@@ -38,14 +38,14 @@ af_default_packages <- c(
   "jsonlite",
   "lubridate",
 
+  # Optimization
+  "quadprog",
+
   # Risk-model packages (we DO care about them)
   # These may be heavy; they will be installed on demand.
   "rugarch",
   "rmgarch",
-  "vars",
-
-  # Portfolio quadratic programming
-  "quadprog"
+  "vars"
 )
 
 # ---- 3. PACKAGE ATTACH / INSTALL LOGIC ----

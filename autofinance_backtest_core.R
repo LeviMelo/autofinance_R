@@ -151,13 +151,13 @@ af_backtest <- function(panel,
   dt <- data.table::copy(panel)
   dt[, refdate := as.Date(refdate)]
 
-  # Use ret_excess if present, else ret_simple
-  if ("ret_excess" %in% names(dt)) {
-    ret_col <- "ret_excess"
+  # Use excess_ret_simple if present, else ret_simple
+  if ("excess_ret_simple" %in% names(dt)) {
+    ret_col <- "excess_ret_simple"
   } else if ("ret_simple" %in% names(dt)) {
     ret_col <- "ret_simple"
   } else {
-    stop("Panel must contain 'ret_excess' or 'ret_simple'.")
+    stop("Panel must contain 'excess_ret_simple' or 'ret_simple'.")
   }
 
   all_dates <- sort(unique(dt$refdate))

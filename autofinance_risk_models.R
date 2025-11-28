@@ -491,3 +491,42 @@ af_risk_build <- function(panel,
     mu_method  = mu_method
   )
 }
+
+# --- Optional config + convenience wrapper ---------------------------------
+# Isto NÃO muda nenhuma lógica já existente. Só oferece uma forma
+# de passar um config-list em vez de um monte de argumentos soltos.
+
+af_risk_config_default <- list(
+  window_years    = 3,
+  use_excess      = TRUE,
+  min_obs_ratio   = 0.7,
+  cov_method      = "sample",     # "sample", "shrinkage", "garch_dcc"
+  mu_method       = "hist_mean",  # "hist_mean", "momentum", "var"
+  shrink_lambda   = 0.1,
+  shrink_target   = "diagonal",
+  momentum_window = 63L,
+  var_lag         = 1L
+)
+
+af_risk_estimate <- function(panel_returns,
+                             symbols = NULL,
+                             end_date = NULL,
+                             config = af_risk_config_default,
+                             ...) {
+  af_risk_build(
+    panel          = panel_returns,
+    symbols        = symbols,
+    end_date       = end_date,
+    window_years   = config$window_years,
+    use_excess     = config$use_excess,
+    min_obs_ratio  = config$min_obs_ratio,
+    cov_method     = config$cov_method,
+    mu_method      = config$mu_method,
+    shrink_lambda  = config$shrink_lambda,
+    shrink_target  = config$shrink_target,
+    momentum_window = config$momentum_window,
+    var_lag         = config$var_lag,
+    ...
+  )
+}
+
