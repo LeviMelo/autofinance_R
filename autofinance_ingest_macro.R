@@ -3,69 +3,61 @@
 # BCB SGS -> macro_series
 ############################################################
 
-af_fetch_sgs_series <- function(series_id,
-                                start_date,
-                                end_date) {
+# PATCH for autofinance_ingest_macro.R
+
+af_fetch_sgs_series <- function(series_id, start_date, end_date) {
   af_attach_packages(c("httr", "jsonlite", "data.table"))
 
   start_str <- format(as.Date(start_date), "%d/%m/%Y")
   end_str   <- format(as.Date(end_date),   "%d/%m/%Y")
 
+  # BCB API requires numeric ID
   url <- sprintf(
     "https://api.bcb.gov.br/dados/serie/bcdata.sgs.%d/dados?formato=json&dataInicial=%s&dataFinal=%s",
-    as.integer(series_id),
-    start_str,
-    end_str
+    as.integer(series_id), start_str, end_str
   )
 
   resp <- httr::GET(url)
   if (httr::http_error(resp)) {
-    stop("af_fetch_sgs_series: HTTP error for series ", series_id)
+    warning("HTTP error for series ", series_id)
+    return(data.table::data.table())
   }
 
   txt <- httr::content(resp, as = "text", encoding = "UTF-8")
   js  <- jsonlite::fromJSON(txt, simplifyDataFrame = TRUE)
   dt  <- data.table::as.data.table(js)
-  if (!nrow(dt)) {
-    return(data.table::data.table(
-      series_id = integer(0),
-      refdate   = as.Date(character(0)),
-      value     = numeric(0)
-    ))
-  }
+  
+  if (!nrow(dt)) return(data.table::data.table())
 
-  # campos padrão: data, valor
   dt[, refdate := as.Date(data, format = "%d/%m/%Y")]
   dt[, value   := as.numeric(gsub(",", ".", valor))]
-
-  out <- dt[, .(series_id = as.integer(series_id),
-                refdate,
-                value)]
-  out
+  
+  # Return without series_id col, we add it in sync function
+  dt[, .(refdate, value)]
 }
 
 af_sync_macro_series <- function(con = af_db_connect(),
-                                 series_ids,
+                                 series_map, # Named vector: c("CDI"=12, "USD"=1)
                                  start_date,
                                  end_date,
-                                 overwrite = FALSE,
                                  verbose = TRUE) {
   on.exit(af_db_disconnect(con), add = TRUE)
   af_db_init(con)
   af_attach_packages(c("DBI", "data.table"))
 
-  series_ids <- unique(as.integer(series_ids))
-
-  for (sid in series_ids) {
-    if (verbose) message("SGS series ", sid, " from ", start_date, " to ", end_date, "...")
-    dt <- af_fetch_sgs_series(sid, start_date, end_date)
-    if (!nrow(dt)) {
-      if (verbose) message("  no data for series ", sid)
-      next
+  # Iterate over the named vector to map ID -> Name
+  for (name in names(series_map)) {
+    numeric_id <- series_map[[name]]
+    if (verbose) message("SGS: Fetching ", name, " (ID ", numeric_id, ")...")
+    
+    dt <- af_fetch_sgs_series(numeric_id, start_date, end_date)
+    
+    if (nrow(dt) > 0) {
+      # Inject the TEXT ID expected by Screener/Risk
+      dt[, series_id := name]
+      af_db_insert_macro_series(con, dt)
     }
-    af_db_insert_macro_series(con, dt)
   }
-
   invisible(TRUE)
 }
 

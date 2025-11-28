@@ -12,7 +12,7 @@ af_fetch_cotahist_year <- function(year) {
   
   message(sprintf("Downloading COTAHIST for %s...", year))
   
-  # rb3::cotahist_get returns a tibble/data.frame
+  # Fetch data via rb3
   df_raw <- tryCatch({
     rb3::cotahist_get(year, type = "yearly")
   }, error = function(e) {
@@ -24,26 +24,14 @@ af_fetch_cotahist_year <- function(year) {
   
   dt <- data.table::as.data.table(df_raw)
   
-  # Filter standard market (Lote Padrão = 2) or Fractional (Lote Fracionário = 10) if desired.
-  # Usually standard market (cod_bdi == '02') is what we want for liquid assets.
-  # We will keep everything and let the screener filter by liquidity/type later, 
-  # BUT standardizing ticker names is crucial (remove trailing spaces).
+  # Cleanup symbol names (remove trailing spaces)
+  if ("symbol" %in% names(dt)) dt[, symbol := trimws(symbol)]
   
-  dt[, symbol := trimws(symbol)]
+  # Standardize column names to match 'prices_raw' schema
+  # rb3 returns Portuguese names: data_referencia, preco_abertura, etc.
+  # We map them to: refdate, open, high, low, close, vol_fin, qty
   
-  # Select and Rename columns to match prices_raw schema:
-  # symbol, refdate, open, high, low, close, vol_fin, qty
-  
-  # Map rb3 columns:
-  # refdate -> refdate
-  # open -> open
-  # high -> high
-  # low -> low
-  # close -> close
-  # volume -> vol_fin (financial volume)
-  # quantity -> qty (share quantity)
-  
-  # Ensure dates are strings for SQLite (ISO 8601)
+  # Mapping based on typical rb3 output
   dt_out <- dt[, .(
     symbol  = symbol,
     refdate = as.Date(refdate),
@@ -55,7 +43,7 @@ af_fetch_cotahist_year <- function(year) {
     qty     = as.numeric(quantity)
   )]
   
-  # Remove invalid rows
+  # Filter out rows with missing keys
   dt_out <- dt_out[!is.na(symbol) & !is.na(refdate) & !is.na(close)]
   
   return(dt_out)
