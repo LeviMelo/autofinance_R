@@ -1,52 +1,80 @@
 ############################################################
 # autofinance_ingest_b3.R
-# Sincronização COTAHIST -> prices_raw
+# Sincronização COTAHIST -> prices_raw (rb3 API real)
 ############################################################
 
-# ATENÇÃO:
-# Aqui eu NÃO chuto a API do rb3, para não te ferrar com função errada.
-# Você pluga seu fetch com rb3 dentro de `af_fetch_cotahist_year()`.
+# The current rb3 API expects a "type" string, not a year. We:
+# 1) Ensure the yearly files are available via fetch_marketdata()
+# 2) Pull the lazy dataset with cotahist_get("yearly")
+# 3) Filter the requested year and asset class
+# 4) Normalize column names to prices_raw schema
 
-af_fetch_cotahist_year <- function(year) {
-  af_attach_packages(c("rb3", "data.table", "dplyr"))
-  
-  message(sprintf("Downloading COTAHIST for %s...", year))
-  
-  # Fetch data via rb3
-  df_raw <- tryCatch({
-    rb3::cotahist_get(year, type = "yearly")
+af_fetch_cotahist_year <- function(year,
+                                   asset_filter = c("equity", "etf", "fii", "all"),
+                                   verbose = TRUE) {
+  asset_filter <- match.arg(asset_filter)
+  af_attach_packages(c("rb3", "data.table", "dplyr", "lubridate"))
+
+  if (verbose) message(sprintf("Downloading COTAHIST for %s...", year))
+
+  # 1) Ensure yearly files are present (no-op if already cached)
+  tryCatch({
+    rb3::fetch_marketdata("b3-cotahist-yearly", year = year)
   }, error = function(e) {
-    warning(sprintf("Failed to fetch year %s: %s", year, e$message))
+    warning(sprintf("fetch_marketdata failed for %s: %s", year, e$message))
+  })
+
+  # 2) Lazy dataset
+  df_raw <- tryCatch({
+    rb3::cotahist_get("yearly")
+  }, error = function(e) {
+    warning(sprintf("cotahist_get failed: %s", e$message))
     return(NULL)
   })
-  
-  if (is.null(df_raw) || nrow(df_raw) == 0) return(data.table::data.table())
-  
-  dt <- data.table::as.data.table(df_raw)
-  
-  # Cleanup symbol names (remove trailing spaces)
+
+  if (is.null(df_raw)) return(data.table::data.table())
+
+  # 3) Filter year and asset type
+  df_year <- df_raw |>
+    dplyr::filter(lubridate::year(.data$refdate) == year)
+
+  if (asset_filter == "equity") {
+    df_year <- rb3::cotahist_filter_equity(df_year)
+  } else if (asset_filter == "etf") {
+    df_year <- rb3::cotahist_filter_etf(df_year)
+  } else if (asset_filter == "fii") {
+    df_year <- rb3::cotahist_filter_fii(df_year)
+  } # "all" keeps everything
+
+  df_year <- dplyr::collect(df_year)
+  if (!nrow(df_year)) return(data.table::data.table())
+
+  dt <- data.table::as.data.table(df_year)
+
+  # Normalize symbol and columns (rb3 uses English names already)
   if ("symbol" %in% names(dt)) dt[, symbol := trimws(symbol)]
-  
-  # Standardize column names to match 'prices_raw' schema
-  # rb3 returns Portuguese names: data_referencia, preco_abertura, etc.
-  # We map them to: refdate, open, high, low, close, vol_fin, qty
-  
-  # Mapping based on typical rb3 output
-  dt_out <- dt[, .(
-    symbol  = symbol,
-    refdate = as.Date(refdate),
-    open    = as.numeric(open),
-    high    = as.numeric(high),
-    low     = as.numeric(low),
-    close   = as.numeric(close),
-    vol_fin = as.numeric(volume),
-    qty     = as.numeric(quantity)
-  )]
-  
+
+  # Handle multiple possible column name variants defensively
+  col_pick <- function(nm, alts) {
+    cand <- intersect(alts, names(dt))
+    if (length(cand)) dt[[cand[1L]]] else NA_real_
+  }
+
+  dt_out <- data.table::data.table(
+    symbol  = dt[["symbol"]],
+    refdate = as.Date(dt[["refdate"]]),
+    open    = as.numeric(col_pick("open", c("open", "price.open", "preco_abertura"))),
+    high    = as.numeric(col_pick("high", c("high", "price.high", "preco_maximo"))),
+    low     = as.numeric(col_pick("low", c("low", "price.low", "preco_minimo"))),
+    close   = as.numeric(col_pick("close", c("close", "price.close", "preco_ultimo"))),
+    vol_fin = as.numeric(col_pick("vol_fin", c("volume", "financial_volume", "volume_total"))),
+    qty     = as.numeric(col_pick("qty", c("quantity", "number_trades", "quantidade_negociada")))
+  )
+
   # Filter out rows with missing keys
   dt_out <- dt_out[!is.na(symbol) & !is.na(refdate) & !is.na(close)]
-  
-  return(dt_out)
+
+  dt_out
 }
 
 af_sync_b3 <- function(con = af_db_connect(),

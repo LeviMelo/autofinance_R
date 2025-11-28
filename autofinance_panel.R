@@ -233,12 +233,12 @@ af_build_adjusted_panel <- function(con,
   }
 
   # 2) Carregar splits
-  #    Usamos um pouco mais largo no início (start_date - small buffer) só por segurança,
-  #    mas por simplicidade, aqui usamos o mesmo intervalo.
+  #    Usamos um buffer para garantir que splits anteriores à janela não sejam perdidos.
+  start_adj <- if (!is.null(start_date)) as.Date(start_date) - 365L else NULL
   adj <- af_load_adjustments(
     con        = con,
     symbols    = unique(prices$symbol),
-    start_date = start_date,
+    start_date = start_adj,
     end_date   = end_date,
     types      = c("SPLIT")
   )
@@ -253,7 +253,7 @@ af_build_adjusted_panel <- function(con,
 
     adj_sym <- af_apply_splits_one_symbol(
       prices_dt = p_sym[, .(refdate, open, high, low, close)],
-      splits_dt = s_sym[, .(date, value)]
+      splits_dt = if (!is.null(s_sym) && nrow(s_sym) > 0L) s_sym[, .(date, value)] else NULL
     )
 
     if (!is.null(adj_sym) && nrow(adj_sym) > 0L) {

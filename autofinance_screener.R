@@ -201,38 +201,55 @@ af_compute_symbol_metrics <- function(dt_sym,
 # Função principal: af_run_screener()
 ############################################################
 
-af_run_screener <- function(ref_date = Sys.Date(),
+af_run_screener <- function(panel = NULL,
+                            ref_date = Sys.Date(),
+                            as_of_date = NULL,
                             config = af_screener_config_default,
                             con = af_db_connect()) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  # If a panel is provided, operate purely in-memory (Option A).
+  # Otherwise, pull from DB (legacy path).
+  own_con <- is.null(panel)
+  if (own_con && !is.null(con)) on.exit(af_db_disconnect(con), add = TRUE)
   af_attach_packages("data.table")
 
-  ref_date <- as.Date(ref_date)
+  ref_date <- as.Date(if (is.null(as_of_date)) ref_date else as_of_date)
   lookback_days <- config$lookback_days
-  # para segurança, pegamos janela 2x maior para métricas
   lookback_start <- ref_date - lookback_days * 2
 
-  # 1) filtro de liquidez com prices_raw
-  liq <- af_compute_basic_liquidity_filter(
-    con             = con,
-    min_liquidity   = config$min_liquidity,
-    min_days_traded = config$min_days_traded,
-    lookback_start  = lookback_start,
-    ref_date        = ref_date
-  )
-  if (nrow(liq) == 0L) {
-    stop("af_run_screener: no liquid symbols found.")
+  if (is.null(panel)) {
+    # 1) filtro de liquidez com prices_raw
+    liq <- af_compute_basic_liquidity_filter(
+      con             = con,
+      min_liquidity   = config$min_liquidity,
+      min_days_traded = config$min_days_traded,
+      lookback_start  = lookback_start,
+      ref_date        = ref_date
+    )
+    if (nrow(liq) == 0L) {
+      stop("af_run_screener: no liquid symbols found.")
+    }
+    symbols_liq <- liq$symbol
+
+    # 2) painel ajustado + retornos
+    panel <- af_build_adjusted_panel(con, symbols_liq, lookback_start, ref_date)
+    panel_ret <- af_compute_returns(panel)
+  } else {
+    panel_ret <- data.table::as.data.table(panel)
+    if (!all(c("symbol", "refdate") %in% names(panel_ret))) {
+      stop("panel must contain symbol/refdate columns.")
+    }
+    panel_ret[, refdate := as.Date(refdate)]
+    panel_ret <- panel_ret[refdate >= lookback_start & refdate <= ref_date]
+    # ensure returns exist
+    if (!("ret_simple" %in% names(panel_ret))) {
+      panel_ret <- af_compute_returns(panel_ret)
+    }
   }
-  symbols_liq <- liq$symbol
 
-  # 2) painel ajustado + retornos
-  panel <- af_build_adjusted_panel(con, symbols_liq, lookback_start, ref_date)
-  panel_ret <- af_compute_returns(panel)
-
-  # 3) fatores macro (ex: IBOV, USD) – assumindo que você salvou como séries de retorno ou níveis
+  # 3) fatores macro (ex: IBOV, USD) - DB path only
   macro_needed <- unique(c(config$ibov_series_id, config$usd_series_id))
   macro_needed <- macro_needed[!is.na(macro_needed)]
-  macro <- if (length(macro_needed) > 0) {
+  macro <- if (length(macro_needed) > 0 && own_con) {
     af_get_macro_series(con, macro_needed, lookback_start, ref_date)
   } else {
     data.table::data.table()
@@ -242,18 +259,25 @@ af_run_screener <- function(ref_date = Sys.Date(),
   if (nrow(macro) > 0L) {
     macro_wide <- data.table::dcast(macro, refdate ~ series_id, value.var = "value")
     macro_wide <- macro_wide[order(refdate)]
-    # se forem níveis, aqui você converte para retornos; se já forem retornos, só alinha.
-    # por enquanto assumo que macro_series$value já está em retorno diário.
-    if (!is.null(config$ibov_series_id) && config$ibov_series_id %in% names(macro_wide)) {
-      factor_returns$ibov <- macro_wide[[config$ibov_series_id]]
-    }
-    if (!is.null(config$usd_series_id) && config$usd_series_id %in% names(macro_wide)) {
-      factor_returns$usd <- macro_wide[[config$usd_series_id]]
+    # convert levels to returns (pct change) if possible
+    for (sid in macro_needed) {
+      if (sid %in% names(macro_wide)) {
+        vals <- macro_wide[[sid]]
+        rts <- c(NA_real_, diff(vals) / head(vals, -1))
+        nm <- if (grepl("IBOV", sid, ignore.case = TRUE)) {
+          "ibov"
+        } else if (grepl("USD", sid, ignore.case = TRUE)) {
+          "usd"
+        } else {
+          tolower(sid)
+        }
+        factor_returns[[nm]] <- rts
+      }
     }
   }
 
   # 4) limitar para última janela exata de lookback_days por símbolo
-  data.table::setorder(panel_ret, symbol, date)
+  data.table::setorder(panel_ret, symbol, refdate)
   metrics_list <- list()
   for (sym in unique(panel_ret$symbol)) {
     dt_sym <- panel_ret[symbol == sym]
@@ -261,10 +285,14 @@ af_run_screener <- function(ref_date = Sys.Date(),
     if (nrow(dt_sym) > lookback_days) {
       dt_sym <- dt_sym[(.N - lookback_days + 1):.N]
     }
+    # fall back to ret_simple if excess not available
+    if (!("excess_ret_simple" %in% names(dt_sym))) {
+      dt_sym[, excess_ret_simple := ret_simple]
+    }
     fr_sym <- NULL
     if (length(factor_returns) > 0L) {
       fr_sym <- lapply(factor_returns, function(x) {
-        if (length(x) >= nrow(dt_sym)) tail(x, nrow(dt_sym)) else NA_real_
+        if (length(x) >= nrow(dt_sym)) tail(x, nrow(dt_sym)) else rep(NA_real_, nrow(dt_sym))
       })
     }
     m <- af_compute_symbol_metrics(
@@ -277,11 +305,13 @@ af_run_screener <- function(ref_date = Sys.Date(),
 
   metrics <- data.table::rbindlist(metrics_list, fill = TRUE)
 
-  # 5) anexar asset_type da assets_meta (se existir)
-  meta <- data.table::as.data.table(
-    DBI::dbGetQuery(con, "SELECT symbol, asset_type FROM assets_meta")
-  )
-  metrics <- meta[metrics, on = .(symbol)]
+  # 5) anexar asset_type da assets_meta (se existir, DB path)
+  if (own_con) {
+    meta <- data.table::as.data.table(
+      DBI::dbGetQuery(con, "SELECT symbol, asset_type FROM assets_meta")
+    )
+    metrics <- meta[metrics, on = .(symbol)]
+  }
 
   # 6) escore com z-score por métrica
   w <- config$score_weights
@@ -300,10 +330,14 @@ af_run_screener <- function(ref_date = Sys.Date(),
 
   # 7) ranking geral e por tipo
   metrics[, rank_overall := rank(-score, ties.method = "first")]
-  metrics[, rank_type    := rank(-score, ties.method = "first"), by = asset_type]
+  if ("asset_type" %in% names(metrics)) {
+    metrics[, rank_type := rank(-score, ties.method = "first"), by = asset_type]
+  } else {
+    metrics[, rank_type := NA_integer_]
+  }
 
   list(
-    full   = metrics[order(rank_overall)],
-    by_type = split(metrics[order(asset_type, rank_type)], metrics$asset_type)
+    full    = metrics[order(rank_overall)],
+    by_type = if ("asset_type" %in% names(metrics)) split(metrics[order(asset_type, rank_type)], metrics$asset_type) else NULL
   )
 }

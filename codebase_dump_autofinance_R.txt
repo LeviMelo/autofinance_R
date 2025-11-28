@@ -14,7 +14,6 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R':
   autofinance_R.Rproj
   autofinance_risk_models.R
   autofinance_screener.R
-  data/autofinance.sqlite
   PLAN.md
   PLAN_risk.md
 
@@ -27,25 +26,8 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R':
 .Rhistory
 .RData
 .Ruserdata
-
-
-
-###############################################################################
-### FILE: autofinance_R.Rproj
-###############################################################################
-Version: 1.0
-
-RestoreWorkspace: Default
-SaveWorkspace: Default
-AlwaysSaveHistory: Default
-
-EnableCodeIndexing: Yes
-UseSpacesForTab: Yes
-NumSpacesForTab: 2
-Encoding: UTF-8
-
-RnwWeave: Sweave
-LaTeX: pdfLaTeX
+data/autofinance.sqlite
+codebase_dump_autofinance_R.txt
 
 
 
@@ -1449,6 +1431,25 @@ Se você quiser, o próximo passo natural é pegarmos **Fase 1–2** e já rascu
 
 
 ###############################################################################
+### FILE: autofinance_R.Rproj
+###############################################################################
+Version: 1.0
+
+RestoreWorkspace: Default
+SaveWorkspace: Default
+AlwaysSaveHistory: Default
+
+EnableCodeIndexing: Yes
+UseSpacesForTab: Yes
+NumSpacesForTab: 2
+Encoding: UTF-8
+
+RnwWeave: Sweave
+LaTeX: pdfLaTeX
+
+
+
+###############################################################################
 ### FILE: autofinance_backtest_core.R
 ###############################################################################
 ############################################################
@@ -1511,7 +1512,12 @@ af_bt_compute_rebalance_dates <- function(panel,
 
 # Select symbols from screener result according to config
 af_bt_select_symbols <- function(screener_res, screener_config) {
-  if (is.null(screener_res) || !nrow(screener_res)) return(character(0))
+  # Accept either a data.table or the full table from af_run_screener
+  if (is.null(screener_res)) return(character(0))
+  if (is.list(screener_res) && "full" %in% names(screener_res)) {
+    screener_res <- screener_res$full
+  }
+  if (!nrow(screener_res)) return(character(0))
   if (!"score" %in% names(screener_res)) {
     stop("screener_res must have a 'score' column.")
   }
@@ -1678,7 +1684,8 @@ af_backtest <- function(panel,
       as_of_date = t_reb
     )
 
-    selected <- af_bt_select_symbols(scr_t, screener_config)
+    scr_table <- if (is.list(scr_t) && "full" %in% names(scr_t)) scr_t$full else scr_t
+    selected <- af_bt_select_symbols(scr_table, screener_config)
     if (!length(selected)) {
       warning(sprintf("No symbols selected at rebalance %s. Keeping previous weights.",
                       as.character(t_reb)))
@@ -2122,53 +2129,81 @@ af_apply_fiscal_trading <- function(trades,
 ###############################################################################
 ############################################################
 # autofinance_ingest_b3.R
-# Sincronização COTAHIST -> prices_raw
+# Sincronização COTAHIST -> prices_raw (rb3 API real)
 ############################################################
 
-# ATENÇÃO:
-# Aqui eu NÃO chuto a API do rb3, para não te ferrar com função errada.
-# Você pluga seu fetch com rb3 dentro de `af_fetch_cotahist_year()`.
+# The current rb3 API expects a "type" string, not a year. We:
+# 1) Ensure the yearly files are available via fetch_marketdata()
+# 2) Pull the lazy dataset with cotahist_get("yearly")
+# 3) Filter the requested year and asset class
+# 4) Normalize column names to prices_raw schema
 
-af_fetch_cotahist_year <- function(year) {
-  af_attach_packages(c("rb3", "data.table", "dplyr"))
-  
-  message(sprintf("Downloading COTAHIST for %s...", year))
-  
-  # Fetch data via rb3
-  df_raw <- tryCatch({
-    rb3::cotahist_get(year, type = "yearly")
+af_fetch_cotahist_year <- function(year,
+                                   asset_filter = c("equity", "etf", "fii", "all"),
+                                   verbose = TRUE) {
+  asset_filter <- match.arg(asset_filter)
+  af_attach_packages(c("rb3", "data.table", "dplyr", "lubridate"))
+
+  if (verbose) message(sprintf("Downloading COTAHIST for %s...", year))
+
+  # 1) Ensure yearly files are present (no-op if already cached)
+  tryCatch({
+    rb3::fetch_marketdata("b3-cotahist-yearly", year = year)
   }, error = function(e) {
-    warning(sprintf("Failed to fetch year %s: %s", year, e$message))
+    warning(sprintf("fetch_marketdata failed for %s: %s", year, e$message))
+  })
+
+  # 2) Lazy dataset
+  df_raw <- tryCatch({
+    rb3::cotahist_get("yearly")
+  }, error = function(e) {
+    warning(sprintf("cotahist_get failed: %s", e$message))
     return(NULL)
   })
-  
-  if (is.null(df_raw) || nrow(df_raw) == 0) return(data.table::data.table())
-  
-  dt <- data.table::as.data.table(df_raw)
-  
-  # Cleanup symbol names (remove trailing spaces)
+
+  if (is.null(df_raw)) return(data.table::data.table())
+
+  # 3) Filter year and asset type
+  df_year <- df_raw |>
+    dplyr::filter(lubridate::year(.data$refdate) == year)
+
+  if (asset_filter == "equity") {
+    df_year <- rb3::cotahist_filter_equity(df_year)
+  } else if (asset_filter == "etf") {
+    df_year <- rb3::cotahist_filter_etf(df_year)
+  } else if (asset_filter == "fii") {
+    df_year <- rb3::cotahist_filter_fii(df_year)
+  } # "all" keeps everything
+
+  df_year <- dplyr::collect(df_year)
+  if (!nrow(df_year)) return(data.table::data.table())
+
+  dt <- data.table::as.data.table(df_year)
+
+  # Normalize symbol and columns (rb3 uses English names already)
   if ("symbol" %in% names(dt)) dt[, symbol := trimws(symbol)]
-  
-  # Standardize column names to match 'prices_raw' schema
-  # rb3 returns Portuguese names: data_referencia, preco_abertura, etc.
-  # We map them to: refdate, open, high, low, close, vol_fin, qty
-  
-  # Mapping based on typical rb3 output
-  dt_out <- dt[, .(
-    symbol  = symbol,
-    refdate = as.Date(refdate),
-    open    = as.numeric(open),
-    high    = as.numeric(high),
-    low     = as.numeric(low),
-    close   = as.numeric(close),
-    vol_fin = as.numeric(volume),
-    qty     = as.numeric(quantity)
-  )]
-  
+
+  # Handle multiple possible column name variants defensively
+  col_pick <- function(nm, alts) {
+    cand <- intersect(alts, names(dt))
+    if (length(cand)) dt[[cand[1L]]] else NA_real_
+  }
+
+  dt_out <- data.table::data.table(
+    symbol  = dt[["symbol"]],
+    refdate = as.Date(dt[["refdate"]]),
+    open    = as.numeric(col_pick("open", c("open", "price.open", "preco_abertura"))),
+    high    = as.numeric(col_pick("high", c("high", "price.high", "preco_maximo"))),
+    low     = as.numeric(col_pick("low", c("low", "price.low", "preco_minimo"))),
+    close   = as.numeric(col_pick("close", c("close", "price.close", "preco_ultimo"))),
+    vol_fin = as.numeric(col_pick("vol_fin", c("volume", "financial_volume", "volume_total"))),
+    qty     = as.numeric(col_pick("qty", c("quantity", "number_trades", "quantidade_negociada")))
+  )
+
   # Filter out rows with missing keys
   dt_out <- dt_out[!is.na(symbol) & !is.na(refdate) & !is.na(close)]
-  
-  return(dt_out)
+
+  dt_out
 }
 
 af_sync_b3 <- function(con = af_db_connect(),
@@ -2795,12 +2830,12 @@ af_build_adjusted_panel <- function(con,
   }
 
   # 2) Carregar splits
-  #    Usamos um pouco mais largo no início (start_date - small buffer) só por segurança,
-  #    mas por simplicidade, aqui usamos o mesmo intervalo.
+  #    Usamos um buffer para garantir que splits anteriores à janela não sejam perdidos.
+  start_adj <- if (!is.null(start_date)) as.Date(start_date) - 365L else NULL
   adj <- af_load_adjustments(
     con        = con,
     symbols    = unique(prices$symbol),
-    start_date = start_date,
+    start_date = start_adj,
     end_date   = end_date,
     types      = c("SPLIT")
   )
@@ -2815,7 +2850,7 @@ af_build_adjusted_panel <- function(con,
 
     adj_sym <- af_apply_splits_one_symbol(
       prices_dt = p_sym[, .(refdate, open, high, low, close)],
-      splits_dt = s_sym[, .(date, value)]
+      splits_dt = if (!is.null(s_sym) && nrow(s_sym) > 0L) s_sym[, .(date, value)] else NULL
     )
 
     if (!is.null(adj_sym) && nrow(adj_sym) > 0L) {
@@ -3888,38 +3923,55 @@ af_compute_symbol_metrics <- function(dt_sym,
 # Função principal: af_run_screener()
 ############################################################
 
-af_run_screener <- function(ref_date = Sys.Date(),
+af_run_screener <- function(panel = NULL,
+                            ref_date = Sys.Date(),
+                            as_of_date = NULL,
                             config = af_screener_config_default,
                             con = af_db_connect()) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  # If a panel is provided, operate purely in-memory (Option A).
+  # Otherwise, pull from DB (legacy path).
+  own_con <- is.null(panel)
+  if (own_con && !is.null(con)) on.exit(af_db_disconnect(con), add = TRUE)
   af_attach_packages("data.table")
 
-  ref_date <- as.Date(ref_date)
+  ref_date <- as.Date(if (is.null(as_of_date)) ref_date else as_of_date)
   lookback_days <- config$lookback_days
-  # para segurança, pegamos janela 2x maior para métricas
   lookback_start <- ref_date - lookback_days * 2
 
-  # 1) filtro de liquidez com prices_raw
-  liq <- af_compute_basic_liquidity_filter(
-    con             = con,
-    min_liquidity   = config$min_liquidity,
-    min_days_traded = config$min_days_traded,
-    lookback_start  = lookback_start,
-    ref_date        = ref_date
-  )
-  if (nrow(liq) == 0L) {
-    stop("af_run_screener: no liquid symbols found.")
+  if (is.null(panel)) {
+    # 1) filtro de liquidez com prices_raw
+    liq <- af_compute_basic_liquidity_filter(
+      con             = con,
+      min_liquidity   = config$min_liquidity,
+      min_days_traded = config$min_days_traded,
+      lookback_start  = lookback_start,
+      ref_date        = ref_date
+    )
+    if (nrow(liq) == 0L) {
+      stop("af_run_screener: no liquid symbols found.")
+    }
+    symbols_liq <- liq$symbol
+
+    # 2) painel ajustado + retornos
+    panel <- af_build_adjusted_panel(con, symbols_liq, lookback_start, ref_date)
+    panel_ret <- af_compute_returns(panel)
+  } else {
+    panel_ret <- data.table::as.data.table(panel)
+    if (!all(c("symbol", "refdate") %in% names(panel_ret))) {
+      stop("panel must contain symbol/refdate columns.")
+    }
+    panel_ret[, refdate := as.Date(refdate)]
+    panel_ret <- panel_ret[refdate >= lookback_start & refdate <= ref_date]
+    # ensure returns exist
+    if (!("ret_simple" %in% names(panel_ret))) {
+      panel_ret <- af_compute_returns(panel_ret)
+    }
   }
-  symbols_liq <- liq$symbol
 
-  # 2) painel ajustado + retornos
-  panel <- af_build_adjusted_panel(con, symbols_liq, lookback_start, ref_date)
-  panel_ret <- af_compute_returns(panel)
-
-  # 3) fatores macro (ex: IBOV, USD) – assumindo que você salvou como séries de retorno ou níveis
+  # 3) fatores macro (ex: IBOV, USD) - DB path only
   macro_needed <- unique(c(config$ibov_series_id, config$usd_series_id))
   macro_needed <- macro_needed[!is.na(macro_needed)]
-  macro <- if (length(macro_needed) > 0) {
+  macro <- if (length(macro_needed) > 0 && own_con) {
     af_get_macro_series(con, macro_needed, lookback_start, ref_date)
   } else {
     data.table::data.table()
@@ -3929,18 +3981,25 @@ af_run_screener <- function(ref_date = Sys.Date(),
   if (nrow(macro) > 0L) {
     macro_wide <- data.table::dcast(macro, refdate ~ series_id, value.var = "value")
     macro_wide <- macro_wide[order(refdate)]
-    # se forem níveis, aqui você converte para retornos; se já forem retornos, só alinha.
-    # por enquanto assumo que macro_series$value já está em retorno diário.
-    if (!is.null(config$ibov_series_id) && config$ibov_series_id %in% names(macro_wide)) {
-      factor_returns$ibov <- macro_wide[[config$ibov_series_id]]
-    }
-    if (!is.null(config$usd_series_id) && config$usd_series_id %in% names(macro_wide)) {
-      factor_returns$usd <- macro_wide[[config$usd_series_id]]
+    # convert levels to returns (pct change) if possible
+    for (sid in macro_needed) {
+      if (sid %in% names(macro_wide)) {
+        vals <- macro_wide[[sid]]
+        rts <- c(NA_real_, diff(vals) / head(vals, -1))
+        nm <- if (grepl("IBOV", sid, ignore.case = TRUE)) {
+          "ibov"
+        } else if (grepl("USD", sid, ignore.case = TRUE)) {
+          "usd"
+        } else {
+          tolower(sid)
+        }
+        factor_returns[[nm]] <- rts
+      }
     }
   }
 
   # 4) limitar para última janela exata de lookback_days por símbolo
-  data.table::setorder(panel_ret, symbol, date)
+  data.table::setorder(panel_ret, symbol, refdate)
   metrics_list <- list()
   for (sym in unique(panel_ret$symbol)) {
     dt_sym <- panel_ret[symbol == sym]
@@ -3948,10 +4007,14 @@ af_run_screener <- function(ref_date = Sys.Date(),
     if (nrow(dt_sym) > lookback_days) {
       dt_sym <- dt_sym[(.N - lookback_days + 1):.N]
     }
+    # fall back to ret_simple if excess not available
+    if (!("excess_ret_simple" %in% names(dt_sym))) {
+      dt_sym[, excess_ret_simple := ret_simple]
+    }
     fr_sym <- NULL
     if (length(factor_returns) > 0L) {
       fr_sym <- lapply(factor_returns, function(x) {
-        if (length(x) >= nrow(dt_sym)) tail(x, nrow(dt_sym)) else NA_real_
+        if (length(x) >= nrow(dt_sym)) tail(x, nrow(dt_sym)) else rep(NA_real_, nrow(dt_sym))
       })
     }
     m <- af_compute_symbol_metrics(
@@ -3964,11 +4027,13 @@ af_run_screener <- function(ref_date = Sys.Date(),
 
   metrics <- data.table::rbindlist(metrics_list, fill = TRUE)
 
-  # 5) anexar asset_type da assets_meta (se existir)
-  meta <- data.table::as.data.table(
-    DBI::dbGetQuery(con, "SELECT symbol, asset_type FROM assets_meta")
-  )
-  metrics <- meta[metrics, on = .(symbol)]
+  # 5) anexar asset_type da assets_meta (se existir, DB path)
+  if (own_con) {
+    meta <- data.table::as.data.table(
+      DBI::dbGetQuery(con, "SELECT symbol, asset_type FROM assets_meta")
+    )
+    metrics <- meta[metrics, on = .(symbol)]
+  }
 
   # 6) escore com z-score por métrica
   w <- config$score_weights
@@ -3987,11 +4052,15 @@ af_run_screener <- function(ref_date = Sys.Date(),
 
   # 7) ranking geral e por tipo
   metrics[, rank_overall := rank(-score, ties.method = "first")]
-  metrics[, rank_type    := rank(-score, ties.method = "first"), by = asset_type]
+  if ("asset_type" %in% names(metrics)) {
+    metrics[, rank_type := rank(-score, ties.method = "first"), by = asset_type]
+  } else {
+    metrics[, rank_type := NA_integer_]
+  }
 
   list(
-    full   = metrics[order(rank_overall)],
-    by_type = split(metrics[order(asset_type, rank_type)], metrics$asset_type)
+    full    = metrics[order(rank_overall)],
+    by_type = if ("asset_type" %in% names(metrics)) split(metrics[order(asset_type, rank_type)], metrics$asset_type) else NULL
   )
 }
 

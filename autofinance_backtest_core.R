@@ -58,7 +58,12 @@ af_bt_compute_rebalance_dates <- function(panel,
 
 # Select symbols from screener result according to config
 af_bt_select_symbols <- function(screener_res, screener_config) {
-  if (is.null(screener_res) || !nrow(screener_res)) return(character(0))
+  # Accept either a data.table or the full table from af_run_screener
+  if (is.null(screener_res)) return(character(0))
+  if (is.list(screener_res) && "full" %in% names(screener_res)) {
+    screener_res <- screener_res$full
+  }
+  if (!nrow(screener_res)) return(character(0))
   if (!"score" %in% names(screener_res)) {
     stop("screener_res must have a 'score' column.")
   }
@@ -225,7 +230,8 @@ af_backtest <- function(panel,
       as_of_date = t_reb
     )
 
-    selected <- af_bt_select_symbols(scr_t, screener_config)
+    scr_table <- if (is.list(scr_t) && "full" %in% names(scr_t)) scr_t$full else scr_t
+    selected <- af_bt_select_symbols(scr_table, screener_config)
     if (!length(selected)) {
       warning(sprintf("No symbols selected at rebalance %s. Keeping previous weights.",
                       as.character(t_reb)))
