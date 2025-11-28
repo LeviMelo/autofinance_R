@@ -50,10 +50,11 @@ af_sync_splits <- function(con = af_db_connect(),
         type   = "SPLIT",
         value  = as.numeric(splits_xts[, 1])
       )
-      af_db_insert_corporate_actions(con, dt_s)
+      # FIX: Changed from af_db_insert_corporate_actions to matches db_core
+      af_db_insert_adjustments(con, dt_s)
     }
 
-    # Atualiza metadata para não ficar rechecando
+    # Atualiza metadata para não ficar rechecando (User Logic Preserved)
     DBI::dbExecute(
       con,
       "INSERT OR REPLACE INTO assets_meta

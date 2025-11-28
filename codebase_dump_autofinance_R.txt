@@ -1424,6 +1424,16 @@ Se você quiser, o próximo passo natural é pegarmos **Fase 1–2** e já rascu
 # Time-series backtest: screener + risk + portfolio
 ############################################################
 
+if (!exists("af_attach_packages")) {
+  if (file.exists("autofinance_config.R")) {
+    source("autofinance_config.R")
+  } else {
+    stop("autofinance_config.R not found; please source it before using backtest.")
+  }
+}
+
+af_attach_packages(c("data.table", "lubridate", "zoo"))
+
 # Compute rebalance dates (e.g. last trading day of each month)
 af_bt_compute_rebalance_dates <- function(panel,
                                           start_date,
@@ -1572,7 +1582,7 @@ af_backtest <- function(panel,
   dt <- data.table::copy(panel)
   dt[, refdate := as.Date(refdate)]
 
-  # Use excess_ret_simple if present, else ret_simple
+  # --- FIX: Dynamic column selection ---
   if ("excess_ret_simple" %in% names(dt)) {
     ret_col <- "excess_ret_simple"
   } else if ("ret_simple" %in% names(dt)) {
@@ -2088,44 +2098,94 @@ af_apply_fiscal_trading <- function(trades,
 # Você pluga seu fetch com rb3 dentro de `af_fetch_cotahist_year()`.
 
 af_fetch_cotahist_year <- function(year) {
-  # TODO: implemente usando rb3::... com sua pipeline atual.
-  # Deve retornar data.table com colunas:
-  # symbol, refdate (Date), open, high, low, close, vol_fin, qty
-  stop("Implemente af_fetch_cotahist_year(year) usando rb3 na sua máquina.")
+  af_attach_packages(c("rb3", "data.table", "dplyr"))
+  
+  message(sprintf("Downloading COTAHIST for %s...", year))
+  
+  # rb3::cotahist_get returns a tibble/data.frame
+  df_raw <- tryCatch({
+    rb3::cotahist_get(year, type = "yearly")
+  }, error = function(e) {
+    warning(sprintf("Failed to fetch year %s: %s", year, e$message))
+    return(NULL)
+  })
+  
+  if (is.null(df_raw) || nrow(df_raw) == 0) return(data.table::data.table())
+  
+  dt <- data.table::as.data.table(df_raw)
+  
+  # Filter standard market (Lote Padrão = 2) or Fractional (Lote Fracionário = 10) if desired.
+  # Usually standard market (cod_bdi == '02') is what we want for liquid assets.
+  # We will keep everything and let the screener filter by liquidity/type later, 
+  # BUT standardizing ticker names is crucial (remove trailing spaces).
+  
+  dt[, symbol := trimws(symbol)]
+  
+  # Select and Rename columns to match prices_raw schema:
+  # symbol, refdate, open, high, low, close, vol_fin, qty
+  
+  # Map rb3 columns:
+  # refdate -> refdate
+  # open -> open
+  # high -> high
+  # low -> low
+  # close -> close
+  # volume -> vol_fin (financial volume)
+  # quantity -> qty (share quantity)
+  
+  # Ensure dates are strings for SQLite (ISO 8601)
+  dt_out <- dt[, .(
+    symbol  = symbol,
+    refdate = as.Date(refdate),
+    open    = as.numeric(open),
+    high    = as.numeric(high),
+    low     = as.numeric(low),
+    close   = as.numeric(close),
+    vol_fin = as.numeric(volume),
+    qty     = as.numeric(quantity)
+  )]
+  
+  # Remove invalid rows
+  dt_out <- dt_out[!is.na(symbol) & !is.na(refdate) & !is.na(close)]
+  
+  return(dt_out)
 }
 
 af_sync_b3 <- function(con = af_db_connect(),
                        years = NULL,
                        verbose = TRUE) {
   on.exit(af_db_disconnect(con), add = TRUE)
-  if (!requireNamespace("data.table", quietly = TRUE)) {
-    stop("Package 'data.table' required.")
-  }
-  data.table::setDTthreads(1L)
-
+  af_attach_packages("data.table")
+  
   if (is.null(years)) {
-    max_ref <- af_db_get_max_refdate_prices(con)
-    if (is.na(max_ref)) {
-      # DB vazio -> pega últimos N anos ou toda a série, a seu critério
-      current_year <- as.integer(format(Sys.Date(), "%Y"))
-      years <- current_year
+    # Check DB for max date
+    max_date_str <- tryCatch({
+      DBI::dbGetQuery(con, "SELECT MAX(refdate) as d FROM prices_raw")$d
+    }, error = function(e) NA)
+    
+    current_year <- as.integer(format(Sys.Date(), "%Y"))
+    
+    if (is.na(max_date_str) || is.null(max_date_str)) {
+      # Bootstrap: Start from 2015 (or config default) if empty
+      years <- 2015:current_year
     } else {
-      last_year <- as.integer(substr(max_ref, 1, 4))
-      current_year <- as.integer(format(Sys.Date(), "%Y"))
-      years <- seq.int(last_year, current_year)
+      last_year <- as.integer(substr(max_date_str, 1, 4))
+      years <- last_year:current_year
     }
   }
-
+  
   for (y in years) {
-    if (verbose) message("af_sync_b3: fetching COTAHIST year ", y)
+    if (verbose) message("af_sync_b3: processing year ", y)
     dt <- af_fetch_cotahist_year(y)
-    if (!inherits(dt, "data.table")) data.table::setDT(dt)
-    if (!all(c("symbol", "refdate", "open", "high", "low", "close", "vol_fin", "qty") %in% names(dt))) {
-      stop("af_fetch_cotahist_year must return symbol, refdate, open, high, low, close, vol_fin, qty")
+    
+    if (nrow(dt) > 0) {
+      if (verbose) message("  inserting ", nrow(dt), " rows...")
+      af_db_insert_prices_raw(con, dt)
+    } else {
+      if (verbose) message("  no data found for ", y)
     }
-    af_db_insert_prices_raw(con, dt)
   }
-
+  
   invisible(TRUE)
 }
 
@@ -2454,10 +2514,11 @@ af_sync_splits <- function(con = af_db_connect(),
         type   = "SPLIT",
         value  = as.numeric(splits_xts[, 1])
       )
-      af_db_insert_corporate_actions(con, dt_s)
+      # FIX: Changed from af_db_insert_corporate_actions to matches db_core
+      af_db_insert_adjustments(con, dt_s)
     }
 
-    # Atualiza metadata para não ficar rechecando
+    # Atualiza metadata para não ficar rechecando (User Logic Preserved)
     DBI::dbExecute(
       con,
       "INSERT OR REPLACE INTO assets_meta
@@ -2482,7 +2543,6 @@ af_sync_splits <- function(con = af_db_connect(),
 
   invisible(all_symbols_checked)
 }
-
 
 
 ###############################################################################

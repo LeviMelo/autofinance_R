@@ -3,6 +3,16 @@
 # Time-series backtest: screener + risk + portfolio
 ############################################################
 
+if (!exists("af_attach_packages")) {
+  if (file.exists("autofinance_config.R")) {
+    source("autofinance_config.R")
+  } else {
+    stop("autofinance_config.R not found; please source it before using backtest.")
+  }
+}
+
+af_attach_packages(c("data.table", "lubridate", "zoo"))
+
 # Compute rebalance dates (e.g. last trading day of each month)
 af_bt_compute_rebalance_dates <- function(panel,
                                           start_date,
@@ -151,7 +161,7 @@ af_backtest <- function(panel,
   dt <- data.table::copy(panel)
   dt[, refdate := as.Date(refdate)]
 
-  # Use excess_ret_simple if present, else ret_simple
+  # --- FIX: Dynamic column selection ---
   if ("excess_ret_simple" %in% names(dt)) {
     ret_col <- "excess_ret_simple"
   } else if ("ret_simple" %in% names(dt)) {
