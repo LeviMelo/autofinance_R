@@ -42,7 +42,10 @@ af_default_packages <- c(
   # These may be heavy; they will be installed on demand.
   "rugarch",
   "rmgarch",
-  "vars"
+  "vars",
+
+  # Portfolio quadratic programming
+  "quadprog"
 )
 
 # ---- 3. PACKAGE ATTACH / INSTALL LOGIC ----

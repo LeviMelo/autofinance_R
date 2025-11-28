@@ -1,171 +1,325 @@
 ############################################################
 # autofinance_portfolio_engine.R
-# Construção de portfólio com restrições
+# Portfolio construction given μ, Σ and constraints
 ############################################################
 
+source("autofinance_config.R")
+af_attach_packages(c("data.table", "quadprog"))
+
+# ----------------------------------------------------------
+# 1. Default config
+# ----------------------------------------------------------
+
 af_port_default_config <- list(
-  cov_method    = "sample",
-  mu_method     = "mean",
-  window_years  = 3,
-  mode          = "min_var",    # "equal", "inv_vol", "min_var", "mean_var", "max_sharpe"
+  mode          = "min_var",  # "equal", "inv_vol", "min_var", "mean_var", "max_sharpe"
   long_only     = TRUE,
-  w_max         = 0.20,
-  leverage_max  = 1.0,
-  group_constraints = NULL,     # ex: list(FII_min = 0.2, BDR_max = 0.3)
-  risk_aversion = 5             # para mean_var
+  w_max         = 0.20,       # per-asset cap
+  leverage_max  = 1.0,        # currently only meaningful if we allow shorts in future
+  risk_aversion = 5,          # λ for mean-variance; higher = more risk-averse
+  rf_annual     = 0,          # annual RF used for Sharpe in reporting
+
+  # Group constraints: list of entries like:
+  # list(
+  #   name    = "FIIs",
+  #   symbols = c("HGLG11", "KNRI11"),
+  #   min     = 0.10,   # optional
+  #   max     = 0.40    # optional
+  # )
+  group_constraints = NULL
 )
+
+# Small helper: make sure config has defaults if user passes a partial list
+af_port_merge_config <- function(config = list()) {
+  cfg <- af_port_default_config
+  if (!is.null(config) && length(config) > 0L) {
+    for (nm in names(config)) {
+      cfg[[nm]] <- config[[nm]]
+    }
+  }
+  cfg
+}
+
+# ----------------------------------------------------------
+# 2. Simple heuristic portfolios: equal-weight, inverse-vol
+# ----------------------------------------------------------
 
 af_port_equal_weights <- function(symbols) {
   n <- length(symbols)
+  if (n == 0L) stop("af_port_equal_weights: length(symbols) == 0")
   rep(1 / n, n)
 }
 
 af_port_inv_vol <- function(Sigma) {
+  if (is.null(dim(Sigma))) stop("af_port_inv_vol: Sigma must be a matrix.")
   sig <- sqrt(diag(Sigma))
   inv <- 1 / sig
   inv[!is.finite(inv)] <- 0
-  if (sum(inv) == 0) return(rep(1 / length(inv), length(inv)))
+  if (sum(inv) <= 0) {
+    # fall back to equal weight
+    return(rep(1 / length(inv), length(inv)))
+  }
   inv / sum(inv)
 }
 
-af_quadprog_solve <- function(Sigma,
-                              mu = NULL,
-                              mode = c("min_var", "mean_var", "max_sharpe"),
-                              long_only = TRUE,
-                              w_max = 1,
-                              leverage_max = 1,
-                              risk_aversion = 5,
-                              rf_rate = 0) {
-  mode <- match.arg(mode)
-  if (!requireNamespace("quadprog", quietly = TRUE)) {
-    stop("Package 'quadprog' required for quadratic optimization.")
-  }
+# ----------------------------------------------------------
+# 3. Build linear constraints for quadprog
+# ----------------------------------------------------------
+# quadprog solves:
+#   min 1/2 w' D w - d' w
+#   s.t. A^T w >= b
+#
+# We represent:
+# - sum(w) = 1       → two inequalities: sum(w) >= 1  AND  -sum(w) >= -1
+# - w_i >= 0         → diag(N)
+# - w_i <= w_max     → -w_i >= -w_max
+# - group min        → sum_{i in G} w_i >= min_G
+# - group max        → -sum_{i in G} w_i >= -max_G
+#
+# The first "meq" columns in Amat are treated as equalities by quadprog,
+# so we keep sum(w) = 1 as equality.
 
-  N <- nrow(Sigma)
-  Dmat <- 2 * Sigma
-  # Objetivo: 1/2 w' D w - d' w
-  if (mode == "min_var") {
-    dvec <- rep(0, N)
-  } else if (mode == "mean_var") {
-    # max (w'μ - λ w'Σw) → min (λ w'Σw - w'μ)
-    # transformado em padrão quadprog
-    dvec <- mu
-    # o fator λ entra implicitamente pela escala de Σ; aqui simplificado
-    Dmat <- 2 * risk_aversion * Sigma
-  } else if (mode == "max_sharpe") {
-    # approx: max Sharpe ≈ max ( (w'μ - rf)/σ ) → usar heurística:
-    # max (w' (μ - rf)) com restrição de var <= 1? Complicado.
-    # Simples: treat as mean_var com μtilde = μ - rf e λ pequeno
-    dvec <- mu - rf_rate
-    Dmat <- 2 * risk_aversion * Sigma
-  }
+af_port_build_constraints <- function(symbols,
+                                      long_only     = TRUE,
+                                      w_max         = 1,
+                                      group_constraints = NULL) {
+  N <- length(symbols)
+  if (N == 0L) stop("af_port_build_constraints: no symbols")
 
-  # Restrições: A^T w >= b
-  # 1) soma w_i = 1 → (1,...,1) w = 1 → tratamos como igualdade, representado como duas desigualdades:
-  # (1,...,1) w >= 1 e (-1,...,-1) w >= -1
+  # Equality: sum(w) = 1
   Aeq <- matrix(1, nrow = N, ncol = 1)
   beq <- 1
 
-  # 2) w_i >= 0 se long_only
+  # Inequalities
   A_ineq <- NULL
   b_ineq <- NULL
+
+  # 1) long_only → w_i >= 0
   if (long_only) {
     A_ineq <- diag(N)
     b_ineq <- rep(0, N)
   }
 
-  # 3) w_i <= w_max → -w_i >= -w_max
-  if (!is.null(w_max) && w_max < 1) {
-    A_ineq2 <- -diag(N)
-    b_ineq2 <- rep(-w_max, N)
+  # 2) w_i <= w_max → -w_i >= -w_max
+  if (!is.null(w_max) && is.finite(w_max) && w_max < 1) {
+    A2 <- -diag(N)
+    b2 <- rep(-w_max, N)
     if (is.null(A_ineq)) {
-      A_ineq <- A_ineq2
-      b_ineq <- b_ineq2
+      A_ineq <- A2
+      b_ineq <- b2
     } else {
-      A_ineq <- rbind(A_ineq, A_ineq2)
-      b_ineq <- c(b_ineq, b_ineq2)
+      A_ineq <- rbind(A_ineq, A2)
+      b_ineq <- c(b_ineq, b2)
     }
   }
 
-  # 4) leverage_max: sum(|w_i|) <= L (simplificado: sum(w_i) <= L se long_only)
-  # já temos sum(w_i) = 1, então leverage_max = 1 está implícito. Se >1, ignoramos aqui.
+  # 3) Group constraints
+  # Each entry in group_constraints: list(name, symbols, min, max)
+  if (!is.null(group_constraints) && length(group_constraints) > 0L) {
+    for (gc in group_constraints) {
+      if (is.null(gc$symbols) || length(gc$symbols) == 0L) next
 
-  # Montagem final de A e b (quadprog: Amat, bvec, meq)
-  if (!is.null(A_ineq)) {
-    A_all <- cbind(Aeq, -Aeq, t(A_ineq))
-    b_all <- c(beq, -beq, b_ineq)
-    meq <- 1  # primeira coluna (Aeq) tratada como igualdade? quadprog usa 'meq' primeiras colunas de Amat como igualdades
-  } else {
-    A_all <- cbind(Aeq, -Aeq)
-    b_all <- c(beq, -beq)
-    meq <- 1
+      idx <- match(gc$symbols, symbols)
+      idx <- idx[!is.na(idx)]
+      if (length(idx) == 0L) next
+
+      # min: sum w_i >= min
+      if (!is.null(gc$min) && is.finite(gc$min)) {
+        a <- rep(0, N)
+        a[idx] <- 1
+        if (is.null(A_ineq)) {
+          A_ineq <- matrix(a, nrow = 1)
+          b_ineq <- gc$min
+        } else {
+          A_ineq <- rbind(A_ineq, a)
+          b_ineq <- c(b_ineq, gc$min)
+        }
+      }
+
+      # max: sum w_i <= max → -sum w_i >= -max
+      if (!is.null(gc$max) && is.finite(gc$max)) {
+        a <- rep(0, N)
+        a[idx] <- -1
+        if (is.null(A_ineq)) {
+          A_ineq <- matrix(a, nrow = 1)
+          b_ineq <- -gc$max
+        } else {
+          A_ineq <- rbind(A_ineq, a)
+          b_ineq <- c(b_ineq, -gc$max)
+        }
+      }
+    }
   }
+
+  # Build final Amat, bvec, meq
+  if (!is.null(A_ineq)) {
+    # Amat: columns are constraint vectors
+    Amat <- cbind(Aeq, t(A_ineq))
+    bvec <- c(beq, b_ineq)
+    meq  <- 1L   # first column (Aeq) is equality
+  } else {
+    Amat <- Aeq
+    bvec <- beq
+    meq  <- 1L
+  }
+
+  list(Amat = Amat, bvec = bvec, meq = meq)
+}
+
+# ----------------------------------------------------------
+# 4. Core QP solver wrapper
+# ----------------------------------------------------------
+
+af_port_quadprog_solve <- function(Sigma,
+                                   mu           = NULL,
+                                   mode         = c("min_var", "mean_var", "max_sharpe"),
+                                   long_only    = TRUE,
+                                   w_max        = 1,
+                                   leverage_max = 1,
+                                   risk_aversion = 5,
+                                   rf_annual     = 0,
+                                   group_constraints = NULL) {
+
+  mode <- match.arg(mode)
+  if (!requireNamespace("quadprog", quietly = TRUE)) {
+    stop("Package 'quadprog' is required for quadratic optimization.")
+  }
+
+  if (is.null(dim(Sigma))) stop("Sigma must be a covariance matrix.")
+  N <- nrow(Sigma)
+  if (ncol(Sigma) != N) stop("Sigma must be square.")
+  if (is.null(rownames(Sigma))) {
+    rownames(Sigma) <- paste0("A", seq_len(N))
+    colnames(Sigma) <- rownames(Sigma)
+  }
+
+  # Dmat = 2 * Σ (scaled later depending on mode)
+  Dmat <- 2 * Sigma
+
+  # dvec depends on mode:
+  #   min_var:  dvec = 0
+  #   mean_var: dvec = μ_tilde (we want to maximize w'μ - λ w'Σw)
+  #   max_sharpe: treat like mean_var with μ_tilde = μ - rf_daily
+  if (mode == "min_var") {
+    dvec <- rep(0, N)
+  } else {
+    if (is.null(mu)) stop("mu must be provided for mode != 'min_var'")
+    mu <- as.numeric(mu)
+    if (length(mu) != N) stop("length(mu) must match nrow(Sigma)")
+    names(mu) <- rownames(Sigma)
+
+    # risk_aversion acts as λ on Σ
+    if (mode == "mean_var") {
+      Dmat <- 2 * risk_aversion * Sigma
+      dvec <- mu
+    } else if (mode == "max_sharpe") {
+      # Approximate with μ_tilde = μ - rf
+      # We assume rf_annual given; convert to daily for μ vector:
+      rf_daily <- (1 + rf_annual)^(1 / 252) - 1
+      mu_tilde <- mu - rf_daily
+      Dmat <- 2 * risk_aversion * Sigma
+      dvec <- mu_tilde
+    } else {
+      stop("Unknown mode in af_port_quadprog_solve.")
+    }
+  }
+
+  # Build constraints
+  constr <- af_port_build_constraints(
+    symbols            = rownames(Sigma),
+    long_only          = long_only,
+    w_max              = w_max,
+    group_constraints  = group_constraints
+  )
 
   res <- quadprog::solve.QP(
     Dmat = Dmat,
     dvec = dvec,
-    Amat = A_all,
-    bvec = b_all,
-    meq = meq
+    Amat = constr$Amat,
+    bvec = constr$bvec,
+    meq  = constr$meq
   )
 
   w <- res$solution
   names(w) <- rownames(Sigma)
+
+  # Clean very small negatives (numeric noise) if long-only
+  if (long_only) {
+    w[w < 0] <- 0
+  }
+
+  # Normalize to sum 1
+  s <- sum(w)
+  if (s > 0) w <- w / s
+
   w
 }
 
-af_build_portfolio <- function(panel_returns,
-                               selected_symbols,
-                               port_config = af_port_default_config,
-                               metrics_table = NULL,
-                               rf_daily_series = NULL,
-                               end_date = max(panel_returns$date)) {
-  af_attach_packages("data.table")
-  dt <- data.table::as.data.table(panel_returns)
-  dt <- dt[symbol %in% selected_symbols]
-  if (nrow(dt) == 0L) stop("af_build_portfolio: no data for selected_symbols.")
+# ----------------------------------------------------------
+# 5. Public API: af_build_portfolio (μ, Σ → weights)
+# ----------------------------------------------------------
 
-  risk_cfg <- af_risk_config_default
-  risk_cfg$cov_method <- port_config$cov_method
-  risk_cfg$mu_method  <- port_config$mu_method
+af_build_portfolio <- function(mu,
+                               Sigma,
+                               config = af_port_default_config) {
+  cfg <- af_port_merge_config(config)
 
-  risk_est <- af_risk_estimate(
-    panel_returns  = dt,
-    end_date       = end_date,
-    config         = risk_cfg,
-    metrics_table  = metrics_table,
-    rf_daily_series = rf_daily_series
-  )
+  # Basic checks
+  if (is.null(dim(Sigma))) stop("af_build_portfolio: Sigma must be a matrix.")
+  N <- nrow(Sigma)
+  if (is.null(mu) || length(mu) != N) {
+    stop("af_build_portfolio: mu must be numeric vector of length nrow(Sigma).")
+  }
+  if (is.null(rownames(Sigma))) {
+    rownames(Sigma) <- paste0("A", seq_len(N))
+    colnames(Sigma) <- rownames(Sigma)
+  }
 
-  mu    <- risk_est$mu
-  Sigma <- risk_est$Sigma
-
-  mode <- match.arg(port_config$mode,
-                    c("equal", "inv_vol", "min_var", "mean_var", "max_sharpe"))
+  mode <- match.arg(cfg$mode, c("equal", "inv_vol", "min_var", "mean_var", "max_sharpe"))
 
   if (mode == "equal") {
-    w <- af_port_equal_weights(names(mu))
+    w <- af_port_equal_weights(rownames(Sigma))
   } else if (mode == "inv_vol") {
     w <- af_port_inv_vol(Sigma)
   } else {
-    w <- af_quadprog_solve(
-      Sigma        = Sigma,
-      mu           = mu,
-      mode         = mode,
-      long_only    = port_config$long_only,
-      w_max        = port_config$w_max,
-      leverage_max = port_config$leverage_max,
-      risk_aversion = port_config$risk_aversion
+    w <- af_port_quadprog_solve(
+      Sigma            = Sigma,
+      mu               = mu,
+      mode             = mode,
+      long_only        = cfg$long_only,
+      w_max            = cfg$w_max,
+      leverage_max     = cfg$leverage_max,
+      risk_aversion    = cfg$risk_aversion,
+      rf_annual        = cfg$rf_annual,
+      group_constraints = cfg$group_constraints
     )
   }
 
-  # garantir soma 1 (numérica)
-  w[w < 0 & port_config$long_only] <- 0
-  if (sum(w) > 0) w <- w / sum(w)
+  # Ex-ante stats
+  mu_vec <- as.numeric(mu)
+  names(mu_vec) <- rownames(Sigma)
+  exp_ret_daily <- sum(w * mu_vec)
+  exp_ret_annual <- (1 + exp_ret_daily)^252 - 1
+
+  port_var <- as.numeric(t(w) %*% Sigma %*% w)
+  port_vol_daily <- sqrt(port_var)
+  port_vol_annual <- port_vol_daily * sqrt(252)
+
+  rf_ann <- cfg$rf_annual
+  rf_d  <- (1 + rf_ann)^(1 / 252) - 1
+  exp_sharpe <- if (port_vol_daily > 0) {
+    (exp_ret_daily - rf_d) / port_vol_daily
+  } else {
+    NA_real_
+  }
 
   list(
-    weights = w,
-    cov_mat = Sigma,
-    mu_vec  = mu
+    weights          = w,
+    mu               = mu_vec,
+    Sigma            = Sigma,
+    exp_ret_daily    = exp_ret_daily,
+    exp_ret_annual   = exp_ret_annual,
+    exp_vol_daily    = port_vol_daily,
+    exp_vol_annual   = port_vol_annual,
+    exp_sharpe_daily = exp_sharpe
   )
 }

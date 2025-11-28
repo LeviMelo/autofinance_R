@@ -1,190 +1,321 @@
 ############################################################
 # autofinance_backtest_core.R
-# Loop temporal: screener + risk + portfolio -> curva de equity
+# Time-series backtest: screener + risk + portfolio
 ############################################################
 
-af_backtest_config_default <- list(
-  rebalance_freq = "monthly",   # "monthly", "quarterly"
-  lookback_years = 3L,
-  screener_config = af_screener_config_default,
-  risk_config     = af_risk_config_default,
-  port_config     = af_port_default_config,
-  rf_series_id    = "CDI"
-)
+# Compute rebalance dates (e.g. last trading day of each month)
+af_bt_compute_rebalance_dates <- function(panel,
+                                          start_date,
+                                          end_date,
+                                          rebalance_freq = "monthly",
+                                          lookback_years = 3L) {
+  stopifnot("refdate" %in% names(panel))
+  dt <- data.table::copy(panel)
+  dt[, refdate := as.Date(refdate)]
 
-af_generate_rebalance_dates <- function(start_date,
-                                        end_date,
-                                        rebalance_freq = "monthly") {
-  start_date <- as.Date(start_date)
-  end_date   <- as.Date(end_date)
-  dates <- seq(from = start_date, to = end_date, by = "day")
+  dates <- sort(unique(dt$refdate))
+  dates <- dates[dates >= start_date & dates <= end_date]
+  if (!length(dates)) stop("No trading dates in panel for given backtest range.")
+
+  dt <- data.table::data.table(refdate = dates)
+
   if (rebalance_freq == "monthly") {
-    idx <- !duplicated(format(dates, "%Y-%m"))
+    dt[, `:=`(
+      year  = lubridate::year(refdate),
+      month = lubridate::month(refdate)
+    )]
+    reb <- dt[, .(reb_date = max(refdate)), by = .(year, month)][order(reb_date), reb_date]
   } else if (rebalance_freq == "quarterly") {
-    qtr <- paste0(format(dates, "%Y"), "Q", lubridate::quarter(dates))
-    idx <- !duplicated(qtr)
+    dt[, `:=`(
+      year    = lubridate::year(refdate),
+      quarter = lubridate::quarter(refdate)
+    )]
+    reb <- dt[, .(reb_date = max(refdate)), by = .(year, quarter)][order(reb_date), reb_date]
+  } else if (rebalance_freq == "weekly") {
+    dt[, `:=`(
+      year = lubridate::year(refdate),
+      week = lubridate::isoweek(refdate)
+    )]
+    reb <- dt[, .(reb_date = max(refdate)), by = .(year, week)][order(reb_date), reb_date]
   } else {
-    stop("Unsupported rebalance_freq.")
+    stop("Unsupported rebalance_freq: ", rebalance_freq)
   }
-  dates[idx]
+
+  min_reb_date <- start_date %m+% lubridate::years(lookback_years)
+  reb <- reb[reb >= min_reb_date & reb <= end_date]
+  reb
 }
 
-af_backtest <- function(symbols_universe = NULL,
-                        start_date,
-                        end_date,
-                        bt_config = af_backtest_config_default,
-                        con = af_db_connect()) {
-  on.exit(af_db_disconnect(con), add = TRUE)
-  af_attach_packages("data.table")
+# Select symbols from screener result according to config
+af_bt_select_symbols <- function(screener_res, screener_config) {
+  if (is.null(screener_res) || !nrow(screener_res)) return(character(0))
+  if (!"score" %in% names(screener_res)) {
+    stop("screener_res must have a 'score' column.")
+  }
 
+  res <- data.table::copy(screener_res)
+  data.table::setorder(res, -score)
+
+  # Per-type selection if requested and asset_type available
+  top_by_type <- screener_config$top_n_by_type
+  if (!is.null(top_by_type) && "asset_type" %in% names(res)) {
+    sel <- character(0)
+    for (tp in names(top_by_type)) {
+      k <- as.integer(top_by_type[[tp]])
+      if (is.na(k) || k <= 0) next
+      tmp <- res[asset_type == tp][1:k, symbol]
+      sel <- c(sel, tmp)
+    }
+    return(unique(sel))
+  }
+
+  # Simple Top-N
+  top_n <- screener_config$top_n
+  if (is.null(top_n) || top_n <= 0) {
+    top_n <- min(20L, nrow(res))
+  } else {
+    top_n <- min(as.integer(top_n), nrow(res))
+  }
+
+  res[1:top_n, symbol]
+}
+
+# Compute portfolio-level performance statistics
+af_bt_compute_stats <- function(equity_dt, returns_dt) {
+  eq    <- equity_dt$equity
+  dates <- equity_dt$refdate
+  if (length(eq) < 2L) {
+    return(list())
+  }
+
+  # Prefer the logged portfolio returns if available
+  r <- returns_dt$port_ret
+  r <- r[!is.na(r)]
+  if (length(r) < 2L) {
+    # fallback: derive from equity
+    r <- diff(eq) / head(eq, -1L)
+  }
+
+  n_days <- length(r)
+  if (n_days < 2L) {
+    return(list())
+  }
+
+  horizon_years <- as.numeric(difftime(tail(dates, 1L),
+                                       head(dates, 1L),
+                                       units = "days")) / 365.25
+  horizon_years <- max(horizon_years, 1e-9)
+
+  # CAGR from equity
+  cagr <- (tail(eq, 1L) / head(eq, 1L))^(1 / horizon_years) - 1
+
+  # Annualized mean/vol (assuming daily freq)
+  mean_daily <- mean(r, na.rm = TRUE)
+  sd_daily   <- stats::sd(r, na.rm = TRUE)
+  ann_return <- mean_daily * 252
+  ann_vol    <- sd_daily * sqrt(252)
+  sharpe     <- if (ann_vol > 0) ann_return / ann_vol else NA_real_
+
+  # Drawdown
+  cummax_eq <- cummax(eq)
+  dd <- eq / cummax_eq - 1
+  max_dd <- min(dd, na.rm = TRUE)
+
+  # Ulcer index (using fractional drawdown)
+  ulcer <- sqrt(mean((dd)^2, na.rm = TRUE))
+
+  list(
+    start_date    = head(dates, 1L),
+    end_date      = tail(dates, 1L),
+    cagr          = cagr,
+    ann_return    = ann_return,
+    ann_vol       = ann_vol,
+    sharpe        = sharpe,
+    max_drawdown  = max_dd,
+    ulcer_index   = ulcer
+  )
+}
+
+# Main backtest function
+af_backtest <- function(panel,
+                        screener_config,
+                        risk_config,
+                        port_config,
+                        rebalance_freq = "monthly",
+                        lookback_years = 3L,
+                        start_date = NULL,
+                        end_date   = NULL) {
+  stopifnot("symbol"  %in% names(panel),
+            "refdate" %in% names(panel))
+
+  dt <- data.table::copy(panel)
+  dt[, refdate := as.Date(refdate)]
+
+  # Use ret_excess if present, else ret_simple
+  if ("ret_excess" %in% names(dt)) {
+    ret_col <- "ret_excess"
+  } else if ("ret_simple" %in% names(dt)) {
+    ret_col <- "ret_simple"
+  } else {
+    stop("Panel must contain 'ret_excess' or 'ret_simple'.")
+  }
+
+  all_dates <- sort(unique(dt$refdate))
+  if (is.null(start_date)) start_date <- min(all_dates)
+  if (is.null(end_date))   end_date   <- max(all_dates)
   start_date <- as.Date(start_date)
   end_date   <- as.Date(end_date)
 
-  # 1) define universo (se NULL, pega assets_meta ativos)
-  if (is.null(symbols_universe)) {
-    dt_meta <- data.table::as.data.table(
-      DBI::dbGetQuery(con, "SELECT symbol FROM assets_meta WHERE active = 1")
-    )
-    symbols_universe <- dt_meta$symbol
+  # Keep enough history for initial lookback
+  dt <- dt[refdate >= (start_date - lubridate::years(lookback_years)) &
+           refdate <= end_date]
+
+  # Dates actually used for equity curve
+  dates_bt <- sort(unique(dt[refdate >= start_date & refdate <= end_date, refdate]))
+  nD <- length(dates_bt)
+  if (nD < 2L) {
+    stop("Not enough dates in backtest window.")
   }
 
-  # 2) constrói painel ajustado para todo período + lookback extra
-  global_start <- start_date - 365 * bt_config$lookback_years
-  panel <- af_build_adjusted_panel(con, symbols_universe, global_start, end_date)
-  panel_ret <- af_compute_returns(panel)
-
-  # 3) RF diário
-  rf_series <- NULL
-  if (!is.null(bt_config$rf_series_id)) {
-    macro_rf <- af_get_macro_series(
-      con,
-      series_ids = bt_config$rf_series_id,
-      start_date = global_start,
-      end_date   = end_date
-    )
-    if (nrow(macro_rf) > 0L) {
-      # assume macro_rf$value já em termos de retorno diário ou taxa diária;
-      # você ajusta conforme seu SGS (se for %aa, converter).
-      rf_series <- data.table::data.table(
-        refdate = macro_rf$refdate,
-        rf_daily = macro_rf$value
-      )
-      panel_ret <- rf_series[panel_ret, on = .(refdate = date)]
-      panel_ret[is.na(rf_daily), rf_daily := 0]
-      panel_ret[, excess_ret_simple := ret_simple - rf_daily]
-    } else {
-      panel_ret[, excess_ret_simple := ret_simple]
-    }
-  } else {
-    panel_ret[, excess_ret_simple := ret_simple]
-  }
-
-  # 4) datas de rebalance
-  reb_dates <- af_generate_rebalance_dates(start_date, end_date,
-                                           bt_config$rebalance_freq)
-  reb_dates <- reb_dates[reb_dates >= start_date & reb_dates <= end_date]
-
-  equity <- data.table::data.table(
-    date = seq(from = start_date, to = end_date, by = "day"),
-    equity = NA_real_
+  reb_dates <- af_bt_compute_rebalance_dates(
+    panel         = dt,
+    start_date    = start_date,
+    end_date      = end_date,
+    rebalance_freq = rebalance_freq,
+    lookback_years = lookback_years
   )
-  equity[1L, equity := 1]  # começa com 1
+  if (!length(reb_dates)) {
+    stop("No rebalance dates found. Check lookback_years and date range.")
+  }
+
+  # Initialize equity and logs
+  equity <- rep(NA_real_, nD)
+  names(equity) <- as.character(dates_bt)
+  equity[1L] <- 1
+
+  returns_log <- data.table::data.table(
+    refdate = dates_bt,
+    port_ret = NA_real_
+  )
+  weights_log <- list()
 
   current_weights <- NULL
-  current_value   <- 1
-  trades <- data.table::data.table(
-    date = as.Date(character(0)),
-    symbol = character(0),
-    weight = numeric(0)
-  )
 
-  for (i in seq_along(reb_dates)) {
-    t_reb <- reb_dates[i]
-    if (t_reb <= start_date) next
+  for (k in seq_along(reb_dates)) {
+    t_reb <- reb_dates[k]
 
-    # janela de lookback para screener
-    # screener usa sua própria lógica de lookback; aqui só passamos data
-    sc <- af_run_screener(ref_date = t_reb,
-                          config = bt_config$screener_config,
-                          con    = con)
-    # escolhe top N por tipo ou simplesmente top X global
-    metrics <- sc$full[order(rank_overall)]
-    # por simplicidade: top 20 global
-    selected <- head(metrics$symbol, 20)
+    # Lookback window for screener/risk
+    window_start <- t_reb %m-% lubridate::years(lookback_years)
+    panel_window <- dt[refdate >= window_start & refdate <= t_reb]
 
-    # dados de retornos até t_reb (para risk/portfolio)
-    dt_window <- panel_ret[date <= t_reb & symbol %in% selected]
-
-    port_res <- af_build_portfolio(
-      panel_returns   = dt_window,
-      selected_symbols = selected,
-      port_config     = bt_config$port_config,
-      metrics_table   = metrics,
-      rf_daily_series = NULL,   # já usamos excess_ret_simple
-      end_date        = t_reb
+    # 1) Screener on full universe in the window
+    scr_t <- af_run_screener(
+      panel      = panel_window,
+      config     = screener_config,
+      as_of_date = t_reb
     )
 
-    w_t <- port_res$weights
-    w_t <- w_t[!is.na(w_t)]
+    selected <- af_bt_select_symbols(scr_t, screener_config)
+    if (!length(selected)) {
+      warning(sprintf("No symbols selected at rebalance %s. Keeping previous weights.",
+                      as.character(t_reb)))
+      if (is.null(current_weights)) next
+    } else {
+      # 2) Risk model on selected subset
+      extra_args <- risk_config$extra_args
+      if (is.null(extra_args)) extra_args <- list()
+      risk_t <- do.call(
+        af_risk_build,
+        c(
+          list(
+            panel        = panel_window,
+            symbols      = selected,
+            end_date     = t_reb,
+            window_years = risk_config$window_years,
+            cov_method   = risk_config$cov_method,
+            mu_method    = risk_config$mu_method
+          ),
+          extra_args
+        )
+      )
 
-    # registra trades (simplificado: target weights)
-    trades <- rbind(
-      trades,
-      data.table::data.table(
-        date   = t_reb,
-        symbol = names(w_t),
-        weight = as.numeric(w_t)
-      ),
-      fill = TRUE
-    )
+      # 3) Portfolio optimization
+      port_t <- af_build_portfolio(
+        mu     = risk_t$mu,
+        Sigma  = risk_t$Sigma,
+        config = port_config
+      )
+      current_weights <- port_t$weights
 
-    # aplica retornos até próximo rebalance
-    t_next <- if (i < length(reb_dates)) reb_dates[i + 1] else end_date
-    dt_horizon <- panel_ret[
-      date > t_reb & date <= t_next & symbol %in% names(w_t)
-    ]
-    if (nrow(dt_horizon) == 0L) next
+      weights_log[[as.character(t_reb)]] <- data.table::data.table(
+        refdate = t_reb,
+        symbol  = names(current_weights),
+        weight  = as.numeric(current_weights)
+      )
+    }
 
-    data.table::setorder(dt_horizon, date)
-    # matriz de retornos por dia x ativo
-    ret_wide <- data.table::dcast(
-      dt_horizon,
-      date ~ symbol,
-      value.var = "excess_ret_simple"
-    )
-    dates_h <- ret_wide$date
-    ret_mat <- as.matrix(ret_wide[, -1, with = FALSE])
-    # garante colunas na ordem de w_t
-    ret_mat <- ret_mat[, names(w_t), drop = FALSE]
+    # 4) Apply these weights from next day until next rebalance
+    idx_reb <- which(dates_bt == t_reb)
+    if (!length(idx_reb)) next  # e.g. t_reb not an actual trading date
 
-    for (k in seq_along(dates_h)) {
-      r_vec <- ret_mat[k, ]
-      # retorno da carteira nesse dia
-      r_p <- sum(w_t * r_vec, na.rm = TRUE)
-      current_value <- current_value * (1 + r_p)
-      equity[date == dates_h[k], equity := current_value]
+    idx_start <- idx_reb + 1L
+    if (k < length(reb_dates)) {
+      idx_end <- which(dates_bt == reb_dates[k + 1L])
+    } else {
+      idx_end <- nD
+    }
+    if (idx_start > idx_end) next
+    if (is.null(current_weights)) next  # no portfolio yet
+
+    for (i in idx_start:idx_end) {
+      d <- dates_bt[i]
+      day_ret <- dt[refdate == d & symbol %in% names(current_weights),
+                    .(symbol, ret = get(ret_col))]
+
+      if (nrow(day_ret) == 0L) {
+        port_ret_d <- 0
+      } else {
+        data.table::setkey(day_ret, symbol)
+        w_vec   <- current_weights[day_ret$symbol]
+        ret_vec <- day_ret$ret
+        port_ret_d <- sum(w_vec * ret_vec, na.rm = TRUE)
+      }
+
+      returns_log[refdate == d, port_ret := port_ret_d]
+
+      if (i == 1L) {
+        equity[i] <- 1 * (1 + port_ret_d)
+      } else {
+        if (is.na(equity[i - 1L])) {
+          equity[i - 1L] <- equity[i - 2L]
+        }
+        equity[i] <- equity[i - 1L] * (1 + port_ret_d)
+      }
     }
   }
 
-  # preenche buracos por interpolação de último valor conhecido
-  data.table::setorder(equity, date)
-  equity[, equity := zoo::na.locf(equity, na.rm = FALSE)]
-  equity[is.na(equity), equity := 1]
+  # Fill any remaining NAs in equity curve (e.g. before first rebalance)
+  equity <- zoo::na.locf(equity, fromLast = FALSE, na.rm = FALSE)
+  equity_dt <- data.table::data.table(
+    refdate = dates_bt,
+    equity  = equity
+  )
 
-  # stats básicos
-  ret_daily <- equity[, equity / data.table::shift(equity) - 1]
-  ret_daily <- ret_daily[is.finite(ret_daily)]
-  cagr <- (tail(equity$equity, 1) / head(equity$equity, 1))^(252 / length(ret_daily)) - 1
-  vol  <- stats::sd(ret_daily, na.rm = TRUE) * sqrt(252)
-  sharpe <- if (vol > 0) cagr / vol else NA_real_
+  weights_dt <- if (length(weights_log)) {
+    data.table::rbindlist(weights_log, use.names = TRUE, fill = TRUE)
+  } else {
+    data.table::data.table(refdate = as.Date(NA),
+                           symbol  = NA_character_,
+                           weight  = NA_real_)
+  }
+
+  stats <- af_bt_compute_stats(equity_dt, returns_log)
 
   list(
-    equity_curve = equity,
-    trades       = trades,
-    stats        = list(
-      cagr   = cagr,
-      vol    = vol,
-      sharpe = sharpe
-    )
+    equity_curve    = equity_dt,
+    returns         = returns_log,
+    weights         = weights_dt,
+    rebalance_dates = reb_dates,
+    stats           = stats
   )
 }
