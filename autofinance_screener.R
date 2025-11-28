@@ -7,21 +7,15 @@ af_screener_config_default <- list(
   lookback_days   = 252L,
   horizons_days   = c(21L, 63L, 126L, 252L),
   min_liquidity   = 5e5,
-  min_days_traded = 0.8,
-  ibov_series_id  = "IBOV",
-  usd_series_id   = "USD_BR",
-  # Weights are now on *factors*, not raw metrics
+  min_days_traded = 0.8,        # 80% dos dias com negócio
+  ibov_series_id  = "IBOV",     # se você salvar IBOV em macro_series
+  usd_series_id   = "USD_BR",   # idem
   score_weights   = list(
-    mom_short      = 0.35,   # ret_21d
-    mom_medium     = 0.30,   # ret_63d
-    mom_long       = 0.15,   # ret_126d/252d
-    risk_vol       = -0.15,  # vol_252d
-    risk_drawdown  = -0.20,  # max_dd
-    risk_ulcer     = -0.10,  # ulcer_index
-    risk_tail      = -0.10,  # cvar_95
-    liq_turnover   = 0.10,   # median_vol_fin
-    liq_depth      = 0.05,   # days_traded_ratio
-    beta_abs       = -0.05   # |beta_ibov|
+    ret_252d    = +1.0,
+    vol_252d    = -0.5,
+    ulcer_index = -0.7,
+    beta_ibov   = -0.2,
+    amihud      = -0.3
   )
 )
 
@@ -37,29 +31,30 @@ af_compute_basic_liquidity_filter <- function(con,
     WHERE refdate >= '%s' AND refdate <= '%s'
   ", lookback_start, ref_date)
   dt <- data.table::as.data.table(DBI::dbGetQuery(con, q))
-  if (nrow(dt) == 0L) {
-    return(data.table::data.table(
-      symbol           = character(0),
-      median_vol_fin   = numeric(0),
-      days_traded_ratio = numeric(0)
-    ))
-  }
+  if (nrow(dt) == 0L) return(data.table::data.table(symbol = character(0)))
 
   dt[, refdate := as.Date(refdate)]
   data.table::setorder(dt, symbol, refdate)
 
+  # janelinha de lookback exata (últimos N dias úteis observados)
+  dt[, n_obs := .N, by = symbol]
+  # calculamos para todo período; o screener principal ainda cortará para N dias úteis se quiser
+
   liq <- dt[, .(
-    median_vol_fin    = stats::median(vol_fin, na.rm = TRUE),
+    median_vol_fin = stats::median(vol_fin, na.rm = TRUE),
     days_traded_ratio = mean(qty > 0, na.rm = TRUE)
   ), by = symbol]
 
-  liq[is.na(median_vol_fin),    median_vol_fin := 0]
+  liq[is.na(median_vol_fin), median_vol_fin := 0]
   liq[is.na(days_traded_ratio), days_traded_ratio := 0]
 
-  # Mantém todas as colunas; o filtro é feito no screener
-  liq
-}
+  liq_filtered <- liq[
+    median_vol_fin >= min_liquidity &
+      days_traded_ratio >= min_days_traded
+  ]
 
+  liq_filtered
+}
 
 af_compute_symbol_metrics <- function(dt_sym,
                                       horizons_days,
@@ -187,25 +182,17 @@ af_run_screener <- function(ref_date = Sys.Date(),
   lookback_start <- ref_date - lookback_days * 2
 
   # 1) filtro de liquidez com prices_raw
-  liq_all <- af_compute_basic_liquidity_filter(
-    con             = con,
-    min_liquidity   = config$min_liquidity,
+  liq <- af_compute_basic_liquidity_filter(
+    con           = con,
+    min_liquidity = config$min_liquidity,
     min_days_traded = config$min_days_traded,
-    lookback_start  = lookback_start,
-    ref_date        = ref_date
+    lookback_start = lookback_start,
+    ref_date = ref_date
   )
-
-  # aplica filtro de liquidez mas guarda métricas
-  liq <- liq_all[
-    median_vol_fin    >= config$min_liquidity &
-      days_traded_ratio >= config$min_days_traded
-  ]
-
   if (nrow(liq) == 0L) {
     stop("af_run_screener: no liquid symbols found.")
   }
   symbols_liq <- liq$symbol
-
 
   # 2) painel ajustado + retornos
   panel <- af_build_adjusted_panel(con, symbols_liq, lookback_start, ref_date)
