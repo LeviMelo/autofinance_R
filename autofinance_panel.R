@@ -186,25 +186,20 @@ af_apply_splits_one_symbol <- function(prices_dt,
 
   split_xts <- NULL
   if (!is.null(splits_dt) && nrow(splits_dt) > 0L) {
-    # Quantmod espera um objeto tipo xts:
-    #   índice = datas, valores = ratio (como getSplits() retorna)
-    split_xts <- xts::xts(splits_dt$value,
-                          order.by = splits_dt$date)
+    split_xts <- xts::xts(
+      x        = splits_dt$value,
+      order.by = splits_dt$date
+    )
+    colnames(split_xts) <- "ratio"
   }
 
   # Ajuste
   # use.Adjusted = FALSE -> gera colunas ajustadas a partir de OHLC
   if (!is.null(split_xts)) {
-    # Build ratios explicitly; adjustOHLC expects 'ratio', not split/div args
-    ratio_xts <- quantmod::adjRatios(
-      splits    = split_xts,
-      dividends = NULL,
-      close     = quantmod::Cl(ohlc_xts)
-    )
     ohlc_adj <- quantmod::adjustOHLC(
       ohlc_xts,
       use.Adjusted = FALSE,
-      ratio        = ratio_xts
+      ratio        = split_xts
     )
   } else {
     # Sem splits: apenas replica

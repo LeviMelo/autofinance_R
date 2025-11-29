@@ -113,6 +113,8 @@ af_sync_splits <- function(con = NULL,
       )
       # FIX: Changed from af_db_insert_corporate_actions to matches db_core
       af_db_insert_adjustments(con, dt_s)
+    } else {
+      if (verbose) message("  no splits found for ", sym, " (using unadjusted prices).")
     }
 
     # Atualiza metadata para não ficar rechecando (User Logic Preserved)

@@ -20,6 +20,12 @@ af_sync_yahoo_splits <- function(con = NULL,
     con <- af_db_connect()
     on.exit(af_db_disconnect(con), add = TRUE)
   }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_sync_yahoo_dividends: 'con' is not a valid DBI connection.")
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_sync_yahoo_splits: 'con' is not a valid DBI connection.")
+  }
   af_attach_packages(c("DBI", "data.table", "quantmod"))
 
   af_db_init(con)

@@ -40,12 +40,20 @@ af_screener_config_default <- list(
 # Filtro de liquidez em cima de prices_raw
 ############################################################
 
-af_compute_basic_liquidity_filter <- function(con,
+af_compute_basic_liquidity_filter <- function(con = NULL,
                                               min_liquidity,
                                               min_days_traded,
                                               lookback_start,
                                               ref_date) {
   af_attach_packages("data.table")
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_compute_basic_liquidity_filter: 'con' is not a valid DBI connection.")
+  }
   q <- sprintf("
     SELECT symbol, refdate, vol_fin, qty
     FROM prices_raw
@@ -229,12 +237,21 @@ af_run_screener <- function(panel = NULL,
                             ref_date = Sys.Date(),
                             as_of_date = NULL,
                             config = af_screener_config_default,
-                            con = af_db_connect()) {
+                            con = NULL) {
   # If a panel is provided, operate purely in-memory (Option A).
   # Otherwise, pull from DB (legacy path).
-  own_con <- is.null(panel)
-  if (own_con && !is.null(con)) on.exit(af_db_disconnect(con), add = TRUE)
   af_attach_packages("data.table")
+  own_con <- FALSE
+  if (is.null(panel)) {
+    if (is.null(con)) {
+      con <- af_db_connect()
+      own_con <- TRUE
+    }
+    if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+      stop("af_run_screener: 'con' is not a valid DBI connection.")
+    }
+    if (own_con) on.exit(af_db_disconnect(con), add = TRUE)
+  }
 
   ref_date <- as.Date(if (is.null(as_of_date)) ref_date else as_of_date)
   lookback_days <- config$lookback_days
