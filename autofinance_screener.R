@@ -73,6 +73,30 @@ af_compute_basic_liquidity_filter <- function(con,
   liq_filtered
 }
 
+# Liquidity filter for in-memory panel path (panel already has ret_simple/vol_fin)
+af_compute_basic_liquidity_from_panel <- function(panel_ret,
+                                                  min_liquidity,
+                                                  min_days_traded) {
+  af_attach_packages("data.table")
+  dt <- data.table::as.data.table(panel_ret)
+  if (!("ret_simple" %in% names(dt))) {
+    stop("panel_ret must contain ret_simple for liquidity filter.")
+  }
+  dt[, traded_flag := !is.na(ret_simple)]
+  liq <- dt[, .(
+    median_vol_fin    = stats::median(vol_fin, na.rm = TRUE),
+    days_traded_ratio = mean(traded_flag, na.rm = TRUE)
+  ), by = symbol]
+
+  liq[is.na(median_vol_fin),    median_vol_fin := 0]
+  liq[is.na(days_traded_ratio), days_traded_ratio := 0]
+
+  liq[
+    median_vol_fin    >= min_liquidity &
+      days_traded_ratio >= min_days_traded
+  ]
+}
+
 ############################################################
 # Métricas por ativo (multi-horizonte + risco completo)
 ############################################################
@@ -244,6 +268,16 @@ af_run_screener <- function(panel = NULL,
     if (!("ret_simple" %in% names(panel_ret))) {
       panel_ret <- af_compute_returns(panel_ret)
     }
+    # Apply liquidity filter in panel-first mode as well
+    liq <- af_compute_basic_liquidity_from_panel(
+      panel_ret,
+      min_liquidity   = config$min_liquidity,
+      min_days_traded = config$min_days_traded
+    )
+    if (nrow(liq) == 0L) {
+      stop("af_run_screener: no liquid symbols in provided panel.")
+    }
+    panel_ret <- panel_ret[symbol %in% liq$symbol]
   }
 
   # 3) fatores macro (ex: IBOV, USD) - DB path only
@@ -315,6 +349,10 @@ af_run_screener <- function(panel = NULL,
 
   # 6) escore com z-score por métrica
   w <- config$score_weights
+  # Flip sign: use magnitude so bigger drawdown -> bigger penalty with negative weight
+  if ("max_dd" %in% names(metrics)) {
+    metrics[, max_dd := -max_dd]
+  }
   metrics[, score := 0]
 
   for (nm in names(w)) {

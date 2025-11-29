@@ -68,7 +68,11 @@ af_fetch_cotahist_year <- function(year,
     low     = as.numeric(col_pick("low", c("low", "price.low", "preco_minimo"))),
     close   = as.numeric(col_pick("close", c("close", "price.close", "preco_ultimo"))),
     vol_fin = as.numeric(col_pick("vol_fin", c("volume", "financial_volume", "volume_total"))),
-    qty     = as.numeric(col_pick("qty", c("quantity", "number_trades", "quantidade_negociada")))
+    qty     = as.numeric(col_pick(
+      "qty",
+      c("trade_quantity", "traded_contracts",
+        "quantity", "number_trades", "quantidade_negociada")
+    ))
   )
 
   # Filter out rows with missing keys
@@ -102,11 +106,24 @@ af_sync_b3 <- function(con = af_db_connect(),
   
   for (y in years) {
     if (verbose) message("af_sync_b3: processing year ", y)
-    dt <- af_fetch_cotahist_year(y)
+    dt <- af_fetch_cotahist_year(y, asset_filter = "all")
     
     if (nrow(dt) > 0) {
       if (verbose) message("  inserting ", nrow(dt), " rows...")
       af_db_insert_prices_raw(con, dt)
+      # Seed assets_meta so splits sync can run later
+      syms <- unique(dt$symbol)
+      if (length(syms) > 0L) {
+        meta_dt <- data.table::data.table(
+          symbol             = syms,
+          asset_type         = NA_character_,
+          sector             = NA_character_,
+          active             = 1L,
+          last_update_splits = NA_character_,
+          last_update_divs   = NA_character_
+        )
+        af_db_upsert_assets_meta(con, meta_dt)
+      }
     } else {
       if (verbose) message("  no data found for ", y)
     }

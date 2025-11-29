@@ -497,9 +497,9 @@ af_risk_build <- function(panel,
 # de passar um config-list em vez de um monte de argumentos soltos.
 
 af_risk_config_default <- list(
-  window_years    = 3,
+  window_years    = 2,
   use_excess      = TRUE,
-  min_obs_ratio   = 0.7,
+  min_obs_ratio   = 0.5,
   cov_method      = "sample",     # "sample", "shrinkage", "garch_dcc"
   mu_method       = "hist_mean",  # "hist_mean", "momentum", "var"
   shrink_lambda   = 0.1,
