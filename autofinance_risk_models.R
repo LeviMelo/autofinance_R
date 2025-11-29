@@ -116,10 +116,23 @@ af_risk_prepare_returns <- function(panel,
   # Drop assets with too many NAs
   n_obs <- length(dates)
   non_na_counts <- colSums(!is.na(R_mat))
-  keep <- non_na_counts >= min_obs_ratio * n_obs
+  base_min <- ceiling(min_obs_ratio * n_obs)
+  max_obs  <- max(non_na_counts, na.rm = TRUE)
+  eff_min  <- min(base_min, floor(max_obs * 0.8))
+
+  keep <- non_na_counts >= eff_min
 
   if (!any(keep)) {
-    stop("All assets dropped by min_obs_ratio filter; relax constraints or extend window.")
+    # fallback: try a looser threshold before erroring
+    eff_min2 <- floor(max_obs * 0.5)
+    keep <- non_na_counts >= eff_min2
+    if (!any(keep)) {
+      warning(sprintf(
+        "risk_prepare_returns: dropping all assets (n_obs=%s, base_min=%s, max_obs=%s, eff_min=%s, eff_min2=%s)",
+        n_obs, base_min, max_obs, eff_min, eff_min2
+      ))
+      stop("All assets dropped by min_obs_ratio filter; relax constraints or extend window.")
+    }
   }
 
   drops <- setdiff(colnames(R_mat), colnames(R_mat)[keep])

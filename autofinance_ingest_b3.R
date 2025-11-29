@@ -81,10 +81,47 @@ af_fetch_cotahist_year <- function(year,
   dt_out
 }
 
-af_sync_b3 <- function(con = af_db_connect(),
+# Basic classifier to tag asset type / investable based on ticker pattern.
+af_classify_symbol <- function(symbol_chr) {
+  sym <- toupper(trimws(symbol_chr))
+  investable <- TRUE
+  asset_type <- "OTHER"
+
+  # Exclude obvious fractions/receipts/options patterns
+  if (grepl("F$", sym) || grepl("[^A-Z0-9]", sym) || nchar(sym) > 8) {
+    investable <- FALSE
+  }
+
+  # Rights/subscription receipts often end with 3+ digits not in our allowed set
+  if (grepl("[0-9]{3,}$", sym) && !grepl("(11|32|33|34|35|36|39)$", sym)) {
+    investable <- FALSE
+  }
+
+  # BDR patterns: usually end with 32-35 (and similar)
+  if (grepl("(32|33|34|35|36|39)$", sym)) {
+    asset_type <- "BDR"
+  } else if (grepl("11$", sym)) {
+    asset_type <- "ETF_FII"  # cannot easily separate here without extra metadata
+  } else {
+    asset_type <- "EQUITY"
+  }
+
+  if (!investable) asset_type <- "OTHER"
+
+  list(asset_type = asset_type, active = as.integer(investable))
+}
+
+af_sync_b3 <- function(con = NULL,
                        years = NULL,
                        verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_sync_b3: 'con' is not a valid DBI connection.")
+  }
   af_attach_packages("data.table")
   
   if (is.null(years)) {
@@ -107,18 +144,19 @@ af_sync_b3 <- function(con = af_db_connect(),
   for (y in years) {
     if (verbose) message("af_sync_b3: processing year ", y)
     dt <- af_fetch_cotahist_year(y, asset_filter = "all")
-    
+
     if (nrow(dt) > 0) {
       if (verbose) message("  inserting ", nrow(dt), " rows...")
       af_db_insert_prices_raw(con, dt)
       # Seed assets_meta so splits sync can run later
       syms <- unique(dt$symbol)
       if (length(syms) > 0L) {
+        classified <- lapply(syms, af_classify_symbol)
         meta_dt <- data.table::data.table(
           symbol             = syms,
-          asset_type         = NA_character_,
+          asset_type         = vapply(classified, `[[`, "", "asset_type"),
           sector             = NA_character_,
-          active             = 1L,
+          active             = vapply(classified, `[[`, integer(1), "active"),
           last_update_splits = NA_character_,
           last_update_divs   = NA_character_
         )

@@ -12,8 +12,13 @@ af_db_connect <- function(db_path = AF_DB_PATH) {
 }
 
 af_db_disconnect <- function(con) {
-  if (!is.null(con) && DBI::dbIsValid(con)) {
-    DBI::dbDisconnect(con)
+  # Be defensive in case someone passes the wrong object (e.g., curl connection)
+  if (is.null(con)) return(invisible(TRUE))
+  if (inherits(con, "DBIConnection")) {
+    ok <- tryCatch(DBI::dbIsValid(con), error = function(...) FALSE)
+    if (isTRUE(ok)) {
+      DBI::dbDisconnect(con)
+    }
   }
   invisible(TRUE)
 }

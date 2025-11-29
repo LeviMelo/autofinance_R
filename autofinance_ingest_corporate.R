@@ -11,11 +11,15 @@ af_yahoo_to_symbol <- function(yahoo_symbol) {
   sub("\\.SA$", "", yahoo_symbol)
 }
 
-af_sync_yahoo_splits <- function(con = af_db_connect(),
+af_sync_yahoo_splits <- function(con = NULL,
                                  symbols = NULL,
                                  from_default = as.Date("2000-01-01"),
                                  verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
   af_attach_packages(c("DBI", "data.table", "quantmod"))
 
   af_db_init(con)
@@ -86,11 +90,15 @@ af_sync_yahoo_splits <- function(con = af_db_connect(),
   invisible(TRUE)
 }
 
-af_sync_yahoo_dividends <- function(con = af_db_connect(),
+af_sync_yahoo_dividends <- function(con = NULL,
                                     symbols = NULL,
                                     from_default = as.Date("2000-01-01"),
                                     verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
   af_attach_packages(c("DBI", "data.table", "quantmod"))
 
   af_db_init(con)

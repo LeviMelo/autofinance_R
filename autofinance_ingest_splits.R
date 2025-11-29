@@ -3,12 +3,23 @@
 # Sincronização de splits (e futuramente dividendos) via quantmod
 ############################################################
 
-af_sync_splits <- function(con = af_db_connect(),
+af_sync_splits <- function(con = NULL,
                            symbols = NULL,
                            max_age_days = 7L,
                            force = FALSE,
-                           verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+                           verbose = TRUE,
+                           investable_only = TRUE,
+                           mode = c("investable", "all", "suspects"),
+                           suspect_threshold = 0.2) {
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_sync_splits: 'con' is not a valid DBI connection.")
+  }
+  mode <- match.arg(mode)
   af_attach_packages(c("data.table", "quantmod"))
   dt_assets <- data.table::as.data.table(
     DBI::dbGetQuery(con, "SELECT symbol, active, last_update_splits FROM assets_meta")
@@ -17,7 +28,36 @@ af_sync_splits <- function(con = af_db_connect(),
   if (!is.null(symbols)) {
     dt_assets <- dt_assets[symbol %in% symbols]
   } else {
-    dt_assets <- dt_assets[active == 1L]
+    if (mode == "investable") {
+      dt_assets <- dt_assets[active == 1L]
+    } else if (mode == "suspects") {
+      # Heuristic: recent unadjusted big moves
+      lookback_start <- Sys.Date() - 365
+      px <- data.table::as.data.table(DBI::dbGetQuery(
+        con,
+        sprintf("
+          SELECT symbol, refdate, close
+          FROM prices_raw
+          WHERE refdate >= '%s'
+        ", format(lookback_start, "%Y-%m-%d"))
+      ))
+      if (nrow(px)) {
+        px[, refdate := as.Date(refdate)]
+        data.table::setorder(px, symbol, refdate)
+        px[, ret := close / data.table::shift(close) - 1, by = symbol]
+        diag_dt <- px[, .(max_abs_ret = max(abs(ret), na.rm = TRUE)), by = symbol]
+        suspects <- diag_dt[max_abs_ret >= suspect_threshold, symbol]
+        dt_assets <- dt_assets[symbol %in% suspects]
+      } else {
+        dt_assets <- dt_assets[0]
+      }
+    } else {
+      # mode == "all"
+      dt_assets <- dt_assets
+    }
+    if (investable_only) {
+      dt_assets <- dt_assets[active == 1L]
+    }
   }
 
   today <- Sys.Date()
@@ -37,11 +77,32 @@ af_sync_splits <- function(con = af_db_connect(),
     ysym <- paste0(sym, ".SA")
     if (verbose) message("af_sync_splits: ", sym, " (", ysym, ")")
     splits_xts <- NULL
-    try({
-      suppressWarnings(
-        splits_xts <- quantmod::getSplits(ysym, auto.assign = FALSE)
-      )
-    }, silent = TRUE)
+    # basic backoff for Yahoo 429/tempo issues
+    fetch_splits <- function() {
+      tryCatch({
+        suppressWarnings(
+          quantmod::getSplits(ysym, auto.assign = FALSE)
+        )
+      }, error = function(e) {
+        msg <- conditionMessage(e)
+        if (grepl("429|Too Many Requests", msg, ignore.case = TRUE)) {
+          if (verbose) message("  Yahoo rate limit, sleeping 60s before retry...")
+          Sys.sleep(60)
+          tryCatch({
+            suppressWarnings(
+              quantmod::getSplits(ysym, auto.assign = FALSE)
+            )
+          }, error = function(e2) {
+            if (verbose) message("  retry failed for ", sym, ": ", conditionMessage(e2))
+            NULL
+          })
+        } else {
+          if (verbose) message("  error fetching splits for ", sym, ": ", msg)
+          NULL
+        }
+      })
+    }
+    splits_xts <- fetch_splits()
 
     if (!is.null(splits_xts) && NROW(splits_xts) > 0) {
       dt_s <- data.table::data.table(

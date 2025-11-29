@@ -42,11 +42,16 @@ af_panel_db_connect <- function(db_path = AF_DB_PATH) {
 
 # Retorna data.table:
 #   symbol, refdate(Date), open, high, low, close, vol_fin, qty
-af_load_prices_raw <- function(con,
+af_load_prices_raw <- function(con = NULL,
                                symbols    = NULL,
                                start_date = NULL,
                                end_date   = NULL) {
-  if (!DBI::dbIsValid(con)) {
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
     stop("af_load_prices_raw: 'con' is not a valid DBI connection.")
   }
 
@@ -96,12 +101,17 @@ af_load_prices_raw <- function(con,
 
 # Retorna data.table:
 #   symbol, date(Date), type, value
-af_load_adjustments <- function(con,
+af_load_adjustments <- function(con = NULL,
                                 symbols    = NULL,
                                 start_date = NULL,
                                 end_date   = NULL,
                                 types      = c("SPLIT")) {
-  if (!DBI::dbIsValid(con)) {
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
     stop("af_load_adjustments: 'con' is not a valid DBI connection.")
   }
 
@@ -185,11 +195,16 @@ af_apply_splits_one_symbol <- function(prices_dt,
   # Ajuste
   # use.Adjusted = FALSE -> gera colunas ajustadas a partir de OHLC
   if (!is.null(split_xts)) {
+    # Build ratios explicitly; adjustOHLC expects 'ratio', not split/div args
+    ratio_xts <- quantmod::adjRatios(
+      splits    = split_xts,
+      dividends = NULL,
+      close     = quantmod::Cl(ohlc_xts)
+    )
     ohlc_adj <- quantmod::adjustOHLC(
       ohlc_xts,
       use.Adjusted = FALSE,
-      split = split_xts,
-      div   = NULL
+      ratio        = ratio_xts
     )
   } else {
     # Sem splits: apenas replica
@@ -217,10 +232,15 @@ af_apply_splits_one_symbol <- function(prices_dt,
 #
 # Nota: vol_fin e qty vêm do prices_raw sem ajuste (o padrão mesmo).
 #       Se quiser "volume ajustado", dá pra derivar depois.
-af_build_adjusted_panel <- function(con,
+af_build_adjusted_panel <- function(con = NULL,
                                     symbols    = NULL,
                                     start_date = NULL,
                                     end_date   = NULL) {
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
   # 1) Carregar preços crus
   prices <- af_load_prices_raw(
     con        = con,

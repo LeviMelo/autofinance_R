@@ -36,12 +36,19 @@ af_fetch_sgs_series <- function(series_id, start_date, end_date) {
   dt[, .(refdate, value)]
 }
 
-af_sync_macro_series <- function(con = af_db_connect(),
+af_sync_macro_series <- function(con = NULL,
                                  series_map, # Named vector: c("CDI"=12, "USD"=1)
                                  start_date,
                                  end_date,
                                  verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_sync_macro_series: 'con' is not a valid DBI connection.")
+  }
   af_db_init(con)
   af_attach_packages(c("DBI", "data.table"))
 
