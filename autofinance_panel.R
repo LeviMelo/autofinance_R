@@ -174,6 +174,9 @@ af_load_adjustments <- function(con = NULL,
 #   refdate, open_adj, high_adj, low_adj, close_adj
 af_apply_splits_one_symbol <- function(prices_dt,
                                        splits_dt = NULL) {
+  # prices_dt: data.table(refdate, open, high, low, close)
+  # splits_dt: data.table(date, value) with split factors from Yahoo
+
   if (nrow(prices_dt) == 0L) return(NULL)
 
   # Garantir ordenação
@@ -184,22 +187,31 @@ af_apply_splits_one_symbol <- function(prices_dt,
   colnames(ohlc_mat) <- c("Open", "High", "Low", "Close")
   ohlc_xts <- xts::xts(ohlc_mat, order.by = prices_dt$refdate)
 
-  split_xts <- NULL
+  # Se houver splits para este ativo, construir série de razões diárias
   if (!is.null(splits_dt) && nrow(splits_dt) > 0L) {
+    # 1) xts esparso com eventos de split (como getSplits retorna)
     split_xts <- xts::xts(
       x        = splits_dt$value,
       order.by = splits_dt$date
     )
-    colnames(split_xts) <- "ratio"
-  }
 
-  # Ajuste
-  # use.Adjusted = FALSE -> gera colunas ajustadas a partir de OHLC
-  if (!is.null(split_xts)) {
+    # 2) Construir fatores de ajuste diários à la CRSP (TTR::adjRatios)
+    #    - 'splits' = fatores de split (0.5 para 2:1 etc.)
+    #    - 'dividends' = NULL por enquanto (não estamos ajustando proventos)
+    #    - 'close' = série de fechamento original
+    ratios <- TTR::adjRatios(
+      splits    = split_xts,
+      dividends = NULL,
+      close     = quantmod::Cl(ohlc_xts)
+    )
+
+    # 3) Usar apenas coluna de split; mesmo índice que ohlc_xts
+    split_ratio <- ratios[, "Split"]
+
     ohlc_adj <- quantmod::adjustOHLC(
       ohlc_xts,
       use.Adjusted = FALSE,
-      ratio        = split_xts
+      ratio        = split_ratio
     )
   } else {
     # Sem splits: apenas replica
@@ -216,6 +228,7 @@ af_apply_splits_one_symbol <- function(prices_dt,
 
   out[]
 }
+
 
 # ----------------------------------------------------------------------
 # 4) Construir painel ajustado para vários símbolos

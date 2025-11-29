@@ -21,11 +21,9 @@ af_sync_yahoo_splits <- function(con = NULL,
     on.exit(af_db_disconnect(con), add = TRUE)
   }
   if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
-    stop("af_sync_yahoo_dividends: 'con' is not a valid DBI connection.")
-  }
-  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
     stop("af_sync_yahoo_splits: 'con' is not a valid DBI connection.")
   }
+
   af_attach_packages(c("DBI", "data.table", "quantmod"))
 
   af_db_init(con)
@@ -58,9 +56,13 @@ af_sync_yahoo_splits <- function(con = NULL,
     if (verbose) message("Splits: ", sym, " (", ysym, ") from ", from_date, "...")
 
     sp <- tryCatch(
-      quantmod::getSplits(ysym, from = from_date),
-      error = function(e) NULL
+      quantmod::getSplits(ysym, from = from_date, auto.assign = FALSE),
+      error = function(e) {
+        if (verbose) message("  error fetching splits for ", sym, ": ", conditionMessage(e))
+        NULL
+      }
     )
+
     if (is.null(sp) || nrow(sp) == 0L) {
       # mesmo sem splits, atualizamos last_update_splits
       new_last <- format(Sys.Date(), "%Y-%m-%d")

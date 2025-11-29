@@ -14,6 +14,8 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R':
   autofinance_R.Rproj
   autofinance_risk_models.R
   autofinance_screener.R
+  data/autofinance.sqlite-shm
+  data/autofinance.sqlite-wal
   PLAN.md
   PLAN_risk.md
 
@@ -28,6 +30,1405 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R':
 .Ruserdata
 data/autofinance.sqlite
 codebase_dump_autofinance_R.txt
+
+
+
+###############################################################################
+### FILE: PLAN.md
+###############################################################################
+Here’s a concrete, implementable architecture you can drop into `PLAN.md` and build against.
+
+---
+
+# Autofinance V2 – Architectural Plan
+
+## 0. Scope and Non-Negotiables
+
+**Goal:**
+Local, R-based “research station” to:
+
+* Ingest and persist **B3 tape** (COTAHIST via `rb3`).
+* Ingest and persist **corporate actions** (splits, and optionally dividends) via `quantmod::getSplits` / `getDividends`.
+* Ingest and persist **macro factors** (CDI, Selic, IPCA, FX, etc.) from **BCB SGS**.
+* Build **split-adjusted price panels** for B3 assets.
+* Compute **research-grade metrics** (returns at multiple horizons, vol, skew, kurtosis, VaR, CVaR, drawdowns, betas to multiple factors).
+* Run a **screener** (purely gross performance/risk, per-asset-class).
+* Run **offline backtests** using only the local DB snapshot.
+* Leave tax/fiscal rules and trading rules to the **portfolio/backtest layer**, not the screener.
+
+**Non-negotiable constraints:**
+
+1. **No always-on server, no cron jobs.** Everything is triggered by R functions you explicitly call.
+2. **COTAHIST (via `rb3`) is the ground truth** for B3 OHLCV. Yahoo is never a primary price source, only a source of corporate actions (and optionally total-return stuff later).
+3. **Splits are never inferred heuristically** from price jumps. Only `getSplits()` results are used. If we have no splits, we either:
+
+   * Treat the series as unsplit, or
+   * Flag it as “unverified” and optionally drop from serious analysis.
+4. **`quantmod::getSplits()` is acceptable for the entire B3 universe**, with caching to SQLite. The real network constraint is bulk OHLC/dividend history from Yahoo, not splits.
+5. **Backtests are 100% offline.** All required history must be in SQLite before the backtest starts.
+6. **Screener works on gross world.** No tax logic, no fee modeling. Asset-class separation is allowed (Equity / FII / BDR / ETF buckets), but net-of-tax modeling happens later.
+
+---
+
+## 1. High-Level System Overview
+
+Think of Autofinance V2 as four layers:
+
+1. **Data Layer (SQLite + ingestion)**
+
+   * `rb3` → COTAHIST → `prices_raw` table.
+   * `quantmod` → splits/dividends → `corporate_actions` table.
+   * BCB SGS → macro series → `macro_series` table.
+   * Metadata for tickers (type, active/delisted, last update timestamps) → `assets_meta`.
+
+2. **Adjustment + Panel Layer**
+
+   * Merge **raw OHLCV** with **splits** to produce **split-adjusted OHLC** in memory for a given set of tickers and date range.
+
+3. **Metrics & Screener Layer**
+
+   * Given adjusted OHLC and macro series, compute a dense feature vector per asset: multi-horizon returns, volatilities, drawdown metrics, tail risk, betas to IBOV, SPX, USD, DI, etc.
+   * Apply **liquidity filters** and **class-wise rankings** (e.g., Top K equities, Top K FIIs, Top K BDRs).
+
+4. **Backtesting & Portfolio Layer**
+
+   * Take screener outputs + DB snapshot.
+   * Run offline simulations, with optional tax rules, costs, rebalancing rules, and constraints.
+   * All data access via SQLite; no HTTP inside the simulation loop.
+
+---
+
+## 2. Core Principles and Design Invariants
+
+1. **Single Source of Truth (per domain):**
+
+   * Prices/volume: **B3** via `rb3`.
+   * Corporate actions: **Yahoo** via `quantmod` (`getSplits`, maybe `getDividends`).
+   * Macro factors: **BCB SGS**.
+
+2. **SQLite as persistent state:**
+
+   * All raw data and events live in a single file `autofinance.sqlite`.
+   * No CSVs as canonical storage.
+
+3. **On-demand synchronization:**
+
+   * You call explicit sync functions:
+
+     * `af_sync_b3()` for COTAHIST.
+     * `af_sync_splits()` for splits.
+     * `af_sync_macro()` for macro.
+     * `af_sync_all()` as a convenience wrapper.
+   * No background tasks.
+
+4. **Adjustments computed locally:**
+
+   * Use `TTR::adjRatios` (or equivalent) + splits table to adjust **all OHLC** (not only close).
+   * Adjusted prices are computed on the fly when needed; they don’t need to be stored as a separate table initially (can be added later for speed).
+
+5. **Dynamic horizons and lookback:**
+
+   * Screener takes a **configurable lookback window**.
+   * Only horizons compatible with available history are computed (e.g., no 3-year metrics if lookback is 1 year).
+
+6. **Asset-class-aware ranking:**
+
+   * The screener outputs **per-class rankings** (equities vs FIIs vs BDRs vs ETFs) instead of a single global “Top N”.
+
+---
+
+## 3. Data Sources and Contracts
+
+### 3.1. B3 COTAHIST via `rb3`
+
+* **Responsibility:** Provide daily OHLCV for all B3 tickers, including delisted ones.
+* **Usage:**
+
+  * Initial bootstrap: download all past years of interest.
+  * On update: download only the missing year(s) and upsert rows.
+
+### 3.2. Yahoo via `quantmod`
+
+* **Splits (mandatory):**
+
+  * `getSplits("PETR4.SA")`, etc.
+  * Full-history for each ticker at first fetch, then incremental (from last date + 1).
+
+* **Dividends (optional, later):**
+
+  * `getDividends()`.
+  * Only required if you want total-return metrics (DRIP, etc.) or realistic cash flow modeling.
+
+### 3.3. BCB SGS Macro Series
+
+Typical series:
+
+* **Risk-free:** CDI, Selic.
+* **Inflation:** IPCA, maybe IGP-M.
+* **FX:** USD/BRL PTAX.
+* **Activity:** IBC-Br.
+
+Usage:
+
+* For **betas/correlations** (asset returns vs macro factor returns).
+* For regime-aware strategies in the backtester.
+
+---
+
+## 4. Data Model – SQLite Schema
+
+This is the backbone. Explicit table definitions:
+
+### 4.1. `assets_meta`
+
+Tracks the universe and state per symbol.
+
+**Columns:**
+
+* `symbol` (TEXT, PK) — e.g., `"PETR4"`, `"KNCR11"`, `"IVVB11"`.
+* `asset_type` (TEXT) — `"EQUITY"`, `"FII"`, `"BDR"`, `"ETF"`, etc.
+* `sector` (TEXT, nullable).
+* `active` (INTEGER) — `1` for currently trading, `0` if delisted.
+* `last_update_prices` (TEXT, ISO date) — last date we ingested raw COTAHIST for this symbol (optional; COTAHIST is mostly year-based, so this can be global).
+* `last_update_splits` (TEXT, ISO date) — last time we checked `getSplits`.
+* `last_update_divs` (TEXT, ISO date) — last time we checked dividends (if used).
+
+Indexes:
+
+* PK (`symbol`) is enough for this table.
+
+### 4.2. `prices_raw`
+
+Immutable tape from B3.
+
+**Columns:**
+
+* `symbol` (TEXT).
+* `refdate` (TEXT, `YYYY-MM-DD`).
+* `open` (REAL).
+* `high` (REAL).
+* `low` (REAL).
+* `close` (REAL).
+* `vol_fin` (REAL) — financial volume.
+* `qty` (INTEGER) — volume in shares/quotes.
+
+**Constraints:**
+
+* `PRIMARY KEY (symbol, refdate)`
+  `WITHOUT ROWID` for efficiency.
+
+Indexes:
+
+* Composite PK already covers `(symbol, refdate)` queries.
+* Optional index on `refdate` alone if you often query “all symbols on a given day”.
+
+### 4.3. `corporate_actions`
+
+Splits and (later) dividends.
+
+**Columns:**
+
+* `symbol` (TEXT).
+* `date` (TEXT, `YYYY-MM-DD`) — ex-date.
+* `type` (TEXT) — `"SPLIT"` or `"DIVIDEND"`.
+* `value` (REAL) — split factor (e.g., `0.1` for 10→1) or dividend amount per share.
+
+**Constraints:**
+
+* `PRIMARY KEY (symbol, date, type)`.
+
+Indexes:
+
+* PK is enough.
+
+### 4.4. `macro_series`
+
+Macro indicators from BCB.
+
+**Columns:**
+
+* `series_id` (TEXT or INTEGER) — e.g. `"CDI"`, `"SELIC"`, `"IPCA"`, `"USD_P TAX"`, or numeric BCB ID.
+* `refdate` (TEXT).
+* `value` (REAL).
+
+**Constraints:**
+
+* `PRIMARY KEY (series_id, refdate)`.
+
+### 4.5. Possible future tables (not mandatory now)
+
+* `prices_adj_cache` — optional pre-materialized adjusted OHLC for speed.
+* `metrics_cache` — optional per-symbol metric snapshots to avoid recomputing everything on each run (only if profiling shows it’s needed).
+
+---
+
+## 5. Codebase Layout (R Modules)
+
+Organize the R code in modules, each with clear responsibilities.
+
+### 5.1. `R/db_core.R`
+
+**Purpose:** Low-level DB utilities.
+
+Public functions:
+
+* `af_db_connect(db_path = "data/autofinance.sqlite")`
+  Opens connection, sets pragmas (`WAL`, cache size, etc.).
+* `af_db_init(db_path)`
+  Creates all tables if not present.
+
+This module never knows about `rb3` or `quantmod`; it only does SQL.
+
+### 5.2. `R/ingest_b3.R`
+
+**Purpose:** Ingest COTAHIST via `rb3` into `prices_raw`.
+
+Key functions:
+
+* `af_sync_b3(years = NULL)`
+
+  * If `years` is `NULL`, infer missing years from `prices_raw` max(refdate).
+  * Uses `rb3::cotahist_get` to fetch full-year data.
+  * Normalizes to `prices_raw` schema and upserts via `af_db_ingest_raw_b3()`.
+
+* `af_db_ingest_raw_b3(dt_b3, con)`
+
+  * Maps columns to schema and does `INSERT OR REPLACE` into `prices_raw`.
+
+### 5.3. `R/ingest_splits.R`
+
+**Purpose:** Fetch and store splits (and later dividends) via `quantmod`.
+
+Key functions:
+
+* `af_sync_splits(symbols = NULL, force = FALSE, max_age_days = 7)`
+
+  * If `symbols` is `NULL`, select from `assets_meta` where `active = 1`.
+  * For each symbol:
+
+    * If `force = FALSE`, check `last_update_splits`. Skip if recent enough.
+    * Call `quantmod::getSplits(paste0(symbol, ".SA"))`.
+    * Convert to `data.table(symbol, date, value, type="SPLIT")`.
+  * Upsert into `corporate_actions`.
+  * Update `assets_meta.last_update_splits`.
+
+### 5.4. `R/ingest_macro.R`
+
+**Purpose:** Fetch macro series from BCB and store in `macro_series`.
+
+Key functions:
+
+* `af_sync_macro(series_ids, start_date, end_date)`
+
+  * For each series_id, fetch missing data from BCB.
+  * Upsert into `macro_series`.
+
+### 5.5. `R/adjustment.R`
+
+**Purpose:** Build adjusted OHLC panels from `prices_raw` + `corporate_actions`.
+
+Key function:
+
+* `af_build_adjusted_panel(symbols, start_date, end_date, con)`
+  Steps:
+
+  1. Query `prices_raw` for those symbols and date range.
+  2. Query `corporate_actions` for splits only (`type = 'SPLIT'`).
+  3. For each symbol:
+
+     * Build an `xts` or `data.table` of OHLC.
+     * Build a splits `xts`.
+     * Compute adjustment ratios via `TTR::adjRatios` or equivalent.
+     * Apply ratios to O/H/L/C.
+  4. Return a single `data.table`:
+
+     * `symbol, refdate, open_adj, high_adj, low_adj, close_adj, vol_fin, qty`.
+
+No Yahoo price data here; only COTAHIST + splits.
+
+### 5.6. `R/metrics.R`
+
+**Purpose:** Given adjusted OHLC and macro series, compute metrics.
+
+Main public function:
+
+* `af_compute_metrics(panel_adj, macro_panel, config)`
+
+Where:
+
+* `panel_adj` is `data.table(symbol, refdate, open_adj, high_adj, low_adj, close_adj, vol_fin, qty)`.
+* `macro_panel` is combined macro series and benchmark index returns.
+* `config` defines:
+
+  * `lookback_start`, `lookback_end`.
+  * `horizons` (in days): e.g. `c(21, 63, 126, 252)`.
+  * Which betas to compute (`ibov`, `usd`, `spx`, `di`).
+
+Per symbol, it should compute (if history is long enough):
+
+* **Returns:**
+
+  * `ret_21d`, `ret_63d`, `ret_126d`, `ret_252d`, etc.
+    (Skip any horizon > available days.)
+
+* **Volatilities:**
+
+  * `vol_21d`, `vol_252d` (annualized from daily sd).
+
+* **Tail risk:**
+
+  * `skew_252d`, `kurt_252d`.
+
+* **VaR & CVaR (historical, 95%):**
+
+  * Percentage loss threshold and conditional expectation below that.
+
+* **Drawdowns:**
+
+  * `max_dd_lookback`.
+  * `ulcer_index` (sqrt of mean squared drawdowns).
+  * `avg_time_underwater` (average length of consecutive drawdown periods).
+
+* **Liquidity metrics:**
+
+  * `median_vol_fin_63d` (or 252d).
+  * `amihud_illiquidity` (average |return| / volume).
+
+* **Betas/correlations:**
+
+  * `beta_ibov`, `beta_usd`, `beta_spx`, `beta_di`:
+
+    * Compute from daily return series via simple covariance/variance or regression.
+  * Possibly `corr_ibov`, `corr_usd`, etc., for raw correlations.
+
+Return shape: one row per symbol, one column per metric.
+
+### 5.7. `R/screener.R`
+
+**Purpose:** Glue: from DB → panel → metrics → ranked screener output.
+
+Key function:
+
+* `af_run_screener(config)`
+
+Flow:
+
+1. **Determine time window** from `config$lookback` (e.g. last 252 trading days).
+2. **Query liquidity pre-filter** using `prices_raw` only (no adjustments yet):
+
+   * Compute median `vol_fin` over lookback.
+   * Keep only assets with `median_vol_fin >= config$min_liquidity`.
+3. **Restrict universe** by `asset_type` (if desired).
+4. **Build adjusted panel** for this filtered universe via `af_build_adjusted_panel()`.
+5. **Load macro series** for that date range.
+6. **Compute metrics** via `af_compute_metrics()`.
+7. **Per asset type**, apply scoring/ranking:
+
+   * Example: z-score of `ret_252d`, `vol_252d`, `ulcer_index`, `beta_ibov`, etc., with your weighting scheme.
+8. Return a **list** or long data.frame:
+
+   * `list(equity = df_equity_ranked, fii = df_fii_ranked, bdr = df_bdr_ranked, etf = df_etf_ranked)`.
+
+Screener does **not** apply tax or trading rules.
+
+### 5.8. `R/backtest.R`
+
+**Purpose:** Run offline simulations based on DB.
+
+Key pieces:
+
+* `af_backtest_prepare(symbols, start_date, end_date, con)`
+
+  * Uses `af_build_adjusted_panel()` to produce full adjusted history for all needed symbols and time range.
+  * Optionally adds dividend cash flows if you support them.
+
+* `af_backtest_run(strategy_fn, universe, start_date, end_date, config)`
+
+  * `strategy_fn` is a user-supplied function that:
+
+    * Given date `t` and current state, returns target weights or trades.
+  * The engine:
+
+    * Steps through time (e.g. daily or rebalance frequency).
+    * Updates portfolio, applies costs, optionally taxes.
+    * Produces equity curve and statistics.
+
+Inside `af_backtest_run`, **no HTTP calls**. All data comes from the `panel_adj` prepared beforehand.
+
+### 5.9. `R/portfolio.R` (later)
+
+This is where you implement:
+
+* Tax rules (BDR vs equity vs FIIs).
+* Capital gains vs dividends modeling.
+* Specific allocation schemes (risk parity, max Sharpe, constraints, position limits).
+
+Screener outputs feed into portfolio construction, but screener itself remains tax-agnostic.
+
+### 5.10. `R/config.R`
+
+Central place for defaults:
+
+* DB path.
+* Default lookback window.
+* Horizons.
+* Macro series mapping.
+* Liquidity thresholds.
+
+---
+
+## 6. Data Flows (Step-by-Step)
+
+### 6.1. Initial Bootstrap
+
+1. `af_db_init()`
+2. `af_sync_b3(years = 2010:current_year)`
+   → fills `prices_raw`.
+3. Populate `assets_meta`:
+
+   * From B3 info or manually (asset_type, active, etc.).
+4. `af_sync_splits()`
+
+   * Full universe splits → `corporate_actions`.
+5. `af_sync_macro()`
+
+   * Fill `macro_series` with CDI, Selic, IPCA, USD, etc.
+
+After this, you have a complete local snapshot.
+
+### 6.2. On-Demand Update Before Analysis
+
+Any time you want to rebalance / re-run:
+
+1. `af_sync_b3()` (only missing years or days; COTAHIST makes this cheap).
+2. `af_sync_macro()` (only missing dates).
+3. `af_sync_splits()` (only stale symbols by `last_update_splits` threshold).
+
+Then:
+
+* `af_run_screener(config)` for fresh rankings.
+* Or `af_backtest_run(...)` on the current DB snapshot.
+
+### 6.3. Screener Execution Flow (Detailed)
+
+Given `config`:
+
+1. Determine date range `[t0, t1]` based on lookback.
+2. From `prices_raw`:
+
+   * For each symbol in `assets_meta[active=1]`, compute `median_vol_fin` over `[t0, t1]`.
+   * Filter: `median_vol_fin >= min_liquidity`.
+3. Build adjusted OHLC for filtered symbols via `af_build_adjusted_panel()`.
+4. Load macro series for `[t0, t1]`.
+5. Compute metrics via `af_compute_metrics()`:
+
+   * Skip horizons that exceed available history for each symbol.
+6. Split metrics by `asset_type` and rank within each class.
+
+---
+
+## 7. Core Algorithms (Implementation Notes)
+
+### 7.1. Split Adjustment
+
+Given:
+
+* Raw OHLC series `P_t` (open, high, low, close).
+* Splits: dates `s_i` with ratios `r_i` (as given by `getSplits`, e.g. `0.1` for 10→1).
+
+Use `TTR::adjRatios(P, splits)` to compute a cumulative adjustment factor `A_t` such that:
+
+* For each date `t`, `P_adj,t = P_t * A_t`.
+
+Apply `A_t` identically to `open`, `high`, `low`, `close` so the OHLC range remains coherent.
+
+### 7.2. Returns and Volatility
+
+Daily log return:
+
+* `r_t = log(close_adj_t / close_adj_{t-1})`.
+
+Horizon return over N days (geometric):
+
+* `R_N = exp(sum_{i=1..N} r_{t-i+1}) - 1`.
+
+Annualized vol over window N:
+
+* `vol_N = sd(r_{window}) * sqrt(252)`.
+
+### 7.3. VaR and CVaR (Historical, 95%)
+
+Given a vector of daily returns `r` in the window:
+
+* Sort `r` ascending.
+* `VaR_95` = 5th percentile (e.g., `quantile(r, probs = 0.05)`).
+* `CVaR_95` = mean of returns below `VaR_95`.
+
+### 7.4. Drawdowns and Ulcer Index
+
+Equity curve from price (normalized):
+
+* `E_t = close_adj_t / close_adj_{t0}`.
+
+Running max:
+
+* `M_t = max_{k <= t} E_k`.
+
+Drawdown:
+
+* `DD_t = (E_t - M_t) / M_t` (negative or zero).
+
+Max drawdown:
+
+* `min(DD_t)`.
+
+Ulcer index:
+
+* `UI = sqrt(mean(DD_t^2))` over the window.
+
+Time underwater:
+
+* Identify contiguous runs where `DD_t < 0`.
+* Take average length of those runs.
+
+### 7.5. Betas to Factors
+
+Given asset returns `r_a,t` and factor returns `r_f,t` for aligned dates:
+
+Beta:
+
+* `beta = cov(r_a, r_f) / var(r_f)`.
+
+You can also run a regression:
+
+* `r_a = alpha + beta * r_f + error`, but for speed, covariance/variance is enough.
+
+Compute betas against:
+
+* IBOV (or IBOV11/IBOV index series).
+* SPX (converted to BRL if needed).
+* USD/BRL FX.
+* DI or proxy fixed-income index.
+
+---
+
+## 8. Configuration Layer
+
+Either:
+
+* A simple `list` in R (`af_default_config()`), or
+* A YAML file that gets parsed once per session.
+
+Key config fields:
+
+* `db_path`.
+* `lookback_days` (e.g., 252).
+* `horizons_days` (e.g., `c(21, 63, 126, 252)`).
+* `min_liquidity` (e.g., 500000 BRL median daily volume).
+* `macro_series_ids`.
+* `benchmarks` (e.g., `"IBOV"`, `"SPX"`, `"USD"`, `"CDI"`).
+
+---
+
+## 9. Validation & QA Strategy
+
+You need systematic sanity checks.
+
+### 9.1. Price sanity
+
+* Randomly sample symbols.
+* Compare your adjusted close vs Yahoo Adjusted Close for those symbols and dates (one-off diagnostic script).
+* Flag if deviations exceed some tolerance (e.g., >1–2%).
+
+### 9.2. Corporate actions sanity
+
+* For a few known split events (ABEV3, GOGL34, etc.), verify:
+
+  * Splits appear in `corporate_actions`.
+  * Adjusted price curve behaves as expected across split dates (no fake crash).
+
+### 9.3. Macro sanity
+
+* Plot each macro series; visually check for obviously broken segments (zeros, missing months).
+
+### 9.4. Metric sanity
+
+For a single symbol:
+
+* Manually compute a subset of metrics (e.g., 21d return, 252d vol, max drawdown) in a separate R script and compare to `af_compute_metrics` output.
+
+---
+
+## 10. Roadmap / Phases
+
+### Phase 1 – DB + B3 Ingest
+
+* Implement `db_core.R`, `ingest_b3.R`.
+* Get `prices_raw` populated from 2010 to present.
+
+### Phase 2 – Splits Ingest + Adjustment
+
+* Implement `ingest_splits.R` and `adjustment.R`.
+* Verify adjusted prices for a small set of symbols vs Yahoo.
+
+### Phase 3 – Macro Ingest
+
+* Implement `ingest_macro.R`.
+* Store CDI, Selic, IPCA, USD, etc., in `macro_series`.
+
+### Phase 4 – Metrics Engine
+
+* Implement `metrics.R`.
+* Test per symbol metrics thoroughly.
+
+### Phase 5 – Screener
+
+* Implement `screener.R`.
+* End-to-end flow: DB → screener → per-class rankings.
+
+### Phase 6 – Backtest Core
+
+* Implement `backtest.R` with a simple long-only strategy to validate the engine.
+* Confirm it runs offline and uses only SQLite + in-memory panels.
+
+### Phase 7 – Portfolio & Fiscal Logic (if/when you care)
+
+* Implement tax rules, position limits, rebalancing logic in `portfolio.R`.
+* Integrate backtester with fiscal modeling.
+
+---
+
+This is the architecture. If you follow this as `PLAN.md`, you’ll have a clean separation between:
+
+* **Data acquisition & storage** (B3, Yahoo splits, BCB),
+* **Price adjustment & panel construction**,
+* **Metric computation & screening**,
+* **Offline simulation & portfolio logic**.
+
+From here, next concrete step is Phase 1: write `af_db_init()` and `af_sync_b3()` exactly against the schema above, and we can start hardening from there.
+
+
+
+###############################################################################
+### FILE: PLAN_risk.md
+###############################################################################
+Perfeito, vamos atualizar o plano levando **GARCH/DCC/VAR + portfolio engine + backtest** para o centro da arquitetura, não como “futuro opcional”.
+
+Vou te entregar um `PLAN.md` já revisado, autocontido e consistente com:
+
+* DB + COTAHIST como base.
+* Screener “research-grade”.
+* **Risk models avançados (GARCH/DCC/VAR) como primeira classe**.
+* Portfolio engine com restrições.
+* Backtest core que cola tudo isso **ao longo do tempo**.
+* Camada fiscal/trading construída em cima do backtest.
+
+---
+
+# Autofinance – Full Architecture (DB + Screener + VAR/GARCH/DCC + Portfolio + Backtest)
+
+## 0. Escopo e objetivos
+
+**Objetivo global:**
+Construir um sistema local, em R, que funcione como uma **estação quantitativa de pesquisa e simulação** para ativos da B3 (ações, FIIs, BDRs, ETFs), com:
+
+1. **Camada de dados sólida**:
+
+   * COTAHIST via `rb3` como **fita oficial** de OHLCV.
+   * Ações corporativas (splits, depois dividendos) via `quantmod::getSplits` / `getDividends`.
+   * Fatores macro via **BCB SGS** (CDI, Selic, IPCA, FX, etc.).
+   * Tudo persistido em **SQLite** (sem CSVs frágeis).
+
+2. **Screener avançado**:
+
+   * Trabalha sobre preços ajustados por splits.
+   * Usa métricas densas: retornos em múltiplos horizontes, volatilidade, skew/kurtosis, VaR/CVaR, drawdown, Ulcer Index, betas a IBOV, SPX, USD, DI, etc.
+   * Faz ranking **por classe de ativo** (Equity/FII/BDR/ETF), sem misturar tudo num top global tosco.
+
+3. **Modelos de risco/retorno avançados (centrais, não laterais)**:
+
+   * **GARCH** univariado para volatilidades condicionais σᵢ,t.
+   * **DCC** para correlações condicionais Cᵗ e covariância Σₜ = Dₜ Cₜ Dₜ.
+   * **VAR** para dinâmica conjunta de retornos ou fatores e previsão de μₜ (expected returns).
+   * Tudo empacotado num módulo `autofinance_risk_models.R` com interface clara para o portfolio engine.
+
+4. **Portfolio engine sério**:
+
+   * Respeita restrições: long-only, w_max por ativo, limite de alavancagem, possíveis restrições por classe (mínimo FIIs, máximo BDRs, etc.).
+   * Suporta múltiplos modos: equal, inv_vol, min_var, mean_var, max_sharpe.
+   * Usa μ e Σ vindos dos risk models (sample/shrinkage/GARCH+DCC/VAR).
+
+5. **Backtest core**:
+
+   * Loop temporal com janelas de lookback (ex: 3 anos) para recalibrar screener + risk models + portfolio em cada rebalance.
+   * Usa **somente SQLite + memória**; sem chamadas HTTP dentro da simulação.
+   * Entrega curva de patrimônio, trades, stats, decomposição por período.
+
+6. **Camada fiscal/trading**:
+
+   * Aplica regras de impostos (ações x BDR x FIIs), custos de transação, limites operacionais **sobre o backtest**.
+   * Não contamina screener nem risk models com fiscal.
+
+---
+
+## 1. Camadas e módulos
+
+### 1.1 Visão em camadas
+
+1. **Data & DB layer**
+
+   * Arquivos:
+
+     * `autofinance_db_core.R`
+     * `autofinance_ingest_b3.R`
+     * `autofinance_ingest_splits.R`
+     * `autofinance_ingest_macro.R`
+   * Responsável por:
+
+     * Sincronizar COTAHIST → `prices_raw`.
+     * Sincronizar splits/dividends → `corporate_actions`.
+     * Sincronizar macro → `macro_series`.
+     * Manter `assets_meta`.
+
+2. **Adjustment & Panel layer**
+
+   * Arquivo: `autofinance_panel.R`
+   * Responsável por:
+
+     * Construir painéis de preços **ajustados por split** (OHLC) a partir de `prices_raw` + `corporate_actions`.
+     * Calcular retornos simples/log, excess returns vs RF, agregar macros.
+
+3. **Screener layer**
+
+   * Arquivo: `autofinance_screener.R` (ou `autofinance_universe_screener.R`)
+   * Responsável por:
+
+     * Filtrar universo por liquidez/ativos válidos.
+     * Calcular todo o vetor de métricas cross-section.
+     * Rankear por classe de ativo.
+
+4. **Risk models layer (μ, Σ)**
+
+   * Arquivo: `autofinance_risk_models.R`
+   * Responsável por:
+
+     * Estimar **Σ (covariância)** por vários métodos: sample, shrinkage, GARCH+DCC.
+     * Estimar **μ (expected returns)**: média histórica, momentum-based, VAR-based.
+     * Fornecer interfaces estáveis pro portfolio engine.
+
+5. **Portfolio engine layer**
+
+   * Arquivo: `autofinance_portfolio_engine.R`
+   * Responsável por:
+
+     * Dado μ, Σ + restrições, resolver problemas de alocação (equal, inv_vol, min_var, mean_var, max_sharpe).
+     * Garantir long-only, w_max, leverage_max, restrições por grupo.
+
+6. **Backtest core layer**
+
+   * Arquivo: `autofinance_backtest_core.R`
+   * Responsável por:
+
+     * Loop temporal: em cada rebalance, rodar screener, risk model, portfolio engine usando só dados até t.
+     * Aplicar retornos realizados entre t e t_next.
+     * Calcular métricas de performance, drawdown, turnover, etc.
+
+7. **Fiscal & trading rules layer**
+
+   * Arquivo: `autofinance_fiscal_trading.R`
+   * Responsável por:
+
+     * Modelar impostos e custos em cima de sequências de trades/posições.
+     * Dar versão “net-of-tax” da curva de patrimônio produzida pelo backtest core.
+
+---
+
+## 2. Data & DB – Modelo e ingestão
+
+### 2.1 Esquema SQLite (resumo consolidado)
+
+**Tabela `assets_meta`**
+
+* `symbol` (PK) – `"PETR4"`, `"IVVB11"`, `"KNCR11"`, `"A1IV34"`, etc.
+* `asset_type` – `"EQUITY" | "FII" | "BDR" | "ETF" | ...`.
+* `sector` – texto opcional (B3 sector/segmento).
+* `active` – `1` ativo, `0` deslistado (mantém para evitar survivorship bias).
+* `last_update_splits` – data da última checagem do `getSplits`.
+* `last_update_divs` – idem para dividendos (quando usado).
+
+**Tabela `prices_raw`** – COTAHIST
+
+* `symbol`
+* `refdate` (YYYY-MM-DD)
+* `open, high, low, close` (REAL)
+* `vol_fin` (REAL)
+* `qty` (INTEGER)
+* **PK** `(symbol, refdate)` `WITHOUT ROWID`.
+
+**Tabela `corporate_actions`**
+
+* `symbol`
+* `date` (ex-date)
+* `type` – `"SPLIT"` / `"DIVIDEND"`.
+* `value` – razão do split (ex: 0.1) ou valor do dividendo.
+* **PK** `(symbol, date, type)`.
+
+**Tabela `macro_series`**
+
+* `series_id` – ex: `"CDI"`, `"SELIC"`, `"IPCA"`, `"USD_P TAX"`, ou ID numérico BCB.
+* `refdate`
+* `value`
+* **PK** `(series_id, refdate)`.
+
+### 2.2 Ingestão e sincronização (on-demand, sem servidor)
+
+**Funções principais:**
+
+* `af_db_init()`
+  Cria o banco e as tabelas se não existirem.
+
+* `af_sync_b3(years = NULL)`
+
+  * Se `years` é `NULL`, checa `max(refdate)` em `prices_raw` e baixa apenas anos que têm datas faltantes (ex: ano corrente).
+  * Usa `rb3::cotahist_get` para pegar COTAHIST e insere via `INSERT OR REPLACE`.
+
+* `af_sync_splits(symbols = NULL, force = FALSE, max_age_days = 7)`
+
+  * Se `symbols = NULL`, pega da `assets_meta` (ativos ativos).
+  * Para cada symbol, checa `last_update_splits`:
+
+    * Se recente e `force = FALSE` → pula.
+    * Caso contrário, chama `quantmod::getSplits(paste0(symbol, ".SA"))` (full history ou incremental, a gosto).
+  * Normaliza em `corporate_actions` com `type="SPLIT"`, atualiza `last_update_splits`.
+
+* `af_sync_dividends(...)` (opcional, depois)
+  Mesma lógica, mas para dividendos.
+
+* `af_sync_macro(series_ids, start_date, end_date)`
+
+  * Para cada série do BCB, busca dados faltantes e injeta em `macro_series`.
+
+---
+
+## 3. Panel e retornos
+
+### 3.1 Construção do painel ajustado
+
+Arquivo: `autofinance_panel.R`
+
+Função central:
+
+```r
+af_build_adjusted_panel <- function(symbols, start_date, end_date, con) {
+  # 1) Query prices_raw
+  # 2) Query corporate_actions (SPLIT)
+  # 3) Para cada symbol:
+  #    - OHLC xts raw
+  #    - splits xts
+  #    - adjRatios -> fatores de ajuste
+  #    - aplica em O/H/L/C
+  # 4) Devolve data.table com:
+  #    symbol, refdate, open_adj, high_adj, low_adj, close_adj, vol_fin, qty
+}
+```
+
+### 3.2 Retornos e excess returns
+
+Ainda em `autofinance_panel.R` (ou submódulo):
+
+* `af_compute_returns(panel_adj, rf_series = NULL)`:
+
+  * Calcula:
+
+    * `r_simple_t = close_adj_t / close_adj_{t-1} - 1`.
+    * `r_log_t = log(close_adj_t / close_adj_{t-1})`.
+  * Se `rf_series` (CDI, Selic) fornecido:
+
+    * Calcula `excess_ret = r_simple - r_rf_diário`.
+
+* Pode opcionalmente já acrescentar:
+
+  * Benchmarks (ex: IBOV, SPX_BR, USD) na mesma estrutura.
+
+---
+
+## 4. Screener – métrica, filtros, ranking
+
+Arquivo: `autofinance_screener.R` / `autofinance_universe_screener.R`
+
+### 4.1 Fluxo conceitual
+
+1. **Definir janela de lookback**: ex: últimos 252 dias úteis.
+2. **Filtrar universo por liquidez** usando `prices_raw`:
+
+   * `median_vol_fin_lookback >= min_liquidity`.
+   * Opcional: days_traded_ratio, Amihud, etc.
+3. **Construir painel ajustado** para esse universo e janela via `af_build_adjusted_panel`.
+4. **Carregar macro & benchmarks** para o período.
+5. **Calcular vetor de métricas** por símbolo.
+6. **Rankear por classe de ativo** conforme config de pesos/fatores.
+
+### 4.2 Vetor de métricas (cross-section)
+
+Por símbolo (dado painel ajustado e retornos):
+
+* **Retornos / momentum**:
+
+  * Janela de lookback `T` (dias).
+  * Conjunto de horizontes `H = {21, 63, 126, 252, ...}`.
+  * Para cada `h ∈ H` tal que `h <= T`:
+
+    * `ret_h` = retorno acumulado geométrico nos últimos h dias.
+    * Opcional: “ret_rel_ibov_h” = retorno do ativo – retorno do IBOV no mesmo período.
+
+* **Volatilidades**:
+
+  * `vol_21d`, `vol_63d`, `vol_252d` (annualizadas).
+
+* **Distribuição / cauda**:
+
+  * `skew_252d`.
+  * `kurt_252d`.
+
+* **Risco de cauda**:
+
+  * `var_95_252d`.
+  * `cvar_95_252d`.
+
+* **Drawdowns**:
+
+  * `max_dd_lookback`.
+  * `ulcer_index` (UI).
+  * `avg_time_underwater`.
+
+* **Liquidez**:
+
+  * `median_vol_fin_63d` (ou 252d).
+  * `amihud_illiquidity` = média(|ret| / vol_fin).
+  * `days_traded_ratio` = dias com `qty > 0` / total de dias.
+
+* **Betas e correlações**:
+
+  * Contra IBOV, USD, SPX, DI, etc., usando retorno diário:
+
+    * `beta_ibov`, `beta_usd`, `beta_spx`, `beta_di`.
+    * `corr_ibov`, `corr_usd`, etc.
+
+### 4.3 Interface do screener
+
+```r
+af_screener_config_default <- list(
+  lookback_days  = 252L,
+  horizons_days  = c(21L, 63L, 126L, 252L),
+  min_liquidity  = 5e5,    # BRL
+  min_days_traded = 0.8,   # 80% dos dias com negócio
+  score_weights  = list(
+    ret_252d      = +1.0,
+    vol_252d      = -0.5,
+    ulcer_index   = -0.7,
+    beta_ibov     = -0.2,
+    amihud        = -0.3
+    # etc, ajustáveis
+  )
+)
+
+af_run_screener <- function(config = af_screener_config_default, con) {
+  # 1) determina janela
+  # 2) filtra liquidez usando prices_raw
+  # 3) panel_adj + returns + macro
+  # 4) metrics
+  # 5) ranking por asset_type
+  # 6) retorna lista:
+  #    list(equity = df_e, fii = df_f, bdr = df_b, etf = df_etf)
+}
+```
+
+---
+
+## 5. Risk Models – μ e Σ (incluindo GARCH/DCC/VAR)
+
+Arquivo: `autofinance_risk_models.R`
+
+Meta: separar claramente **cálculo de métricas cross-section** (screener) de **modelagem de μ e Σ** para otimização de portfólio.
+
+### 5.1 Interface geral
+
+```r
+af_risk_config_default <- list(
+  cov_method   = "sample",      # "sample", "shrinkage", "garch_dcc"
+  mu_method    = "mean",        # "mean", "momentum", "var"
+  window_years = 3,
+  rf_series_id = "CDI"
+)
+
+af_risk_estimate <- function(
+  panel_returns,  # retornos diários (já ajustados), subset de símbolos
+  macro_panel,    # opcional, para VAR/fatores
+  config = af_risk_config_default
+) {
+  # 1) Seleciona janela (ex: últimos 3 anos)
+  # 2) Estima Σ conforme cov_method
+  # 3) Estima μ conforme mu_method
+  # 4) Retorna list(mu = μ_vec, Sigma = Σ_mat, meta = list(...))
+}
+```
+
+### 5.2 Covariance (Σ)
+
+**cov_method = "sample"**
+Covariância de amostra simples de excess returns:
+
+* Σ = cov(R_excesso).
+
+**cov_method = "shrinkage"**
+Ex: Ledoit-Wolf:
+
+* Σ_shrink = λ·F + (1 − λ)·Σ_sample,
+  onde F pode ser matriz diagonal (variâncias apenas) ou “identidade escalada”.
+
+**cov_method = "garch_dcc"** (núcleo avançado):
+
+1. Para cada ativo i:
+
+   * Ajusta um GARCH(1,1) a rᵢ,t:
+
+     * σᵢ,t² = ω + α εᵢ,t−1² + β σᵢ,t−1²
+   * Obtém resíduos padronizados:
+
+     * zᵢ,t = εᵢ,t / σᵢ,t.
+
+2. Conjunto de z_t = (z₁,t, z₂,t, ..., zₙ,t):
+
+   * Ajusta modelo DCC para a matriz de correlações condicionais Cₜ.
+
+3. Em um rebalance em t*:
+
+   * Pegamos σᵢ,t* para cada ativo → Dₜ* = diag(σ₁,t*,...,σₙ,t*).
+   * Pegamos Cₜ* do DCC.
+   * Covariância condicional:
+
+     * Σₜ* = Dₜ* Cₜ* Dₜ*.
+
+**Design importante:**
+No backtest, **não recalibrar GARCH/DCC todo dia**; recalibrar **por rebalance** (ex.: mensal). Para cada rebalance t:
+
+* Usar janela (ex.: últimos 3 anos) para calibrar GARCH/DCC.
+* Extrair Σₜ pronto para o portfolio engine.
+
+### 5.3 Expected returns (μ)
+
+**mu_method = "mean"**
+Média histórica de excess returns na janela:
+
+* μᵢ = média(rᵢ_excesso) (anualizada) para cada ativo.
+
+**mu_method = "momentum"**
+Imputar μ com base em métricas de momentum vindas do screener:
+
+* μᵢ ∝ combinação linear de `ret_21d`, `ret_63d`, `ret_252d`.
+* Pode normalizar e calibrar escalas.
+
+**mu_method = "var"** (VAR-based, avançado):
+
+1. Definir vetor de variáveis para o VAR:
+
+   * Pode ser:
+
+     * diretamente retornos de ativos, ou
+     * retornos de fatores (IBOV, SPX_BR, FX, yield, etc.) e mapear ativos para fatores.
+
+2. Ajustar VAR(p):
+
+   * yₜ = A₁ yₜ₋₁ + ... + Aₚ yₜ₋ₚ + εₜ.
+
+3. Prever **E[yₜ₊₁ | info até t]**:
+
+   * μ_fatores,t+1 para fatores.
+   * Se usar fatores, projetar μ_fatores em μ_ativos usando exposições de fator (betas, regressão cross-section).
+
+4. Resultado:
+
+   * μ_t (vector) com expected returns condicionais.
+
+No contexto do backtest, também recalibrado **por rebalance**, usando janela móvel.
+
+---
+
+## 6. Portfolio Engine – alocação com restrições
+
+Arquivo: `autofinance_portfolio_engine.R`
+
+### 6.1 Config
+
+```r
+af_port_default_config <- list(
+  cov_method    = "sample",      # repassado para risk_models
+  mu_method     = "mean",        # idem
+  window_years  = 3,
+  mode          = "min_var",     # "equal", "inv_vol", "min_var", "mean_var", "max_sharpe"
+  long_only     = TRUE,
+  w_max         = 0.20,          # máximo por ativo
+  leverage_max  = 1.0,           # sum(w_i) <= 1, sem alavancagem
+  group_constraints = NULL       # ex: list(FII_min = 0.2, BDR_max = 0.3)
+)
+```
+
+### 6.2 Interface
+
+```r
+af_build_portfolio <- function(
+  panel_returns,     # retornos diários para selected_symbols
+  selected_symbols,  # vetores de tickers escolhidos (p.ex. top N do screener)
+  port_config,
+  macro_panel = NULL # se risk_models precisar
+) {
+  # 1) Chama af_risk_estimate() com methods do port_config
+  # 2) Resolve problema de otimização conforme mode:
+  #    - equal, inv_vol, min_var, mean_var, max_sharpe
+  # 3) Aplica restrições: long_only, w_max, leverage_max, group_constraints
+  # 4) Retorna list(weights, cov_mat, mu_vec, stats)
+}
+```
+
+### 6.3 Modos de alocação
+
+* **"equal"**:
+
+  * wᵢ = 1/N com restrições de grupo (se houver).
+
+* **"inv_vol"**:
+
+  * wᵢ ∝ 1/σᵢ (σᵢ pode vir de Σ ou de estimador simples).
+
+* **"min_var"**:
+
+  * Resolver:
+
+    * min wᵀ Σ w
+      s.a.
+
+      * wᵢ ≥ 0 (se long_only)
+      * ∑ wᵢ = 1
+      * wᵢ ≤ w_max
+      * * group_constraints (por ex. ∑ wᵢ (i em BDR) ≤ 0.3).
+
+* **"mean_var"**:
+
+  * Problema de Markowitz:
+
+    * max [wᵀ μ − λ · wᵀ Σ w], para algum λ (aversion risk).
+
+* **"max_sharpe"**:
+
+  * max ( (wᵀ μ − r_f) / √(wᵀ Σ w) )
+    com mesmas restrições.
+
+Implementação com `quadprog`, `ROI` + plugins, ou `nloptr`, conforme preferência.
+
+---
+
+## 7. Backtest Core – colando screener + risk + portfolio ao longo do tempo
+
+Arquivo: `autofinance_backtest_core.R`
+
+### 7.1 Config geral
+
+```r
+af_backtest_config_default <- list(
+  rebalance_freq = "monthly",    # "monthly", "quarterly", etc.
+  lookback_years = 3,
+  screener_config = af_screener_config_default,
+  risk_config     = af_risk_config_default,
+  port_config     = af_port_default_config,
+  rf_series_id    = "CDI"
+)
+```
+
+### 7.2 Interface
+
+```r
+af_backtest <- function(
+  symbols_universe,    # pode ser NULL -> usar assets_meta ativos
+  start_date,
+  end_date,
+  bt_config = af_backtest_config_default,
+  con
+) {
+  # 1) Prepara painel ajustado + retornos + macros (de af_build_adjusted_panel / af_compute_returns)
+  # 2) Gera sequência de datas de rebalance (ex: fim de cada mês)
+  # 3) Loop ao longo dos rebalances:
+  #    - t_reb é data de rebalance
+  #    - define janela [t_reb - lookback_years, t_reb] (sem look-ahead)
+  #    - roda screener nessa janela
+  #    - escolhe selected_symbols
+  #    - chama af_build_portfolio(...) para obter w_t
+  #    - aplica retornos realizados de (t_reb, t_next] para atualizar carteira
+  #    - registra trades, equity, etc.
+  # 4) Retorna list(equity_curve, trades, stats, by_period)
+}
+```
+
+### 7.3 Propriedades importantes
+
+* **Sem HTTP** dentro do loop:
+
+  * Toda a sincronização (`af_sync_*`) deve ter ocorrido **antes** do backtest.
+  * O backtest só lê do SQLite e trabalha em memória.
+
+* **Sem look-ahead**:
+
+  * Screener, risk_models, portfolio engine sempre usam dados apenas até t_reb.
+
+* **Recalibração por rebalance**:
+
+  * GARCH/DCC/VAR são recalibrados apenas em t_reb, usando janela de lookback (ex: 3 anos).
+  * Isso torna o custo computacional administrável.
+
+---
+
+## 8. Fiscal & Trading Rules – camada “net-of-tax”
+
+Arquivo: `autofinance_fiscal_trading.R`
+
+### 8.1 Papel
+
+Não altera screener, Σ ou μ.
+Pega a **sequência de trades/posições** do backtest e aplica:
+
+* Regras de IR para:
+
+  * Ações locais (isenção dos 20k, 15% ganho, etc., conforme legislação que você quiser codar).
+  * BDRs (sem isenção, alíquotas diferentes).
+  * FIIs (tratamento de rendimentos vs ganho de capital).
+* Custos operacionais:
+
+  * Corretagem, emolumentos, spread, etc.
+
+### 8.2 Interface
+
+```r
+af_apply_fiscal_trading <- function(
+  trades,          # data.table: date, symbol, qty, price, side
+  rf_series = NULL,
+  rules_config
+) {
+  # 1) Reconstruir posição por ativo ao longo do tempo
+  # 2) Identificar eventos tributáveis por classe
+  # 3) Calcular imposto devido, custos, eventualmente acumular "caixa"
+  # 4) Ajustar equity_curve do backtest para "net-of-tax"
+  # 5) Retornar curva líquida + stats
+}
+```
+
+---
+
+## 9. Configuração central e orquestração
+
+Arquivo: `autofinance_config.R`
+
+* `af_default_paths` – caminho do DB.
+* `af_screener_config_default`.
+* `af_risk_config_default`.
+* `af_port_default_config`.
+* `af_backtest_config_default`.
+
+Função helper:
+
+```r
+af_sync_all <- function(con) {
+  af_sync_b3(con = con)
+  af_sync_macro(con = con, ...)
+  af_sync_splits(con = con)
+  # (dividends mais tarde, se/quando usar)
+}
+```
+
+---
+
+## 10. Roadmap de desenvolvimento com GARCH/DCC/VAR já planejados
+
+### Fase 1 – DB + B3
+
+* Implementar `af_db_init`, `af_db_connect`.
+* Implementar `af_sync_b3` + ingestão COTAHIST → `prices_raw`.
+* Preencher `assets_meta` inicial (tipo de ativo, active/deslistado).
+
+### Fase 2 – Splits + painel ajustado
+
+* Implementar `af_sync_splits` → `corporate_actions` (SPLIT).
+* Implementar `af_build_adjusted_panel` e validar com alguns tickers vs Yahoo Adjusted Close.
+
+### Fase 3 – Macro
+
+* Implementar `af_sync_macro` (CDI, Selic, IPCA, USD, IBOV, etc.).
+* Validar séries.
+
+### Fase 4 – Retornos + Screener base
+
+* Implementar `af_compute_returns`.
+* Implementar `af_compute_metrics` (momentum, vol, drawdown, betas simples, etc.).
+* Implementar `af_run_screener` com ranking por classe.
+
+### Fase 5 – Risk models (sample & shrinkage) + portfolio engine básico
+
+* Implementar `af_risk_estimate` com `cov_method = "sample"/"shrinkage"`, `mu_method = "mean"`.
+* Implementar `af_build_portfolio` com modos "equal", "inv_vol", "min_var" sob restrições básicas.
+* Validar com testes unitários e casos simples.
+
+### Fase 6 – GARCH + DCC
+
+* Integrar `rugarch` para GARCH univariado.
+* Integrar `rmgarch` para DCC.
+* Implementar `cov_method = "garch_dcc"`:
+
+  * Por rebalance: calibrar GARCH/DCC na janela de lookback.
+  * Extrair Σₜ condicional.
+
+### Fase 7 – VAR para μ
+
+* Definir vetor de variáveis (retornos de fatores ou ativos principais).
+* Usar `vars` ou equivalente para ajustar VAR(p).
+* Implementar `mu_method = "var"`:
+
+  * Prever μₜ+₁ para fatores.
+  * Mapear μ_fatores → μ_ativos (via betas/factor loadings).
+
+### Fase 8 – Backtest core
+
+* Implementar `af_backtest`:
+
+  * Loop por rebalance.
+  * Em cada rebalance:
+
+    * screener → selected_symbols
+    * risk_models → μ, Σ
+    * portfolio_engine → weights
+  * Aplicar retornos, registrar trades, equity, stats.
+
+### Fase 9 – Fiscal/trading
+
+* Implementar `af_apply_fiscal_trading`.
+* Configurar regras de impostos/custos para Ações, FIIs, BDRs.
+* Gerar curva bruta vs curva líquida.
+
+### Fase 10 – Tuning e grid search
+
+* Sobre o backtest core:
+
+  * Rodar variações de `score_weights` do screener, métodos de Σ e μ.
+  * Encontrar combinações que maximizem métricas (Sharpe, MAR, etc.).
+  * Isso vira um hyperparameter search, não “ML”, mas suficiente para calibrar o sistema.
+
+---
+
+Esse plano já assume, desde o começo, que:
+
+* **GARCH/DCC e VAR são cidadãos de primeira classe** no módulo de modelos de risco.
+* O **portfolio engine** é construído explicitamente para receber Σₜ e μₜ condicional desses modelos.
+* O **backtest** é o orquestrador real, com janelas móveis e re-estimação em cada rebalance.
+* A camada fiscal/trading é acoplada apenas ao nível de trades/posições, sem contaminar screener ou risk models.
+
+Se você quiser, o próximo passo natural é pegarmos **Fase 1–2** e já rascunharmos os skeletons de funções e arquivos (sem implementação pesada) para começar a preencher o projeto de forma consistente com esse `PLAN.md`.
 
 
 
@@ -502,8 +1903,13 @@ af_db_connect <- function(db_path = AF_DB_PATH) {
 }
 
 af_db_disconnect <- function(con) {
-  if (!is.null(con) && DBI::dbIsValid(con)) {
-    DBI::dbDisconnect(con)
+  # Be defensive in case someone passes the wrong object (e.g., curl connection)
+  if (is.null(con)) return(invisible(TRUE))
+  if (inherits(con, "DBIConnection")) {
+    ok <- tryCatch(DBI::dbIsValid(con), error = function(...) FALSE)
+    if (isTRUE(ok)) {
+      DBI::dbDisconnect(con)
+    }
   }
   invisible(TRUE)
 }
@@ -798,7 +2204,11 @@ af_fetch_cotahist_year <- function(year,
     low     = as.numeric(col_pick("low", c("low", "price.low", "preco_minimo"))),
     close   = as.numeric(col_pick("close", c("close", "price.close", "preco_ultimo"))),
     vol_fin = as.numeric(col_pick("vol_fin", c("volume", "financial_volume", "volume_total"))),
-    qty     = as.numeric(col_pick("qty", c("quantity", "number_trades", "quantidade_negociada")))
+    qty     = as.numeric(col_pick(
+      "qty",
+      c("trade_quantity", "traded_contracts",
+        "quantity", "number_trades", "quantidade_negociada")
+    ))
   )
 
   # Filter out rows with missing keys
@@ -807,10 +2217,47 @@ af_fetch_cotahist_year <- function(year,
   dt_out
 }
 
-af_sync_b3 <- function(con = af_db_connect(),
+# Basic classifier to tag asset type / investable based on ticker pattern.
+af_classify_symbol <- function(symbol_chr) {
+  sym <- toupper(trimws(symbol_chr))
+  investable <- TRUE
+  asset_type <- "OTHER"
+
+  # Exclude obvious fractions/receipts/options patterns
+  if (grepl("F$", sym) || grepl("[^A-Z0-9]", sym) || nchar(sym) > 8) {
+    investable <- FALSE
+  }
+
+  # Rights/subscription receipts often end with 3+ digits not in our allowed set
+  if (grepl("[0-9]{3,}$", sym) && !grepl("(11|32|33|34|35|36|39)$", sym)) {
+    investable <- FALSE
+  }
+
+  # BDR patterns: usually end with 32-35 (and similar)
+  if (grepl("(32|33|34|35|36|39)$", sym)) {
+    asset_type <- "BDR"
+  } else if (grepl("11$", sym)) {
+    asset_type <- "ETF_FII"  # cannot easily separate here without extra metadata
+  } else {
+    asset_type <- "EQUITY"
+  }
+
+  if (!investable) asset_type <- "OTHER"
+
+  list(asset_type = asset_type, active = as.integer(investable))
+}
+
+af_sync_b3 <- function(con = NULL,
                        years = NULL,
                        verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_sync_b3: 'con' is not a valid DBI connection.")
+  }
   af_attach_packages("data.table")
   
   if (is.null(years)) {
@@ -832,11 +2279,25 @@ af_sync_b3 <- function(con = af_db_connect(),
   
   for (y in years) {
     if (verbose) message("af_sync_b3: processing year ", y)
-    dt <- af_fetch_cotahist_year(y)
-    
+    dt <- af_fetch_cotahist_year(y, asset_filter = "all")
+
     if (nrow(dt) > 0) {
       if (verbose) message("  inserting ", nrow(dt), " rows...")
       af_db_insert_prices_raw(con, dt)
+      # Seed assets_meta so splits sync can run later
+      syms <- unique(dt$symbol)
+      if (length(syms) > 0L) {
+        classified <- lapply(syms, af_classify_symbol)
+        meta_dt <- data.table::data.table(
+          symbol             = syms,
+          asset_type         = vapply(classified, `[[`, "", "asset_type"),
+          sector             = NA_character_,
+          active             = vapply(classified, `[[`, integer(1), "active"),
+          last_update_splits = NA_character_,
+          last_update_divs   = NA_character_
+        )
+        af_db_upsert_assets_meta(con, meta_dt)
+      }
     } else {
       if (verbose) message("  no data found for ", y)
     }
@@ -863,11 +2324,19 @@ af_yahoo_to_symbol <- function(yahoo_symbol) {
   sub("\\.SA$", "", yahoo_symbol)
 }
 
-af_sync_yahoo_splits <- function(con = af_db_connect(),
+af_sync_yahoo_splits <- function(con = NULL,
                                  symbols = NULL,
                                  from_default = as.Date("2000-01-01"),
                                  verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_sync_yahoo_splits: 'con' is not a valid DBI connection.")
+  }
+
   af_attach_packages(c("DBI", "data.table", "quantmod"))
 
   af_db_init(con)
@@ -900,9 +2369,13 @@ af_sync_yahoo_splits <- function(con = af_db_connect(),
     if (verbose) message("Splits: ", sym, " (", ysym, ") from ", from_date, "...")
 
     sp <- tryCatch(
-      quantmod::getSplits(ysym, from = from_date),
-      error = function(e) NULL
+      quantmod::getSplits(ysym, from = from_date, auto.assign = FALSE),
+      error = function(e) {
+        if (verbose) message("  error fetching splits for ", sym, ": ", conditionMessage(e))
+        NULL
+      }
     )
+
     if (is.null(sp) || nrow(sp) == 0L) {
       # mesmo sem splits, atualizamos last_update_splits
       new_last <- format(Sys.Date(), "%Y-%m-%d")
@@ -938,11 +2411,15 @@ af_sync_yahoo_splits <- function(con = af_db_connect(),
   invisible(TRUE)
 }
 
-af_sync_yahoo_dividends <- function(con = af_db_connect(),
+af_sync_yahoo_dividends <- function(con = NULL,
                                     symbols = NULL,
                                     from_default = as.Date("2000-01-01"),
                                     verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
   af_attach_packages(c("DBI", "data.table", "quantmod"))
 
   af_db_init(con)
@@ -1055,12 +2532,19 @@ af_fetch_sgs_series <- function(series_id, start_date, end_date) {
   dt[, .(refdate, value)]
 }
 
-af_sync_macro_series <- function(con = af_db_connect(),
+af_sync_macro_series <- function(con = NULL,
                                  series_map, # Named vector: c("CDI"=12, "USD"=1)
                                  start_date,
                                  end_date,
                                  verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_sync_macro_series: 'con' is not a valid DBI connection.")
+  }
   af_db_init(con)
   af_attach_packages(c("DBI", "data.table"))
 
@@ -1115,12 +2599,23 @@ af_get_macro_series <- function(con,
 # Sincronização de splits (e futuramente dividendos) via quantmod
 ############################################################
 
-af_sync_splits <- function(con = af_db_connect(),
+af_sync_splits <- function(con = NULL,
                            symbols = NULL,
                            max_age_days = 7L,
                            force = FALSE,
-                           verbose = TRUE) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+                           verbose = TRUE,
+                           investable_only = TRUE,
+                           mode = c("investable", "all", "suspects"),
+                           suspect_threshold = 0.2) {
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_sync_splits: 'con' is not a valid DBI connection.")
+  }
+  mode <- match.arg(mode)
   af_attach_packages(c("data.table", "quantmod"))
   dt_assets <- data.table::as.data.table(
     DBI::dbGetQuery(con, "SELECT symbol, active, last_update_splits FROM assets_meta")
@@ -1129,7 +2624,36 @@ af_sync_splits <- function(con = af_db_connect(),
   if (!is.null(symbols)) {
     dt_assets <- dt_assets[symbol %in% symbols]
   } else {
-    dt_assets <- dt_assets[active == 1L]
+    if (mode == "investable") {
+      dt_assets <- dt_assets[active == 1L]
+    } else if (mode == "suspects") {
+      # Heuristic: recent unadjusted big moves
+      lookback_start <- Sys.Date() - 365
+      px <- data.table::as.data.table(DBI::dbGetQuery(
+        con,
+        sprintf("
+          SELECT symbol, refdate, close
+          FROM prices_raw
+          WHERE refdate >= '%s'
+        ", format(lookback_start, "%Y-%m-%d"))
+      ))
+      if (nrow(px)) {
+        px[, refdate := as.Date(refdate)]
+        data.table::setorder(px, symbol, refdate)
+        px[, ret := close / data.table::shift(close) - 1, by = symbol]
+        diag_dt <- px[, .(max_abs_ret = max(abs(ret), na.rm = TRUE)), by = symbol]
+        suspects <- diag_dt[max_abs_ret >= suspect_threshold, symbol]
+        dt_assets <- dt_assets[symbol %in% suspects]
+      } else {
+        dt_assets <- dt_assets[0]
+      }
+    } else {
+      # mode == "all"
+      dt_assets <- dt_assets
+    }
+    if (investable_only) {
+      dt_assets <- dt_assets[active == 1L]
+    }
   }
 
   today <- Sys.Date()
@@ -1149,11 +2673,32 @@ af_sync_splits <- function(con = af_db_connect(),
     ysym <- paste0(sym, ".SA")
     if (verbose) message("af_sync_splits: ", sym, " (", ysym, ")")
     splits_xts <- NULL
-    try({
-      suppressWarnings(
-        splits_xts <- quantmod::getSplits(ysym, auto.assign = FALSE)
-      )
-    }, silent = TRUE)
+    # basic backoff for Yahoo 429/tempo issues
+    fetch_splits <- function() {
+      tryCatch({
+        suppressWarnings(
+          quantmod::getSplits(ysym, auto.assign = FALSE)
+        )
+      }, error = function(e) {
+        msg <- conditionMessage(e)
+        if (grepl("429|Too Many Requests", msg, ignore.case = TRUE)) {
+          if (verbose) message("  Yahoo rate limit, sleeping 60s before retry...")
+          Sys.sleep(60)
+          tryCatch({
+            suppressWarnings(
+              quantmod::getSplits(ysym, auto.assign = FALSE)
+            )
+          }, error = function(e2) {
+            if (verbose) message("  retry failed for ", sym, ": ", conditionMessage(e2))
+            NULL
+          })
+        } else {
+          if (verbose) message("  error fetching splits for ", sym, ": ", msg)
+          NULL
+        }
+      })
+    }
+    splits_xts <- fetch_splits()
 
     if (!is.null(splits_xts) && NROW(splits_xts) > 0) {
       dt_s <- data.table::data.table(
@@ -1164,6 +2709,8 @@ af_sync_splits <- function(con = af_db_connect(),
       )
       # FIX: Changed from af_db_insert_corporate_actions to matches db_core
       af_db_insert_adjustments(con, dt_s)
+    } else {
+      if (verbose) message("  no splits found for ", sym, " (using unadjusted prices).")
     }
 
     # Atualiza metadata para não ficar rechecando (User Logic Preserved)
@@ -1191,6 +2738,7 @@ af_sync_splits <- function(con = af_db_connect(),
 
   invisible(all_symbols_checked)
 }
+
 
 
 ###############################################################################
@@ -1240,11 +2788,16 @@ af_panel_db_connect <- function(db_path = AF_DB_PATH) {
 
 # Retorna data.table:
 #   symbol, refdate(Date), open, high, low, close, vol_fin, qty
-af_load_prices_raw <- function(con,
+af_load_prices_raw <- function(con = NULL,
                                symbols    = NULL,
                                start_date = NULL,
                                end_date   = NULL) {
-  if (!DBI::dbIsValid(con)) {
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
     stop("af_load_prices_raw: 'con' is not a valid DBI connection.")
   }
 
@@ -1294,12 +2847,17 @@ af_load_prices_raw <- function(con,
 
 # Retorna data.table:
 #   symbol, date(Date), type, value
-af_load_adjustments <- function(con,
+af_load_adjustments <- function(con = NULL,
                                 symbols    = NULL,
                                 start_date = NULL,
                                 end_date   = NULL,
                                 types      = c("SPLIT")) {
-  if (!DBI::dbIsValid(con)) {
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
     stop("af_load_adjustments: 'con' is not a valid DBI connection.")
   }
 
@@ -1362,6 +2920,9 @@ af_load_adjustments <- function(con,
 #   refdate, open_adj, high_adj, low_adj, close_adj
 af_apply_splits_one_symbol <- function(prices_dt,
                                        splits_dt = NULL) {
+  # prices_dt: data.table(refdate, open, high, low, close)
+  # splits_dt: data.table(date, value) with split factors from Yahoo
+
   if (nrow(prices_dt) == 0L) return(NULL)
 
   # Garantir ordenação
@@ -1372,22 +2933,31 @@ af_apply_splits_one_symbol <- function(prices_dt,
   colnames(ohlc_mat) <- c("Open", "High", "Low", "Close")
   ohlc_xts <- xts::xts(ohlc_mat, order.by = prices_dt$refdate)
 
-  split_xts <- NULL
+  # Se houver splits para este ativo, construir série de razões diárias
   if (!is.null(splits_dt) && nrow(splits_dt) > 0L) {
-    # Quantmod espera um objeto tipo xts:
-    #   índice = datas, valores = ratio (como getSplits() retorna)
-    split_xts <- xts::xts(splits_dt$value,
-                          order.by = splits_dt$date)
-  }
+    # 1) xts esparso com eventos de split (como getSplits retorna)
+    split_xts <- xts::xts(
+      x        = splits_dt$value,
+      order.by = splits_dt$date
+    )
 
-  # Ajuste
-  # use.Adjusted = FALSE -> gera colunas ajustadas a partir de OHLC
-  if (!is.null(split_xts)) {
+    # 2) Construir fatores de ajuste diários à la CRSP (TTR::adjRatios)
+    #    - 'splits' = fatores de split (0.5 para 2:1 etc.)
+    #    - 'dividends' = NULL por enquanto (não estamos ajustando proventos)
+    #    - 'close' = série de fechamento original
+    ratios <- TTR::adjRatios(
+      splits    = split_xts,
+      dividends = NULL,
+      close     = quantmod::Cl(ohlc_xts)
+    )
+
+    # 3) Usar apenas coluna de split; mesmo índice que ohlc_xts
+    split_ratio <- ratios[, "Split"]
+
     ohlc_adj <- quantmod::adjustOHLC(
       ohlc_xts,
       use.Adjusted = FALSE,
-      split = split_xts,
-      div   = NULL
+      ratio        = split_ratio
     )
   } else {
     # Sem splits: apenas replica
@@ -1405,6 +2975,7 @@ af_apply_splits_one_symbol <- function(prices_dt,
   out[]
 }
 
+
 # ----------------------------------------------------------------------
 # 4) Construir painel ajustado para vários símbolos
 # ----------------------------------------------------------------------
@@ -1415,10 +2986,15 @@ af_apply_splits_one_symbol <- function(prices_dt,
 #
 # Nota: vol_fin e qty vêm do prices_raw sem ajuste (o padrão mesmo).
 #       Se quiser "volume ajustado", dá pra derivar depois.
-af_build_adjusted_panel <- function(con,
+af_build_adjusted_panel <- function(con = NULL,
                                     symbols    = NULL,
                                     start_date = NULL,
                                     end_date   = NULL) {
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
   # 1) Carregar preços crus
   prices <- af_load_prices_raw(
     con        = con,
@@ -1901,10 +3477,23 @@ af_risk_prepare_returns <- function(panel,
   # Drop assets with too many NAs
   n_obs <- length(dates)
   non_na_counts <- colSums(!is.na(R_mat))
-  keep <- non_na_counts >= min_obs_ratio * n_obs
+  base_min <- ceiling(min_obs_ratio * n_obs)
+  max_obs  <- max(non_na_counts, na.rm = TRUE)
+  eff_min  <- min(base_min, floor(max_obs * 0.8))
+
+  keep <- non_na_counts >= eff_min
 
   if (!any(keep)) {
-    stop("All assets dropped by min_obs_ratio filter; relax constraints or extend window.")
+    # fallback: try a looser threshold before erroring
+    eff_min2 <- floor(max_obs * 0.5)
+    keep <- non_na_counts >= eff_min2
+    if (!any(keep)) {
+      warning(sprintf(
+        "risk_prepare_returns: dropping all assets (n_obs=%s, base_min=%s, max_obs=%s, eff_min=%s, eff_min2=%s)",
+        n_obs, base_min, max_obs, eff_min, eff_min2
+      ))
+      stop("All assets dropped by min_obs_ratio filter; relax constraints or extend window.")
+    }
   }
 
   drops <- setdiff(colnames(R_mat), colnames(R_mat)[keep])
@@ -2282,9 +3871,9 @@ af_risk_build <- function(panel,
 # de passar um config-list em vez de um monte de argumentos soltos.
 
 af_risk_config_default <- list(
-  window_years    = 3,
+  window_years    = 2,
   use_excess      = TRUE,
-  min_obs_ratio   = 0.7,
+  min_obs_ratio   = 0.5,
   cov_method      = "sample",     # "sample", "shrinkage", "garch_dcc"
   mu_method       = "hist_mean",  # "hist_mean", "momentum", "var"
   shrink_lambda   = 0.1,
@@ -2363,12 +3952,20 @@ af_screener_config_default <- list(
 # Filtro de liquidez em cima de prices_raw
 ############################################################
 
-af_compute_basic_liquidity_filter <- function(con,
+af_compute_basic_liquidity_filter <- function(con = NULL,
                                               min_liquidity,
                                               min_days_traded,
                                               lookback_start,
                                               ref_date) {
   af_attach_packages("data.table")
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
+  if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+    stop("af_compute_basic_liquidity_filter: 'con' is not a valid DBI connection.")
+  }
   q <- sprintf("
     SELECT symbol, refdate, vol_fin, qty
     FROM prices_raw
@@ -2394,6 +3991,30 @@ af_compute_basic_liquidity_filter <- function(con,
   ]
 
   liq_filtered
+}
+
+# Liquidity filter for in-memory panel path (panel already has ret_simple/vol_fin)
+af_compute_basic_liquidity_from_panel <- function(panel_ret,
+                                                  min_liquidity,
+                                                  min_days_traded) {
+  af_attach_packages("data.table")
+  dt <- data.table::as.data.table(panel_ret)
+  if (!("ret_simple" %in% names(dt))) {
+    stop("panel_ret must contain ret_simple for liquidity filter.")
+  }
+  dt[, traded_flag := !is.na(ret_simple)]
+  liq <- dt[, .(
+    median_vol_fin    = stats::median(vol_fin, na.rm = TRUE),
+    days_traded_ratio = mean(traded_flag, na.rm = TRUE)
+  ), by = symbol]
+
+  liq[is.na(median_vol_fin),    median_vol_fin := 0]
+  liq[is.na(days_traded_ratio), days_traded_ratio := 0]
+
+  liq[
+    median_vol_fin    >= min_liquidity &
+      days_traded_ratio >= min_days_traded
+  ]
 }
 
 ############################################################
@@ -2528,12 +4149,21 @@ af_run_screener <- function(panel = NULL,
                             ref_date = Sys.Date(),
                             as_of_date = NULL,
                             config = af_screener_config_default,
-                            con = af_db_connect()) {
+                            con = NULL) {
   # If a panel is provided, operate purely in-memory (Option A).
   # Otherwise, pull from DB (legacy path).
-  own_con <- is.null(panel)
-  if (own_con && !is.null(con)) on.exit(af_db_disconnect(con), add = TRUE)
   af_attach_packages("data.table")
+  own_con <- FALSE
+  if (is.null(panel)) {
+    if (is.null(con)) {
+      con <- af_db_connect()
+      own_con <- TRUE
+    }
+    if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
+      stop("af_run_screener: 'con' is not a valid DBI connection.")
+    }
+    if (own_con) on.exit(af_db_disconnect(con), add = TRUE)
+  }
 
   ref_date <- as.Date(if (is.null(as_of_date)) ref_date else as_of_date)
   lookback_days <- config$lookback_days
@@ -2567,6 +4197,16 @@ af_run_screener <- function(panel = NULL,
     if (!("ret_simple" %in% names(panel_ret))) {
       panel_ret <- af_compute_returns(panel_ret)
     }
+    # Apply liquidity filter in panel-first mode as well
+    liq <- af_compute_basic_liquidity_from_panel(
+      panel_ret,
+      min_liquidity   = config$min_liquidity,
+      min_days_traded = config$min_days_traded
+    )
+    if (nrow(liq) == 0L) {
+      stop("af_run_screener: no liquid symbols in provided panel.")
+    }
+    panel_ret <- panel_ret[symbol %in% liq$symbol]
   }
 
   # 3) fatores macro (ex: IBOV, USD) - DB path only
@@ -2638,6 +4278,10 @@ af_run_screener <- function(panel = NULL,
 
   # 6) escore com z-score por métrica
   w <- config$score_weights
+  # Flip sign: use magnitude so bigger drawdown -> bigger penalty with negative weight
+  if ("max_dd" %in% names(metrics)) {
+    metrics[, max_dd := -max_dd]
+  }
   metrics[, score := 0]
 
   for (nm in names(w)) {
