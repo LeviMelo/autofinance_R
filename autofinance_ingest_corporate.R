@@ -3,6 +3,18 @@
 # Splits & dividendos via quantmod -> adjustments
 ############################################################
 
+af_is_empty_series <- function(x) {
+  if (is.null(x)) return(TRUE)
+
+  nx <- tryCatch(NROW(x), error = function(...) NA_integer_)
+  if (is.na(nx) || nx == 0L) return(TRUE)
+
+  vals <- suppressWarnings(as.numeric(x))
+  if (length(vals) == 0L || all(is.na(vals))) return(TRUE)
+
+  FALSE
+}
+
 af_symbol_to_yahoo <- function(symbol) {
   paste0(symbol, ".SA")
 }
@@ -63,7 +75,7 @@ af_sync_yahoo_splits <- function(con = NULL,
       }
     )
 
-    if (is.null(sp) || nrow(sp) == 0L) {
+    if (af_is_empty_series(sp)) {
       # mesmo sem splits, atualizamos last_update_splits
       new_last <- format(Sys.Date(), "%Y-%m-%d")
       DBI::dbExecute(
@@ -142,7 +154,7 @@ af_sync_yahoo_dividends <- function(con = NULL,
       quantmod::getDividends(ysym, from = from_date),
       error = function(e) NULL
     )
-    if (is.null(dv) || nrow(dv) == 0L) {
+    if (af_is_empty_series(dv)) {
       new_last <- format(Sys.Date(), "%Y-%m-%d")
       DBI::dbExecute(
         con,

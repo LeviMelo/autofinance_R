@@ -12,20 +12,23 @@ af_db_connect <- function(db_path = AF_DB_PATH) {
 }
 
 af_db_disconnect <- function(con) {
-  # Be defensive in case someone passes the wrong object (e.g., curl connection)
   if (is.null(con)) return(invisible(TRUE))
-  if (inherits(con, "DBIConnection")) {
-    ok <- tryCatch(DBI::dbIsValid(con), error = function(...) FALSE)
-    if (isTRUE(ok)) {
-      DBI::dbDisconnect(con)
-    }
+  ok <- tryCatch(DBI::dbIsValid(con), error = function(...) FALSE)
+  if (isTRUE(ok)) {
+    DBI::dbDisconnect(con)
   }
   invisible(TRUE)
 }
 
-af_db_init <- function(con = af_db_connect()) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+
+af_db_init <- function(con = NULL) {
   af_attach_packages("DBI")
+
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
 
   # assets_meta
   DBI::dbExecute(con, "
