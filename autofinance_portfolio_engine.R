@@ -79,11 +79,13 @@ af_quadprog_solve <- function(Sigma,
   N <- nrow(Sigma)
   if (N != ncol(Sigma)) stop("af_quadprog_solve: Sigma must be square.")
 
-  # quadprog: solve.QP(Dmat, dvec, Amat, bvec, meq)
-  # Objetivo canônico: min 1/2 w' D w - d' w
-  Dmat <- 2 * Sigma
+  # Defensive PD ridge (quadprog is sensitive to near-singular Σ)
+  Sigma_pd <- Sigma
+  diag(Sigma_pd) <- diag(Sigma_pd) + 1e-10
 
+  # Objective: min 1/2 w' D w - d' w
   if (mode == "min_var") {
+    Dmat <- 2 * Sigma_pd
     dvec <- rep(0, N)
   } else {
     if (is.null(mu) || length(mu) != N) {
@@ -92,72 +94,50 @@ af_quadprog_solve <- function(Sigma,
     mu <- as.numeric(mu)
 
     if (mode == "mean_var") {
-      # max (w'μ - λ w'Σw) ≈ min (λ w'Σw - w'μ)
-      # → Dmat = 2 λ Σ, dvec = μ
-      Dmat <- 2 * risk_aversion * Sigma
+      # max (w'μ - λ w'Σw) -> min (λ w'Σw - w'μ)
+      Dmat <- 2 * risk_aversion * Sigma_pd
       dvec <- mu
-    } else if (mode == "max_sharpe") {
-      # Heurística: tratar Sharpe ~ (w'(μ - rf)) com penalização de risco
-      # via λ -> similar a mean_var com μtilde = μ - rf
+    } else { # max_sharpe
       mu_tilde <- mu - rf_daily
-      Dmat <- 2 * risk_aversion * Sigma
+      Dmat <- 2 * risk_aversion * Sigma_pd
       dvec <- mu_tilde
     }
   }
 
-  # Restrições lineares: A^T w >= b (quadprog usa essa convenção)
-  # 1) soma w_i = 1 -> representamos como igualdade via meq
-  Aeq <- matrix(1, nrow = N, ncol = 1)
-  beq <- 1
+  # Constraints:
+  # 1) sum(w) = 1  (equality)
+  Amat <- matrix(1, nrow = N, ncol = 1)
+  bvec <- 1
 
-  # 2) w_i >= 0 se long_only
-  A_ineq <- NULL
-  b_ineq <- NULL
-  if (long_only) {
-    A_ineq <- diag(N)
-    b_ineq <- rep(0, N)
+  # 2) w_i >= 0 if long_only
+  if (isTRUE(long_only)) {
+    Amat <- cbind(Amat, diag(N))
+    bvec <- c(bvec, rep(0, N))
   }
 
-  # 3) w_i <= w_max -> -w_i >= -w_max
-  if (!is.null(w_max) && w_max < 1) {
-    A_ineq2 <- -diag(N)
-    b_ineq2 <- rep(-w_max, N)
-    if (is.null(A_ineq)) {
-      A_ineq <- A_ineq2
-      b_ineq <- b_ineq2
-    } else {
-      A_ineq <- rbind(A_ineq, A_ineq2)
-      b_ineq <- c(b_ineq, b_ineq2)
-    }
+  # 3) w_i <= w_max  ->  -w_i >= -w_max
+  if (!is.null(w_max) && is.finite(w_max) && w_max < 1) {
+    Amat <- cbind(Amat, -diag(N))
+    bvec <- c(bvec, rep(-w_max, N))
   }
 
-  # 4) leverage_max: com long_only e sum(w) = 1, leverage_max = 1 já está embutido.
-  # Se futuramente tiver shorts, aqui precisa de restrição extra na soma(|w_i|).
-
-  # Montagem Amat / bvec
-  if (!is.null(A_ineq)) {
-    # Igualdade vira as primeiras colunas de Amat, com meq = 1
-    Amat <- cbind(Aeq, -Aeq, t(A_ineq))
-    bvec <- c(beq, -beq, b_ineq)
-    meq  <- 1
-  } else {
-    Amat <- cbind(Aeq, -Aeq)
-    bvec <- c(beq, -beq)
-    meq  <- 1
-  }
+  # Note:
+  # With long_only + sum(w)=1, leverage_max is already implicitly 1.
+  # If you later allow shorts, you'll need explicit leverage constraints.
 
   res <- quadprog::solve.QP(
     Dmat = Dmat,
     dvec = dvec,
     Amat = Amat,
     bvec = bvec,
-    meq  = meq
+    meq  = 1
   )
 
   w <- as.numeric(res$solution)
   names(w) <- rownames(Sigma)
   w
 }
+
 
 # -------------------------------------------------------------------
 # Função principal: mu, Sigma -> pesos

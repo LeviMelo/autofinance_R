@@ -36,6 +36,17 @@ af_screener_config_default <- list(
   )
 )
 
+if (!exists("af_db_connect")) {
+  if (file.exists("autofinance_db_core.R")) {
+    source("autofinance_db_core.R")
+  }
+}
+if (!exists("af_build_adjusted_panel")) {
+  if (file.exists("autofinance_panel.R")) {
+    source("autofinance_panel.R")
+  }
+}
+
 ############################################################
 # Filtro de liquidez em cima de prices_raw
 ############################################################
@@ -241,8 +252,11 @@ af_run_screener <- function(panel = NULL,
   # If a panel is provided, operate purely in-memory (Option A).
   # Otherwise, pull from DB (legacy path).
   af_attach_packages("data.table")
+
+  db_mode <- is.null(panel)  # <<< FIXED semantic flag
   own_con <- FALSE
-  if (is.null(panel)) {
+
+  if (db_mode) {
     if (is.null(con)) {
       con <- af_db_connect()
       own_con <- TRUE
@@ -300,7 +314,8 @@ af_run_screener <- function(panel = NULL,
   # 3) fatores macro (ex: IBOV, USD) - DB path only
   macro_needed <- unique(c(config$ibov_series_id, config$usd_series_id))
   macro_needed <- macro_needed[!is.na(macro_needed)]
-  macro <- if (length(macro_needed) > 0 && own_con) {
+
+  macro <- if (length(macro_needed) > 0 && db_mode) {
     af_get_macro_series(con, macro_needed, lookback_start, ref_date)
   } else {
     data.table::data.table()
@@ -357,7 +372,7 @@ af_run_screener <- function(panel = NULL,
   metrics <- data.table::rbindlist(metrics_list, fill = TRUE)
 
   # 5) anexar asset_type da assets_meta (se existir, DB path)
-  if (own_con) {
+  if (db_mode) {
     meta <- data.table::as.data.table(
       DBI::dbGetQuery(con, "SELECT symbol, asset_type FROM assets_meta")
     )

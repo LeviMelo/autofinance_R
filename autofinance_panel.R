@@ -24,6 +24,14 @@ if (!exists("af_attach_packages")) {
   }
 }
 
+if (!exists("af_db_connect")) {
+  if (file.exists("autofinance_db_core.R")) {
+    source("autofinance_db_core.R")
+  } else {
+    stop("autofinance_db_core.R not found; required for panel DB access.")
+  }
+}
+
 af_attach_packages(c("data.table", "DBI", "RSQLite", "quantmod", "xts", "TTR"))
 
 # ----------------------------------------------------------------------
@@ -173,60 +181,56 @@ af_load_adjustments <- function(con = NULL,
 # Retorna data.table com colunas:
 #   refdate, open_adj, high_adj, low_adj, close_adj
 af_apply_splits_one_symbol <- function(prices_dt,
-                                       splits_dt = NULL) {
-  # prices_dt: data.table(refdate, open, high, low, close)
-  # splits_dt: data.table(date, value) with split factors from Yahoo
-
+                                       splits_dt    = NULL,
+                                       dividends_dt = NULL,
+                                       use_dividends = FALSE) {
   if (nrow(prices_dt) == 0L) return(NULL)
-
-  # Garantir ordenação
   data.table::setorder(prices_dt, refdate)
 
-  # Construir xts OHLC
   ohlc_mat <- as.matrix(prices_dt[, .(open, high, low, close)])
   colnames(ohlc_mat) <- c("Open", "High", "Low", "Close")
   ohlc_xts <- xts::xts(ohlc_mat, order.by = prices_dt$refdate)
 
-  # Se houver splits para este ativo, construir série de razões diárias
+  split_xts <- NULL
   if (!is.null(splits_dt) && nrow(splits_dt) > 0L) {
-    # 1) xts esparso com eventos de split (como getSplits retorna)
-    split_xts <- xts::xts(
-      x        = splits_dt$value,
-      order.by = splits_dt$date
-    )
+    split_xts <- xts::xts(x = splits_dt$value, order.by = splits_dt$date)
+  }
 
-    # 2) Construir fatores de ajuste diários à la CRSP (TTR::adjRatios)
-    #    - 'splits' = fatores de split (0.5 para 2:1 etc.)
-    #    - 'dividends' = NULL por enquanto (não estamos ajustando proventos)
-    #    - 'close' = série de fechamento original
+  div_xts <- NULL
+  if (isTRUE(use_dividends) && !is.null(dividends_dt) && nrow(dividends_dt) > 0L) {
+    div_xts <- xts::xts(x = dividends_dt$value, order.by = dividends_dt$date)
+  }
+
+  if (!is.null(split_xts) || !is.null(div_xts)) {
     ratios <- TTR::adjRatios(
       splits    = split_xts,
-      dividends = NULL,
+      dividends = div_xts,
       close     = quantmod::Cl(ohlc_xts)
     )
 
-    # 3) Usar apenas coluna de split; mesmo índice que ohlc_xts
-    split_ratio <- ratios[, "Split"]
+    ratio_xts <- if (isTRUE(use_dividends) && !is.null(div_xts)) {
+      # Total-return style ratio
+      ratios[, "Ratio"]
+    } else {
+      ratios[, "Split"]
+    }
 
     ohlc_adj <- quantmod::adjustOHLC(
       ohlc_xts,
       use.Adjusted = FALSE,
-      ratio        = split_ratio
+      ratio        = ratio_xts
     )
   } else {
-    # Sem splits: apenas replica
     ohlc_adj <- ohlc_xts
   }
 
-  out <- data.table::data.table(
+  data.table::data.table(
     refdate   = as.Date(zoo::index(ohlc_adj)),
     open_adj  = as.numeric(ohlc_adj[, "Open"]),
     high_adj  = as.numeric(ohlc_adj[, "High"]),
     low_adj   = as.numeric(ohlc_adj[, "Low"]),
     close_adj = as.numeric(ohlc_adj[, "Close"])
   )
-
-  out[]
 }
 
 
@@ -243,7 +247,8 @@ af_apply_splits_one_symbol <- function(prices_dt,
 af_build_adjusted_panel <- function(con = NULL,
                                     symbols    = NULL,
                                     start_date = NULL,
-                                    end_date   = NULL) {
+                                    end_date   = NULL,
+                                    adjust_dividends = FALSE) {
   own_con <- is.null(con)
   if (own_con) {
     con <- af_db_connect()
@@ -263,12 +268,14 @@ af_build_adjusted_panel <- function(con = NULL,
   # 2) Carregar splits
   #    Usamos um buffer para garantir que splits anteriores à janela não sejam perdidos.
   start_adj <- if (!is.null(start_date)) as.Date(start_date) - 365L else NULL
+  types_needed <- if (isTRUE(adjust_dividends)) c("SPLIT", "DIVIDEND") else c("SPLIT")
+
   adj <- af_load_adjustments(
     con        = con,
     symbols    = unique(prices$symbol),
     start_date = start_adj,
     end_date   = end_date,
-    types      = c("SPLIT")
+    types      = types_needed
   )
 
   # 3) Aplicar por símbolo
@@ -278,10 +285,13 @@ af_build_adjusted_panel <- function(con = NULL,
   for (sym in syms) {
     p_sym <- prices[symbol == sym]
     s_sym <- if (nrow(adj) > 0L) adj[symbol == sym & type == "SPLIT"] else NULL
+    d_sym <- if (nrow(adj) > 0L && isTRUE(adjust_dividends)) adj[symbol == sym & type == "DIVIDEND"] else NULL
 
     adj_sym <- af_apply_splits_one_symbol(
-      prices_dt = p_sym[, .(refdate, open, high, low, close)],
-      splits_dt = if (!is.null(s_sym) && nrow(s_sym) > 0L) s_sym[, .(date, value)] else NULL
+      prices_dt     = p_sym[, .(refdate, open, high, low, close)],
+      splits_dt     = if (!is.null(s_sym) && nrow(s_sym) > 0L) s_sym[, .(date, value)] else NULL,
+      dividends_dt  = if (!is.null(d_sym) && nrow(d_sym) > 0L) d_sym[, .(date, value)] else NULL,
+      use_dividends = adjust_dividends
     )
 
     if (!is.null(adj_sym) && nrow(adj_sym) > 0L) {

@@ -13,6 +13,31 @@ if (!exists("af_attach_packages")) {
 
 af_attach_packages(c("data.table", "lubridate", "zoo"))
 
+if (!exists("af_run_screener")) {
+  if (file.exists("autofinance_screener.R")) {
+    source("autofinance_screener.R")
+  } else {
+    stop("autofinance_screener.R not found; required for backtest.")
+  }
+}
+
+if (!exists("af_risk_build")) {
+  if (file.exists("autofinance_risk_models.R")) {
+    source("autofinance_risk_models.R")
+  } else {
+    stop("autofinance_risk_models.R not found; required for backtest.")
+  }
+}
+
+if (!exists("af_build_portfolio")) {
+  if (file.exists("autofinance_portfolio_engine.R")) {
+    source("autofinance_portfolio_engine.R")
+  } else {
+    stop("autofinance_portfolio_engine.R not found; required for backtest.")
+  }
+}
+
+
 # Compute rebalance dates (e.g. last trading day of each month)
 af_bt_compute_rebalance_dates <- function(panel,
                                           start_date,
