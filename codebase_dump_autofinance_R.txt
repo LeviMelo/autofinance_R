@@ -14,8 +14,6 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R':
   autofinance_R.Rproj
   autofinance_risk_models.R
   autofinance_screener.R
-  data/autofinance.sqlite-shm
-  data/autofinance.sqlite-wal
   PLAN.md
   PLAN_risk.md
 

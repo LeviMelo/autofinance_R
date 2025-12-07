@@ -9,6 +9,7 @@
 # 3) Filter the requested year and asset class
 # 4) Normalize column names to prices_raw schema
 
+
 af_fetch_cotahist_year <- function(year,
                                    asset_filter = c("equity", "etf", "fii", "all"),
                                    verbose = TRUE) {
