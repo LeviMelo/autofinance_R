@@ -2,7 +2,12 @@
 
 af2_config_default <- list(
   # Universe scope (used later)
-  years = 2018:as.integer(format(Sys.Date(), "%Y")),
+  # Dev default: keep it small and fast.
+  # Override explicitly for full rebuild.
+  years = {
+    y <- as.integer(format(Sys.Date(), "%Y"))
+    (y-1L):y
+  },
   include_types = c("equity", "fii", "etf", "bdr"),
 
   # Screener liquidity

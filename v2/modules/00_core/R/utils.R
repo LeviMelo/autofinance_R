@@ -43,8 +43,23 @@ af2_weekdays_only <- function(dates) {
   !(w %in% c("Saturday", "Sunday", "sábado", "domingo"))
 }
 
-af2_make_bizdays_seq <- function(start_date, end_date) {
-  d <- seq.Date(as.Date(start_date), as.Date(end_date), by = "day")
+af2_make_bizdays_seq <- function(start_date, end_date, cal = "Brazil/B3") {
+  start_date <- as.Date(start_date)
+  end_date   <- as.Date(end_date)
+
+  # Prefer the official calendar if available
+  if (requireNamespace("bizdays", quietly = TRUE)) {
+    out <- tryCatch(
+      bizdays::bizseq(start_date, end_date, cal),
+      error = function(e) NULL
+    )
+    if (!is.null(out) && length(out)) {
+      return(as.Date(out))
+    }
+  }
+
+  # Fallback: weekdays only
+  d <- seq.Date(start_date, end_date, by = "day")
   d[af2_weekdays_only(d)]
 }
 

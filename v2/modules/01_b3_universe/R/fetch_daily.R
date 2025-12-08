@@ -3,7 +3,8 @@
 af2_b3_fetch_daily_lazy <- function(start_date, end_date,
                                     cfg = NULL, verbose = TRUE,
                                     force_download = FALSE,
-                                    reprocess = FALSE) {
+                                    reprocess = FALSE,
+                                    throttle = TRUE) {
 
   cfg <- cfg %||% af2_get_config()
   af2_b3_init_rb3(cfg, verbose = verbose)
@@ -11,7 +12,7 @@ af2_b3_fetch_daily_lazy <- function(start_date, end_date,
   start_date <- as.Date(start_date)
   end_date   <- as.Date(end_date)
 
-  # Use your existing lightweight biz-day generator
+  # Now uses proper B3 bizdays if available
   refdates <- af2_make_bizdays_seq(start_date, end_date)
 
   if (!length(refdates)) {
@@ -29,7 +30,7 @@ af2_b3_fetch_daily_lazy <- function(start_date, end_date,
     rb3::fetch_marketdata(
       "b3-cotahist-daily",
       refdate = refdates,
-      throttle = TRUE,
+      throttle = isTRUE(throttle),
       force_download = isTRUE(force_download),
       reprocess = isTRUE(reprocess)
     )
@@ -39,7 +40,6 @@ af2_b3_fetch_daily_lazy <- function(start_date, end_date,
   })
 
   if (!ok) {
-    # Conservative fallback: loop download/read
     for (d in refdates) {
       tryCatch({
         meta <- rb3::download_marketdata("b3-cotahist-daily", refdate = d)
@@ -56,5 +56,6 @@ af2_b3_fetch_daily_lazy <- function(start_date, end_date,
     stop("cotahist_get('daily') failed: ", conditionMessage(e))
   })
 
-  df_lazy |> dplyr::filter(.data$refdate >= start_date, .data$refdate <= end_date)
+  df_lazy |>
+    dplyr::filter(.data$refdate >= start_date, .data$refdate <= end_date)
 }

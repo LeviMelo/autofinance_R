@@ -13,6 +13,7 @@ source("v2/modules/01_b3_universe/R/select_min_cols.R")
 source("v2/modules/01_b3_universe/R/unify_liquidity.R")
 source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
 source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
 source("v2/modules/01_b3_universe/R/build_universe.R")
 
 cfg <- af2_get_config()
@@ -81,3 +82,17 @@ if (!dir.exists(artifact_dir)) dir.create(artifact_dir, recursive = TRUE)
 saveRDS(dt_all, artifact_file)
 af2_log("AF2_B3:", "Wrote artifact: ", artifact_file)
 
+RUN_DAILY_SMOKE <- TRUE
+
+if (isTRUE(RUN_DAILY_SMOKE)) {
+  end_date <- Sys.Date() - 1
+  start_date <- end_date - 90  # ~3 months
+  dt_daily_lazy <- af2_b3_fetch_daily_lazy(
+    start_date, end_date,
+    cfg = cfg,
+    verbose = TRUE,
+    throttle = FALSE
+  )
+  # just force a tiny collect to prove it works
+  print(dt_daily_lazy |> dplyr::slice_head(n = 5) |> dplyr::collect())
+}
