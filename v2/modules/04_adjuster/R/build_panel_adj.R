@@ -62,8 +62,16 @@ af2_build_panel_adj <- function(universe_raw,
   # - whether manual was involved
   # - whether dividend computation had issues
 
-  ev_flags <- if (nrow(events)) {
-    events[, .(
+  # Restrict event flags to the panel date range for state semantics
+  panel_min <- min(panel$refdate, na.rm = TRUE)
+  panel_max <- max(panel$refdate, na.rm = TRUE)
+
+  events_state <- events[
+    refdate >= panel_min & refdate <= panel_max
+  ]
+  
+  ev_flags <- if (nrow(events_state)) {
+    events_state[, .(
       has_split = any(is.finite(split_value) & split_value != 1),
       has_div   = any(is.finite(div_cash) & div_cash > 0),
       has_manual = any(isTRUE(has_manual))
@@ -88,10 +96,13 @@ af2_build_panel_adj <- function(universe_raw,
     fifelse(
       has_manual, "manual_override",
       fifelse(
-        has_split & !has_div, "split_only",
+        has_split & has_div, "split_dividend",
         fifelse(
-          !has_split & has_div, "dividend_only",
-          "ok"
+          has_split, "split_only",
+          fifelse(
+            has_div, "dividend_only",
+            "ok"
+          )
         )
       )
     )
