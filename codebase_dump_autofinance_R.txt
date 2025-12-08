@@ -27,6 +27,7 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R':
 data/autofinance.sqlite
 codebase_dump_autofinance_R.txt
 plans
+data
 
 
 ###############################################################################
@@ -525,20 +526,23 @@ af_db_connect <- function(db_path = AF_DB_PATH) {
 }
 
 af_db_disconnect <- function(con) {
-  # Be defensive in case someone passes the wrong object (e.g., curl connection)
   if (is.null(con)) return(invisible(TRUE))
-  if (inherits(con, "DBIConnection")) {
-    ok <- tryCatch(DBI::dbIsValid(con), error = function(...) FALSE)
-    if (isTRUE(ok)) {
-      DBI::dbDisconnect(con)
-    }
+  ok <- tryCatch(DBI::dbIsValid(con), error = function(...) FALSE)
+  if (isTRUE(ok)) {
+    DBI::dbDisconnect(con)
   }
   invisible(TRUE)
 }
 
-af_db_init <- function(con = af_db_connect()) {
-  on.exit(af_db_disconnect(con), add = TRUE)
+
+af_db_init <- function(con = NULL) {
   af_attach_packages("DBI")
+
+  own_con <- is.null(con)
+  if (own_con) {
+    con <- af_db_connect()
+    on.exit(af_db_disconnect(con), add = TRUE)
+  }
 
   # assets_meta
   DBI::dbExecute(con, "
@@ -1001,6 +1005,18 @@ af_sync_b3 <- function(con = NULL,
 # Splits & dividendos via quantmod -> adjustments
 ############################################################
 
+af_is_empty_series <- function(x) {
+  if (is.null(x)) return(TRUE)
+
+  nx <- tryCatch(NROW(x), error = function(...) NA_integer_)
+  if (is.na(nx) || nx == 0L) return(TRUE)
+
+  vals <- suppressWarnings(as.numeric(x))
+  if (length(vals) == 0L || all(is.na(vals))) return(TRUE)
+
+  FALSE
+}
+
 af_symbol_to_yahoo <- function(symbol) {
   paste0(symbol, ".SA")
 }
@@ -1061,7 +1077,7 @@ af_sync_yahoo_splits <- function(con = NULL,
       }
     )
 
-    if (is.null(sp) || nrow(sp) == 0L) {
+    if (af_is_empty_series(sp)) {
       # mesmo sem splits, atualizamos last_update_splits
       new_last <- format(Sys.Date(), "%Y-%m-%d")
       DBI::dbExecute(
@@ -1140,7 +1156,7 @@ af_sync_yahoo_dividends <- function(con = NULL,
       quantmod::getDividends(ysym, from = from_date),
       error = function(e) NULL
     )
-    if (is.null(dv) || nrow(dv) == 0L) {
+    if (af_is_empty_series(dv)) {
       new_last <- format(Sys.Date(), "%Y-%m-%d")
       DBI::dbExecute(
         con,
