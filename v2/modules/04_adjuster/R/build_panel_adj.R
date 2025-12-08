@@ -29,6 +29,26 @@ af2_build_panel_adj <- function(universe_raw,
   dt[, symbol := toupper(trimws(as.character(symbol)))]
   dt[, refdate := as.Date(refdate)]
 
+  # ------------------------------------------------------------------
+  # Defensive dedupe (rb3 edge cases)
+  # We keep the first row per symbol/refdate after ordering.
+  # This prevents hard failures on occasional upstream duplicates.
+  # ------------------------------------------------------------------
+  data.table::setorder(dt, asset_type, symbol, refdate)
+
+  dup_check <- dt[, .N, by = .(symbol, refdate)][N > 1L]
+  if (nrow(dup_check)) {
+    af2_log(
+      "AF2_ADJ:",
+      "WARNING: universe_raw had duplicated symbol/refdate rows. ",
+      "Examples: ",
+      paste(utils::head(paste0(dup_check$symbol, "@", dup_check$refdate), 5), collapse = ", "),
+      ". Keeping first row per key."
+    )
+    dt <- dt[, .SD[1L], by = .(symbol, refdate)]
+  }
+
+
   af2_assert_no_dupes(dt, c("symbol", "refdate"), name = "universe_raw")
 
   # 1) Build event table (split_value + div_cash per symbol-date)

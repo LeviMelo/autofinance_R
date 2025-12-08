@@ -52,8 +52,7 @@ af2_config_default <- list(
   ca_prefilter_gap_equity = -0.20,
   ca_prefilter_gap_fii    = -0.12,
   ca_prefilter_gap_etf    = -0.15,
-  ca_prefilter_gap_bdr    = -0.20,
-
+  ca_prefilter_gap_bdr    = -0.20
 )
 
 af2_get_config <- function(config = NULL) {

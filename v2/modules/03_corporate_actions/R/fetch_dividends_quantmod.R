@@ -1,4 +1,5 @@
 # v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R
+source("v2/modules/03_corporate_actions/R/yahoo_retry.R")
 
 af2_ca_fetch_dividends_one <- function(yahoo_symbol,
                                        from = "2018-01-01",
@@ -7,19 +8,20 @@ af2_ca_fetch_dividends_one <- function(yahoo_symbol,
                                        split.adjust = TRUE) {
   if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
 
-  x <- tryCatch(
-    quantmod::getDividends(
-      yahoo_symbol,
-      from = from,
-      to = to,
-      auto.assign = FALSE,
-      verbose = verbose,
-      split.adjust = split.adjust
-    ),
-    error = function(e) {
-      if (verbose) af2_log("AF2_CA:", "getDividends failed for ", yahoo_symbol, ": ", conditionMessage(e))
-      NULL
-    }
+  x <- af2_ca_with_retry(
+    function() {
+      quantmod::getDividends(
+        yahoo_symbol,
+        from = from,
+        to = to,
+        auto.assign = FALSE,
+        verbose = verbose,
+        split.adjust = split.adjust
+      )
+    },
+    max_tries = 4L,
+    base_sleep = 1.5,
+    verbose = verbose
   )
 
   if (is.null(x)) return(NULL)
