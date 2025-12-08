@@ -20,7 +20,18 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   modules/01_b3_universe/R/zzz_depends.R
   modules/01_b3_universe/README.md
   modules/02_diagnostics/README.md
+  modules/03_corporate_actions/codebase_dump_03_corporate_actions.txt
+  modules/03_corporate_actions/R/build_registry.R
+  modules/03_corporate_actions/R/fetch_dividends_quantmod.R
+  modules/03_corporate_actions/R/fetch_splits_quantmod.R
+  modules/03_corporate_actions/R/yahoo_symbol_map.R
+  modules/03_corporate_actions/R/zzz_depends.R
   modules/03_corporate_actions/README.md
+  modules/04_adjuster/R/apply_adjustments.R
+  modules/04_adjuster/R/build_adjustments.R
+  modules/04_adjuster/R/build_panel_adj.R
+  modules/04_adjuster/R/validate_panel_adj.R
+  modules/04_adjuster/R/zzz_depends.R
   modules/04_adjuster/README.md
   modules/05_screener/R/compute_metrics.R
   modules/05_screener/R/liquidity_filter.R
@@ -34,7 +45,171 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   scripts/00_make_fixtures.R
   scripts/01a_smoke_b3_fetch_one_year.R
   scripts/01b_build_universe_small_window.R
+  scripts/02a_smoke_corp_actions_quantmod.R
   scripts/04_run_screener_mock_only.R
+  scripts/04a_smoke_adjuster_small_window.R
+  scripts/05a_smoke_screener_real_small_window.R
+
+
+
+###############################################################################
+### FILE: scripts/05a_smoke_screener_real_small_window.R
+###############################################################################
+# v2/scripts/05a_smoke_screener_real_small_window.R
+# End-to-end real-data smoke:
+# Universe (rb3 daily) -> Corp actions (quantmod/Yahoo cached)
+# -> Adjuster -> Screener
+#
+# Goal:
+# - Prove the full v2 spine works on a small real window + sampled symbols
+# - Avoid Yahoo hammering via Module 03 cache
+# - Surface any contract mismatches early
+
+# ----------------------------
+# 00) Core
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+cfg <- af2_get_config()
+
+af2_log_cfg(cfg)
+
+# ----------------------------
+# 01) Universe (rb3)
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+types_all <- c("equity", "fii", "etf", "bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - 365  # ~1y for faster smoke
+
+af2_log("AF2_SMOKE05:", "Universe window ", as.character(start_date), " to ", as.character(end_date))
+
+dt_univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+af2_log("AF2_SMOKE05:", "Universe rows=", nrow(dt_univ),
+        " symbols=", length(unique(dt_univ$symbol)))
+
+# ----------------------------
+# 02) Sample symbols
+# ----------------------------
+set.seed(42)
+sample_n <- 50L
+
+all_syms <- unique(dt_univ$symbol)
+syms_smoke <- if (length(all_syms) > sample_n) sample(all_syms, sample_n) else all_syms
+
+dt_univ_smoke <- dt_univ[symbol %in% syms_smoke]
+
+af2_log("AF2_SMOKE05:", "Sampled symbols=", length(syms_smoke),
+        " sampled rows=", nrow(dt_univ_smoke))
+
+# ----------------------------
+# 03) Corporate actions (quantmod/Yahoo)
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+
+from_ca <- as.Date("2018-01-01")
+to_ca   <- Sys.Date()
+
+# keep conservative parallel for Windows; adjust if you want
+n_workers <- 2L
+
+af2_log("AF2_SMOKE05:", "Building corp-actions registry for ", length(syms_smoke), " symbols")
+
+registry <- af2_ca_build_registry(
+  symbols = syms_smoke,
+  cfg = cfg,
+  from = from_ca,
+  to = to_ca,
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = n_workers
+)
+
+af2_log("AF2_SMOKE05:", "Registry rows=", nrow(registry),
+        " symbols with actions=", length(unique(registry$symbol)))
+
+# ----------------------------
+# 04) Adjuster (Module 04)
+# ----------------------------
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+# Expectation based on your module layout:
+# - build_panel_adj.R should expose a high-level builder that consumes:
+#   (universe_raw + registry) or (universe_raw + events)
+#
+# If your function signature differs, adjust THIS call only.
+
+panel_adj <- af2_adj_build_panel_adj(
+  universe_raw = dt_univ_smoke,
+  registry = registry,
+  cfg = cfg,
+  verbose = TRUE
+)
+
+af2_adj_validate_panel_adj(
+  panel_adj,
+  allow_unresolved = TRUE
+)
+
+af2_log("AF2_SMOKE05:", "panel_adj rows=", nrow(panel_adj),
+        " symbols=", length(unique(panel_adj$symbol)))
+
+# ----------------------------
+# 05) Screener (real data)
+# ----------------------------
+source("v2/modules/05_screener/R/screener_config.R")
+source("v2/modules/05_screener/R/validate_screener_input.R")
+source("v2/modules/05_screener/R/liquidity_filter.R")
+source("v2/modules/05_screener/R/compute_metrics.R")
+source("v2/modules/05_screener/R/score_rank.R")
+source("v2/modules/05_screener/R/run_screener.R")
+
+af2_log("AF2_SMOKE05:", "Running real-data screener (allow_unresolved=TRUE for smoke).")
+
+res <- af2_run_screener(
+  panel_adj,
+  allow_unresolved = TRUE
+)
+
+af2_log("AF2_SMOKE05:", "Top 10 overall:")
+print(utils::head(res$full, 10))
+
+af2_log("AF2_SMOKE05:", "Top 5 by type:")
+for (tp in names(res$by_type)) {
+  af2_log("AF2_SMOKE05:", "Type=", tp)
+  print(utils::head(res$by_type[[tp]], 5))
+}
+
+af2_log("AF2_SMOKE05:", "OK - real-data screener smoke passed.")
 
 
 
@@ -848,6 +1023,314 @@ Purpose:
 
 
 ###############################################################################
+### FILE: modules/03_corporate_actions/R/build_registry.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/build_registry.R
+
+af2_ca_cache_file <- function(cfg, tag = "splits_dividends") {
+  cache_dir <- file.path(cfg$cache_dir, "corp_actions")
+  if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+  file.path(cache_dir, paste0("corp_actions_", tag, ".rds"))
+}
+
+af2_ca_build_registry <- function(symbols,
+                                  asset_types = NULL,
+                                  cfg = NULL,
+                                  from = "2018-01-01",
+                                  to = Sys.Date(),
+                                  verbose = TRUE,
+                                  use_cache = TRUE,
+                                  force_refresh = FALSE,
+                                  n_workers = 1L) {
+
+  cfg <- cfg %||% af2_get_config()
+  symbols <- as.character(symbols)
+  symbols <- toupper(trimws(symbols))
+  symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
+  symbols <- sort(unique(symbols))
+
+  if (!length(symbols)) stop("af2_ca_build_registry: empty symbols.", call. = FALSE)
+
+  af2_ca_require("digest")
+
+  from <- as.Date(from)
+  to   <- as.Date(to)
+
+  # Bucket 'to' by week to avoid daily refetch storms in dev
+  to_tag   <- as.Date(cut(to, breaks = "week"))
+  from_tag <- from
+
+  # symbols is already sorted+unique above
+  sym_hash <- digest::digest(symbols, algo = "xxhash64")
+
+  tag <- paste0(
+    format(from_tag, "%Y%m%d"), "_",
+    format(to_tag, "%Y%m%d"), "_",
+    length(symbols), "_",
+    sym_hash
+  )
+
+  cache_file <- af2_ca_cache_file(cfg, tag)
+
+  if (isTRUE(use_cache) && file.exists(cache_file) && !isTRUE(force_refresh)) {
+    if (verbose) af2_log("AF2_CA:", "Using cache: ", cache_file)
+    return(readRDS(cache_file))
+  }
+
+  yahoo_syms <- af2_yahoo_symbol_vec(symbols, asset_types)
+  map_dt <- data.table::data.table(
+    symbol = symbols,
+    yahoo_symbol = yahoo_syms
+  )
+  map_dt <- map_dt[!is.na(yahoo_symbol)]
+
+  if (!nrow(map_dt)) {
+    stop("af2_ca_build_registry: no Yahoo symbols could be mapped.", call. = FALSE)
+  }
+
+  if (verbose) {
+    af2_log("AF2_CA:", "Fetching corporate actions for ", nrow(map_dt), " symbols (Yahoo).")
+  }
+
+  worker_fun <- function(i) {
+    sym <- map_dt$symbol[i]
+    ysym <- map_dt$yahoo_symbol[i]
+
+    dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
+    dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE)
+
+    out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
+    if (!nrow(out)) return(NULL)
+
+    out[, symbol := sym]
+    out[, yahoo_symbol := ysym]
+
+    out
+  }
+
+  res_list <- list()
+
+  n_workers <- as.integer(n_workers)
+  if (is.na(n_workers) || n_workers < 1L) n_workers <- 1L
+
+  # Windows-safe optional parallel
+  if (n_workers > 1L) {
+    af2_ca_require("parallel")
+
+    cl <- parallel::makeCluster(n_workers)
+    on.exit(try(parallel::stopCluster(cl), silent = TRUE), add = TRUE)
+
+    parallel::clusterExport(
+      cl,
+      varlist = c(
+        "map_dt",
+        "from", "to",
+        "af2_ca_fetch_splits_one",
+        "af2_ca_fetch_dividends_one"
+      ),
+      envir = environment()
+    )
+    parallel::clusterEvalQ(cl, {
+      library(data.table)
+      library(quantmod)
+      library(xts)
+      library(zoo)
+    })
+
+    idx <- seq_len(nrow(map_dt))
+    res_list <- parallel::parLapply(cl, idx, worker_fun)
+
+  } else {
+    for (i in seq_len(nrow(map_dt))) {
+      res_list[[i]] <- worker_fun(i)
+      if (verbose && i %% 50 == 0) {
+        af2_log("AF2_CA:", "Progress: ", i, "/", nrow(map_dt))
+      }
+    }
+  }
+
+  dt_all <- data.table::rbindlist(res_list, use.names = TRUE, fill = TRUE)
+
+  if (!nrow(dt_all)) {
+    # It is valid to have zero actions, but keep schema stable
+    dt_all <- data.table::data.table(
+      symbol = character(),
+      yahoo_symbol = character(),
+      refdate = as.Date(character()),
+      action_type = character(),
+      value = numeric(),
+      source = character()
+    )
+  }
+
+  # Normalize + order
+  dt_all[, refdate := as.Date(refdate)]
+  dt_all <- dt_all[order(symbol, action_type, refdate)]
+
+  # Basic contract sanity
+  req <- c("symbol", "yahoo_symbol", "refdate", "action_type", "value", "source")
+  miss <- setdiff(req, names(dt_all))
+  if (length(miss)) stop("Corporate actions registry missing cols: ", paste(miss, collapse = ", "))
+
+  if (isTRUE(use_cache)) {
+    saveRDS(dt_all, cache_file)
+    if (verbose) af2_log("AF2_CA:", "Wrote cache: ", cache_file)
+  }
+
+  dt_all
+}
+
+
+
+###############################################################################
+### FILE: modules/03_corporate_actions/R/fetch_dividends_quantmod.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R
+
+af2_ca_fetch_dividends_one <- function(yahoo_symbol,
+                                       from = "2018-01-01",
+                                       to = Sys.Date(),
+                                       verbose = FALSE,
+                                       split.adjust = TRUE) {
+  if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
+
+  x <- tryCatch(
+    quantmod::getDividends(
+      yahoo_symbol,
+      from = from,
+      to = to,
+      auto.assign = FALSE,
+      verbose = verbose,
+      split.adjust = split.adjust
+    ),
+    error = function(e) {
+      if (verbose) af2_log("AF2_CA:", "getDividends failed for ", yahoo_symbol, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+
+  if (is.null(x)) return(NULL)
+  if (!inherits(x, "xts")) return(NULL)
+  if (NROW(x) == 0) return(NULL)
+
+  dt <- data.table::data.table(
+    yahoo_symbol = yahoo_symbol,
+    refdate = as.Date(zoo::index(x)),
+    action_type = "dividend",
+    value = as.numeric(zoo::coredata(x)),
+    source = "yahoo"
+  )
+
+  dt[is.finite(value) & value != 0 & !is.na(refdate)]
+}
+
+
+###############################################################################
+### FILE: modules/03_corporate_actions/R/fetch_splits_quantmod.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R
+
+af2_ca_fetch_splits_one <- function(yahoo_symbol,
+                                    from = "2018-01-01",
+                                    to = Sys.Date(),
+                                    verbose = FALSE) {
+  if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
+
+  x <- tryCatch(
+    quantmod::getSplits(
+      yahoo_symbol,
+      from = from,
+      to = to,
+      auto.assign = FALSE,
+      verbose = verbose
+    ),
+    error = function(e) {
+      if (verbose) af2_log("AF2_CA:", "getSplits failed for ", yahoo_symbol, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+
+  # quantmod returns NA if no split data
+  if (is.null(x)) return(NULL)
+  if (!inherits(x, "xts")) return(NULL)
+  if (NROW(x) == 0) return(NULL)
+  if (length(x) == 1 && is.na(as.numeric(x))) return(NULL)
+
+  # xts index = date, coredata = ratio
+  dt <- data.table::data.table(
+    yahoo_symbol = yahoo_symbol,
+    refdate = as.Date(zoo::index(x)),
+    action_type = "split",
+    value = as.numeric(zoo::coredata(x)),
+    source = "yahoo"
+  )
+
+  dt[is.finite(value) & !is.na(refdate)]
+}
+
+
+###############################################################################
+### FILE: modules/03_corporate_actions/R/yahoo_symbol_map.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/yahoo_symbol_map.R
+
+af2_yahoo_symbol <- function(symbol, asset_type = NULL) {
+  s <- toupper(trimws(as.character(symbol)))
+  if (is.na(s) || !nzchar(s)) return(NA_character_)
+
+  # If user already passed a Yahoo-style symbol, respect it
+  if (grepl("\\.", s)) return(s)
+
+  # Most B3 assets on Yahoo use .SA
+  # This covers equities, FIIs, ETFs, many BDRs.
+  paste0(s, ".SA")
+}
+
+af2_yahoo_symbol_vec <- function(symbols, asset_types = NULL) {
+  if (is.null(asset_types)) {
+    vapply(symbols, af2_yahoo_symbol, character(1))
+  } else {
+    mapply(af2_yahoo_symbol, symbols, asset_types, USE.NAMES = FALSE)
+  }
+}
+
+
+###############################################################################
+### FILE: modules/03_corporate_actions/R/zzz_depends.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/zzz_depends.R
+
+if (!exists("af2_get_config")) {
+  stop("af2_get_config not found. Source v2/modules/00_core/R/config.R first.")
+}
+if (!exists("af2_log")) {
+  stop("af2_log not found. Source v2/modules/00_core/R/logging.R first.")
+}
+if (!exists("%||%")) {
+  stop("%||% not found. Source v2/modules/00_core/R/utils.R first.")
+}
+
+af2_ca_require <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      stop("Missing package for corporate actions module: ", p, call. = FALSE)
+    }
+  }
+  invisible(TRUE)
+}
+
+# quantmod is the key dependency here
+af2_ca_require(c("data.table", "quantmod", "xts"))
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(quantmod)
+  library(xts)
+})
+
+
+
+###############################################################################
 ### FILE: modules/03_corporate_actions/README.md
 ###############################################################################
 # Module
@@ -857,6 +1340,898 @@ Purpose:
 - Define OUTPUT contract
 - List functions
 - List tests
+
+
+
+###############################################################################
+### FILE: modules/03_corporate_actions/codebase_dump_03_corporate_actions.txt
+###############################################################################
+Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2/modules/03_corporate_actions':
+===============================================================================
+  R/build_registry.R
+  R/fetch_dividends_quantmod.R
+  R/fetch_splits_quantmod.R
+  R/yahoo_symbol_map.R
+  R/zzz_depends.R
+  README.md
+
+
+
+###############################################################################
+### FILE: R/build_registry.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/build_registry.R
+
+af2_ca_cache_file <- function(cfg, tag = "splits_dividends") {
+  cache_dir <- file.path(cfg$cache_dir, "corp_actions")
+  if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+  file.path(cache_dir, paste0("corp_actions_", tag, ".rds"))
+}
+
+af2_ca_build_registry <- function(symbols,
+                                  asset_types = NULL,
+                                  cfg = NULL,
+                                  from = "2018-01-01",
+                                  to = Sys.Date(),
+                                  verbose = TRUE,
+                                  use_cache = TRUE,
+                                  force_refresh = FALSE,
+                                  n_workers = 1L) {
+
+  cfg <- cfg %||% af2_get_config()
+  symbols <- unique(toupper(trimws(as.character(symbols))))
+  symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
+  if (!length(symbols)) stop("af2_ca_build_registry: empty symbols.", call. = FALSE)
+
+  tag <- paste0(
+    format(as.Date(from), "%Y%m%d"), "_",
+    format(as.Date(to), "%Y%m%d"), "_",
+    length(symbols)
+  )
+  cache_file <- af2_ca_cache_file(cfg, tag)
+
+  if (isTRUE(use_cache) && file.exists(cache_file) && !isTRUE(force_refresh)) {
+    if (verbose) af2_log("AF2_CA:", "Using cache: ", cache_file)
+    return(readRDS(cache_file))
+  }
+
+  yahoo_syms <- af2_yahoo_symbol_vec(symbols, asset_types)
+  map_dt <- data.table::data.table(
+    symbol = symbols,
+    yahoo_symbol = yahoo_syms
+  )
+  map_dt <- map_dt[!is.na(yahoo_symbol)]
+
+  if (!nrow(map_dt)) {
+    stop("af2_ca_build_registry: no Yahoo symbols could be mapped.", call. = FALSE)
+  }
+
+  if (verbose) {
+    af2_log("AF2_CA:", "Fetching corporate actions for ", nrow(map_dt), " symbols (Yahoo).")
+  }
+
+  worker_fun <- function(i) {
+    sym <- map_dt$symbol[i]
+    ysym <- map_dt$yahoo_symbol[i]
+
+    dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
+    dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE)
+
+    out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
+    if (!nrow(out)) return(NULL)
+
+    out[, symbol := sym]
+    out[, yahoo_symbol := ysym]
+
+    out
+  }
+
+  res_list <- list()
+
+  n_workers <- as.integer(n_workers)
+  if (is.na(n_workers) || n_workers < 1L) n_workers <- 1L
+
+  # Windows-safe optional parallel
+  if (n_workers > 1L) {
+    af2_ca_require("parallel")
+
+    cl <- parallel::makeCluster(n_workers)
+    on.exit(try(parallel::stopCluster(cl), silent = TRUE), add = TRUE)
+
+    parallel::clusterExport(
+      cl,
+      varlist = c(
+        "map_dt",
+        "from", "to",
+        "af2_ca_fetch_splits_one",
+        "af2_ca_fetch_dividends_one"
+      ),
+      envir = environment()
+    )
+    parallel::clusterEvalQ(cl, {
+      library(data.table)
+      library(quantmod)
+      library(xts)
+      library(zoo)
+    })
+
+    idx <- seq_len(nrow(map_dt))
+    res_list <- parallel::parLapply(cl, idx, worker_fun)
+
+  } else {
+    for (i in seq_len(nrow(map_dt))) {
+      res_list[[i]] <- worker_fun(i)
+      if (verbose && i %% 50 == 0) {
+        af2_log("AF2_CA:", "Progress: ", i, "/", nrow(map_dt))
+      }
+    }
+  }
+
+  dt_all <- data.table::rbindlist(res_list, use.names = TRUE, fill = TRUE)
+
+  if (!nrow(dt_all)) {
+    # It is valid to have zero actions, but keep schema stable
+    dt_all <- data.table::data.table(
+      symbol = character(),
+      yahoo_symbol = character(),
+      refdate = as.Date(character()),
+      action_type = character(),
+      value = numeric(),
+      source = character()
+    )
+  }
+
+  # Normalize + order
+  dt_all[, refdate := as.Date(refdate)]
+  dt_all <- dt_all[order(symbol, action_type, refdate)]
+
+  # Basic contract sanity
+  req <- c("symbol", "yahoo_symbol", "refdate", "action_type", "value", "source")
+  miss <- setdiff(req, names(dt_all))
+  if (length(miss)) stop("Corporate actions registry missing cols: ", paste(miss, collapse = ", "))
+
+  if (isTRUE(use_cache)) {
+    saveRDS(dt_all, cache_file)
+    if (verbose) af2_log("AF2_CA:", "Wrote cache: ", cache_file)
+  }
+
+  dt_all
+}
+
+
+
+###############################################################################
+### FILE: R/fetch_dividends_quantmod.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R
+
+af2_ca_fetch_dividends_one <- function(yahoo_symbol,
+                                       from = "2018-01-01",
+                                       to = Sys.Date(),
+                                       verbose = FALSE,
+                                       split.adjust = TRUE) {
+  if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
+
+  x <- tryCatch(
+    quantmod::getDividends(
+      yahoo_symbol,
+      from = from,
+      to = to,
+      auto.assign = FALSE,
+      verbose = verbose,
+      split.adjust = split.adjust
+    ),
+    error = function(e) {
+      if (verbose) af2_log("AF2_CA:", "getDividends failed for ", yahoo_symbol, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+
+  if (is.null(x)) return(NULL)
+  if (!inherits(x, "xts")) return(NULL)
+  if (NROW(x) == 0) return(NULL)
+
+  dt <- data.table::data.table(
+    yahoo_symbol = yahoo_symbol,
+    refdate = as.Date(zoo::index(x)),
+    action_type = "dividend",
+    value = as.numeric(zoo::coredata(x)),
+    source = "yahoo"
+  )
+
+  dt[is.finite(value) & value != 0 & !is.na(refdate)]
+}
+
+
+###############################################################################
+### FILE: R/fetch_splits_quantmod.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R
+
+af2_ca_fetch_splits_one <- function(yahoo_symbol,
+                                    from = "2018-01-01",
+                                    to = Sys.Date(),
+                                    verbose = FALSE) {
+  if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
+
+  x <- tryCatch(
+    quantmod::getSplits(
+      yahoo_symbol,
+      from = from,
+      to = to,
+      auto.assign = FALSE,
+      verbose = verbose
+    ),
+    error = function(e) {
+      if (verbose) af2_log("AF2_CA:", "getSplits failed for ", yahoo_symbol, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+
+  # quantmod returns NA if no split data
+  if (is.null(x)) return(NULL)
+  if (length(x) == 1 && is.na(as.numeric(x))) return(NULL)
+  if (!inherits(x, "xts")) return(NULL)
+
+  # xts index = date, coredata = ratio
+  dt <- data.table::data.table(
+    yahoo_symbol = yahoo_symbol,
+    refdate = as.Date(zoo::index(x)),
+    action_type = "split",
+    value = as.numeric(zoo::coredata(x)),
+    source = "yahoo"
+  )
+
+  dt[is.finite(value) & !is.na(refdate)]
+}
+
+
+###############################################################################
+### FILE: R/yahoo_symbol_map.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/yahoo_symbol_map.R
+
+af2_yahoo_symbol <- function(symbol, asset_type = NULL) {
+  s <- toupper(trimws(as.character(symbol)))
+  if (is.na(s) || !nzchar(s)) return(NA_character_)
+
+  # If user already passed a Yahoo-style symbol, respect it
+  if (grepl("\\.", s)) return(s)
+
+  # Most B3 assets on Yahoo use .SA
+  # This covers equities, FIIs, ETFs, many BDRs.
+  paste0(s, ".SA")
+}
+
+af2_yahoo_symbol_vec <- function(symbols, asset_types = NULL) {
+  if (is.null(asset_types)) {
+    vapply(symbols, af2_yahoo_symbol, character(1))
+  } else {
+    mapply(af2_yahoo_symbol, symbols, asset_types, USE.NAMES = FALSE)
+  }
+}
+
+
+###############################################################################
+### FILE: R/zzz_depends.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/zzz_depends.R
+
+if (!exists("af2_get_config")) {
+  stop("af2_get_config not found. Source v2/modules/00_core/R/config.R first.")
+}
+if (!exists("af2_log")) {
+  stop("af2_log not found. Source v2/modules/00_core/R/logging.R first.")
+}
+if (!exists("%||%")) {
+  stop("%||% not found. Source v2/modules/00_core/R/utils.R first.")
+}
+
+af2_ca_require <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      stop("Missing package for corporate actions module: ", p, call. = FALSE)
+    }
+  }
+  invisible(TRUE)
+}
+
+# quantmod is the key dependency here
+af2_ca_require(c("data.table", "quantmod", "xts"))
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(quantmod)
+  library(xts)
+})
+
+
+
+###############################################################################
+### FILE: README.md
+###############################################################################
+# Module
+
+Purpose:
+- Define INPUT contract
+- Define OUTPUT contract
+- List functions
+- List tests
+
+
+
+
+
+
+###############################################################################
+### FILE: modules/04_adjuster/R/apply_adjustments.R
+###############################################################################
+# v2/modules/04_adjuster/R/apply_adjustments.R
+
+# Helper: reverse cumulative product excluding same-day event.
+# For a vector of daily event factors:
+# factor(date) = product of event_factors for events with refdate > date
+af2_adj_rev_cumprod_exclusive <- function(x) {
+  if (!length(x)) return(x)
+  v <- rev(cumprod(rev(x)))
+  data.table::shift(v, 1L, type = "lead", fill = 1)
+}
+
+# Compute adjustments for one symbol
+af2_adj_compute_symbol_adjustments <- function(dt_sym, ev_sym) {
+  dt <- data.table::as.data.table(dt_sym)
+  data.table::setorder(dt, refdate)
+
+  # Universe raw contract minimum for adjuster
+  af2_assert_cols(dt,
+                  c("symbol", "refdate", "open", "high", "low", "close",
+                    "turnover", "qty", "asset_type"),
+                  name = "universe_raw(symbol)")
+
+  # Prep event table for this symbol
+  ev <- data.table::as.data.table(ev_sym)
+  if (!nrow(ev)) {
+    ev <- data.table(
+      symbol = unique(dt$symbol)[1],
+      refdate = as.Date(character()),
+      split_value = numeric(),
+      div_cash = numeric(),
+      source_mask = character(),
+      has_manual = logical()
+    )
+  }
+
+  # Join events onto daily grid
+  dt[, split_value := 1]
+  dt[, div_cash := 0]
+  dt[, source_mask := "none"]
+  dt[, has_manual := FALSE]
+
+  if (nrow(ev)) {
+    dt[ev,
+       on = .(refdate),
+       `:=`(
+         split_value = i.split_value,
+         div_cash = i.div_cash,
+         source_mask = i.source_mask,
+         has_manual = i.has_manual
+       )]
+  }
+
+  dt[is.na(split_value), split_value := 1]
+  dt[is.na(div_cash), div_cash := 0]
+  dt[is.na(source_mask), source_mask := "none"]
+  dt[is.na(has_manual), has_manual := FALSE]
+
+  # -----------------------
+  # 1) Split cumulative factor
+  # -----------------------
+  dt[, split_factor_cum := af2_adj_rev_cumprod_exclusive(split_value)]
+
+  # Apply split adjustment to OHLC
+  dt[, open_adj_split  := open  * split_factor_cum]
+  dt[, high_adj_split  := high  * split_factor_cum]
+  dt[, low_adj_split   := low   * split_factor_cum]
+  dt[, close_adj_split := close * split_factor_cum]
+
+  # -----------------------
+  # 2) Dividend event factor
+  # -----------------------
+  dt[, close_prev := data.table::shift(close_adj_split, 1L)]
+
+  # Default no-dividend factor
+  dt[, div_factor_event := 1]
+
+  # Flag issues when we cannot compute a sane dividend factor
+  dt[, issue_div := FALSE]
+
+  has_div_row <- dt$div_cash > 0
+
+  if (any(has_div_row, na.rm = TRUE)) {
+    # bad cases
+    bad_idx <- which(
+      has_div_row & (
+        !is.finite(dt$close_prev) |
+          is.na(dt$close_prev) |
+          dt$close_prev <= 0 |
+          dt$div_cash >= dt$close_prev
+      )
+    )
+    if (length(bad_idx)) dt[bad_idx, issue_div := TRUE]
+
+    # good cases
+    good_idx <- which(
+      has_div_row &
+        is.finite(dt$close_prev) &
+        !is.na(dt$close_prev) &
+        dt$close_prev > 0 &
+        dt$div_cash < dt$close_prev
+    )
+
+    if (length(good_idx)) {
+      dt[good_idx,
+         div_factor_event := (close_prev - div_cash) / close_prev]
+    }
+  }
+
+  # Guarantee numeric stability
+  dt[!is.finite(div_factor_event) | is.na(div_factor_event), div_factor_event := 1]
+  dt[div_factor_event < 0, div_factor_event := 0]
+
+  # -----------------------
+  # 3) Dividend cumulative factor
+  # -----------------------
+  dt[, div_factor_cum := af2_adj_rev_cumprod_exclusive(div_factor_event)]
+
+  # -----------------------
+  # 4) Final factor + apply
+  # -----------------------
+  dt[, adj_factor_final := split_factor_cum * div_factor_cum]
+
+  dt[, open_adj_final  := open  * adj_factor_final]
+  dt[, high_adj_final  := high  * adj_factor_final]
+  dt[, low_adj_final   := low   * adj_factor_final]
+  dt[, close_adj_final := close * adj_factor_final]
+
+  # Prepare adjustment timeline output for auditing
+  adj_timeline <- dt[, .(
+    symbol,
+    refdate,
+    split_value,
+    div_cash,
+    split_factor_cum,
+    div_factor_event,
+    div_factor_cum,
+    adj_factor_final,
+    source_mask,
+    has_manual,
+    issue_div
+  )]
+
+  list(
+    panel_cols = dt,
+    adjustments = adj_timeline
+  )
+}
+
+# Apply adjustments to full universe_raw
+# Returns:
+#   list(panel_adj = ..., adjustments = ...)
+af2_adj_apply_adjustments <- function(universe_raw,
+                                      events,
+                                      verbose = TRUE) {
+
+  dt <- data.table::as.data.table(universe_raw)
+  data.table::setorder(dt, symbol, refdate)
+
+  ev <- data.table::as.data.table(events)
+  if (!nrow(ev)) {
+    ev <- data.table(
+      symbol = character(),
+      refdate = as.Date(character()),
+      split_value = numeric(),
+      div_cash = numeric(),
+      source_mask = character(),
+      has_manual = logical()
+    )
+  }
+
+  syms <- unique(dt$symbol)
+
+  res_pan <- vector("list", length(syms))
+  res_adj <- vector("list", length(syms))
+
+  for (i in seq_along(syms)) {
+    s <- syms[i]
+
+    dt_sym <- dt[symbol == s]
+    ev_sym <- ev[symbol == s]
+
+    out <- af2_adj_compute_symbol_adjustments(dt_sym, ev_sym)
+
+    res_pan[[i]] <- out$panel_cols
+    res_adj[[i]] <- out$adjustments
+
+    if (verbose && i %% 200 == 0) {
+      af2_log("AF2_ADJ:", "Progress ", i, "/", length(syms))
+    }
+  }
+
+  panel_all <- data.table::rbindlist(res_pan, use.names = TRUE, fill = TRUE)
+  adj_all   <- data.table::rbindlist(res_adj, use.names = TRUE, fill = TRUE)
+
+  data.table::setorder(panel_all, symbol, refdate)
+  data.table::setorder(adj_all, symbol, refdate)
+
+  list(panel_adj = panel_all, adjustments = adj_all)
+}
+
+
+
+###############################################################################
+### FILE: modules/04_adjuster/R/build_adjustments.R
+###############################################################################
+# v2/modules/04_adjuster/R/build_adjustments.R
+
+# Build normalized event table for the adjuster.
+# Input corp_actions contract (from Module 03):
+#   symbol, yahoo_symbol, refdate, action_type, value, source
+#
+# Output event table:
+#   symbol, refdate, split_value, div_cash, source_mask, has_manual
+
+af2_adj_normalize_corp_actions <- function(corp_actions) {
+  if (is.null(corp_actions)) {
+    return(data.table(
+      symbol = character(),
+      refdate = as.Date(character()),
+      action_type = character(),
+      value = numeric(),
+      source = character()
+    ))
+  }
+
+  dt <- data.table::as.data.table(corp_actions)
+
+  # Allow either registry schema with yahoo_symbol or not
+  if ("yahoo_symbol" %in% names(dt)) dt[, yahoo_symbol := NULL]
+
+  # Basic required
+  af2_assert_cols(dt, c("symbol", "refdate", "action_type", "value", "source"),
+                  name = "corp_actions")
+
+  dt[, symbol := toupper(trimws(as.character(symbol)))]
+  dt[, action_type := tolower(trimws(as.character(action_type)))]
+  dt[, refdate := as.Date(refdate)]
+  dt[, value := as.numeric(value)]
+  dt[, source := tolower(trimws(as.character(source)))]
+
+  dt <- dt[!is.na(symbol) & nzchar(symbol) & !is.na(refdate)]
+  dt <- dt[action_type %in% c("split", "dividend")]
+
+  dt
+}
+
+af2_adj_normalize_manual_events <- function(manual_events) {
+  if (is.null(manual_events)) {
+    return(data.table(
+      symbol = character(),
+      refdate = as.Date(character()),
+      action_type = character(),
+      value = numeric(),
+      source = character()
+    ))
+  }
+
+  dt <- data.table::as.data.table(manual_events)
+
+  af2_assert_cols(dt, c("symbol", "refdate", "action_type", "value"),
+                  name = "manual_events")
+
+  if (!"source" %in% names(dt)) dt[, source := "manual"]
+
+  dt[, symbol := toupper(trimws(as.character(symbol)))]
+  dt[, action_type := tolower(trimws(as.character(action_type)))]
+  dt[, refdate := as.Date(refdate)]
+  dt[, value := as.numeric(value)]
+  dt[, source := "manual"]
+
+  dt <- dt[!is.na(symbol) & nzchar(symbol) & !is.na(refdate)]
+  dt <- dt[action_type %in% c("split", "dividend")]
+
+  dt
+}
+
+af2_adj_build_events <- function(corp_actions,
+                                 manual_events = NULL,
+                                 verbose = TRUE) {
+
+  ca <- af2_adj_normalize_corp_actions(corp_actions)
+  me <- af2_adj_normalize_manual_events(manual_events)
+
+  dt_all <- data.table::rbindlist(list(ca, me), use.names = TRUE, fill = TRUE)
+  if (!nrow(dt_all)) {
+    return(data.table(
+      symbol = character(),
+      refdate = as.Date(character()),
+      split_value = numeric(),
+      div_cash = numeric(),
+      source_mask = character(),
+      has_manual = logical()
+    ))
+  }
+
+  # Aggregate same-day events:
+  # - splits: multiply price factors
+  # - dividends: sum cash amounts
+  splits <- dt_all[action_type == "split",
+                   .(split_value = prod(value, na.rm = TRUE),
+                     source_mask = paste(sort(unique(source)), collapse = "+")),
+                   by = .(symbol, refdate)]
+
+  divs <- dt_all[action_type == "dividend",
+                 .(div_cash = sum(value, na.rm = TRUE),
+                   source_mask_div = paste(sort(unique(source)), collapse = "+")),
+                 by = .(symbol, refdate)]
+
+  # Merge into unified event table
+  ev <- merge(
+    splits, divs,
+    by = c("symbol", "refdate"),
+    all = TRUE
+  )
+
+  ev[is.na(split_value), split_value := 1]
+  ev[is.na(div_cash), div_cash := 0]
+
+  # Compose source mask
+  ev[, source_mask := fifelse(
+    !is.na(source_mask) & !is.na(source_mask_div),
+    paste0(source_mask, "+", source_mask_div),
+    fifelse(!is.na(source_mask), source_mask, source_mask_div)
+  )]
+  ev[is.na(source_mask), source_mask := "unknown"]
+
+  ev[, c("source_mask_div") := NULL]
+
+  ev[, has_manual := grepl("manual", source_mask)]
+
+  # Clean obvious nonsense
+  ev <- ev[!is.na(symbol) & nzchar(symbol) & !is.na(refdate)]
+  ev <- ev[is.finite(split_value) & split_value > 0]
+  ev <- ev[is.finite(div_cash) & div_cash >= 0]
+
+  if (verbose) {
+    af2_log("AF2_ADJ:", "Built events: ", nrow(ev), " rows for ",
+            length(unique(ev$symbol)), " symbols.")
+  }
+
+  data.table::setorder(ev, symbol, refdate)
+  ev
+}
+
+
+
+###############################################################################
+### FILE: modules/04_adjuster/R/build_panel_adj.R
+###############################################################################
+# v2/modules/04_adjuster/R/build_panel_adj.R
+
+# High-level builder:
+#   universe_raw (Module 01 output)
+#   corp_actions (Module 03 output)
+#   manual_events (optional)
+#
+# Returns:
+#   list(panel_adj = ..., adjustments = ..., events = ...)
+
+af2_build_panel_adj <- function(universe_raw,
+                                corp_actions = NULL,
+                                manual_events = NULL,
+                                cfg = NULL,
+                                verbose = TRUE) {
+
+  cfg <- cfg %||% af2_get_config()
+
+  dt <- data.table::as.data.table(universe_raw)
+
+  # Strict universe column expectations for v2
+  af2_assert_cols(
+    dt,
+    c("symbol", "refdate", "open", "high", "low", "close",
+      "turnover", "qty", "asset_type"),
+    name = "universe_raw"
+  )
+
+  dt[, symbol := toupper(trimws(as.character(symbol)))]
+  dt[, refdate := as.Date(refdate)]
+
+  af2_assert_no_dupes(dt, c("symbol", "refdate"), name = "universe_raw")
+
+  # 1) Build event table (split_value + div_cash per symbol-date)
+  events <- af2_adj_build_events(
+    corp_actions = corp_actions,
+    manual_events = manual_events,
+    verbose = verbose
+  )
+
+  # 2) Apply adjustments
+  out <- af2_adj_apply_adjustments(
+    universe_raw = dt,
+    events = events,
+    verbose = verbose
+  )
+
+  panel <- out$panel_adj
+  adj_tl <- out$adjustments
+
+  # 3) Add raw aliases for clarity/audit
+  panel[, `:=`(
+    open_raw = open,
+    high_raw = high,
+    low_raw  = low,
+    close_raw = close
+  )]
+
+  # 4) Compute adjustment_state per symbol (research-grade honesty)
+  # We base this on:
+  # - presence of split/dividend events
+  # - whether manual was involved
+  # - whether dividend computation had issues
+
+  # Restrict event flags to the panel date range for state semantics
+  panel_min <- min(panel$refdate, na.rm = TRUE)
+  panel_max <- max(panel$refdate, na.rm = TRUE)
+
+  events_state <- events[
+    refdate >= panel_min & refdate <= panel_max
+  ]
+  
+  ev_flags <- if (nrow(events_state)) {
+    events_state[, .(
+      has_split = any(is.finite(split_value) & split_value != 1),
+      has_div   = any(is.finite(div_cash) & div_cash > 0),
+      has_manual = any(isTRUE(has_manual))
+    ), by = symbol]
+  } else {
+    data.table(symbol = unique(panel$symbol),
+               has_split = FALSE, has_div = FALSE, has_manual = FALSE)
+  }
+
+  issue_flags <- adj_tl[, .(
+    issue_div_any = any(isTRUE(issue_div))
+  ), by = symbol]
+
+  state_dt <- merge(ev_flags, issue_flags, by = "symbol", all = TRUE)
+  state_dt[is.na(has_split), has_split := FALSE]
+  state_dt[is.na(has_div), has_div := FALSE]
+  state_dt[is.na(has_manual), has_manual := FALSE]
+  state_dt[is.na(issue_div_any), issue_div_any := FALSE]
+
+  state_dt[, adjustment_state := fifelse(
+    issue_div_any, "suspect_unresolved",
+    fifelse(
+      has_manual, "manual_override",
+      fifelse(
+        has_split & has_div, "split_dividend",
+        fifelse(
+          has_split, "split_only",
+          fifelse(
+            has_div, "dividend_only",
+            "ok"
+          )
+        )
+      )
+    )
+  )]
+
+  panel[state_dt, on = "symbol", adjustment_state := i.adjustment_state]
+
+  # 5) Final column cleanup ordering
+  keep_cols <- c(
+    "symbol", "refdate", "asset_type",
+    "open_raw", "high_raw", "low_raw", "close_raw",
+    "open_adj_split", "high_adj_split", "low_adj_split", "close_adj_split",
+    "open_adj_final", "high_adj_final", "low_adj_final", "close_adj_final",
+    "turnover", "qty",
+    "adjustment_state"
+  )
+
+  # Some columns may be missing if upstream had NA open/high/low;
+  # preserve everything but move preferred cols to front.
+  present_keep <- intersect(keep_cols, names(panel))
+  other_cols <- setdiff(names(panel), present_keep)
+  data.table::setcolorder(panel, c(present_keep, other_cols))
+
+  if (verbose) {
+    af2_log("AF2_ADJ:", "panel_adj rows = ", nrow(panel))
+    af2_log("AF2_ADJ:", "symbols = ", length(unique(panel$symbol)))
+    af2_log("AF2_ADJ:", "states:")
+    print(panel[, .N, by = adjustment_state][order(-N)])
+  }
+
+  list(
+    panel_adj = panel,
+    adjustments = adj_tl,
+    events = events
+  )
+}
+
+
+
+###############################################################################
+### FILE: modules/04_adjuster/R/validate_panel_adj.R
+###############################################################################
+# v2/modules/04_adjuster/R/validate_panel_adj.R
+
+af2_validate_panel_adj <- function(panel_adj) {
+
+  af2_require(c("data.table"))
+
+  af2_assert_cols(
+    panel_adj,
+    c("symbol", "refdate", "close_adj_final", "asset_type", "adjustment_state"),
+    name = "panel_adj"
+  )
+
+  dt <- data.table::as.data.table(panel_adj)
+  dt[, refdate := as.Date(refdate)]
+
+  # Must have liquidity column for screener use
+  has_turnover <- "turnover" %in% names(dt)
+  has_vol_fin  <- "vol_fin" %in% names(dt)
+  if (!has_turnover && !has_vol_fin) {
+    stop("panel_adj must contain 'turnover' or 'vol_fin'.", call. = FALSE)
+  }
+
+  # No duplicate symbol-date
+  af2_assert_no_dupes(dt, c("symbol", "refdate"), name = "panel_adj")
+
+  invisible(TRUE)
+}
+
+
+
+###############################################################################
+### FILE: modules/04_adjuster/R/zzz_depends.R
+###############################################################################
+# v2/modules/04_adjuster/R/zzz_depends.R
+# Dependencies + guardrails for Module 04 (Adjuster)
+
+# Must have core loaded first
+if (!exists("af2_get_config")) {
+  stop("af2_get_config not found. Source v2/modules/00_core/R/config.R first.")
+}
+if (!exists("af2_log")) {
+  stop("af2_log not found. Source v2/modules/00_core/R/logging.R first.")
+}
+if (!exists("%||%")) {
+  stop("%||% not found. Source v2/modules/00_core/R/utils.R first.")
+}
+if (!exists("af2_require")) {
+  stop("af2_require not found. Source v2/modules/00_core/R/utils.R first.")
+}
+if (!exists("af2_assert_cols")) {
+  stop("af2_assert_cols not found. Source v2/modules/00_core/R/utils.R first.")
+}
+if (!exists("af2_assert_no_dupes")) {
+  stop("af2_assert_no_dupes not found. Source v2/modules/00_core/R/utils.R first.")
+}
+
+af2_adj_require <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      stop("Missing package for adjuster module: ", p, call. = FALSE)
+    }
+  }
+  invisible(TRUE)
+}
+
+af2_adj_require(c("data.table"))
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
 
 
 
@@ -1210,8 +2585,8 @@ af2_bootstrap_v2 <- function(root = "v2", verbose = TRUE) {
     file.path(root, "modules"),
     file.path(root, "modules", "00_core", "R"),
     file.path(root, "modules", "00_core", "tests"),
-    file.path(root, "modules", "01_universe", "R"),
-    file.path(root, "modules", "01_universe", "tests"),
+    file.path(root, "modules", "01_b3_universe", "R"),
+    file.path(root, "modules", "01_b3_universe", "tests"),
     file.path(root, "modules", "02_diagnostics", "R"),
     file.path(root, "modules", "02_diagnostics", "tests"),
     file.path(root, "modules", "03_corporate_actions", "R"),
@@ -1264,7 +2639,7 @@ af2_bootstrap_v2 <- function(root = "v2", verbose = TRUE) {
   # Module READMEs
   module_readmes <- c(
     file.path(root, "modules", "00_core", "README.md"),
-    file.path(root, "modules", "01_universe", "README.md"),
+    file.path(root, "modules", "01_b3_universe", "README.md"),
     file.path(root, "modules", "02_diagnostics", "README.md"),
     file.path(root, "modules", "03_corporate_actions", "README.md"),
     file.path(root, "modules", "04_adjuster", "README.md"),
@@ -1508,7 +2883,7 @@ cfg <- af2_get_config()
 # Choose mode here to avoid future screener regressions.
 # "yearly" = backfill-style artifact
 # "daily"  = screener-grade recent window
-mode <- "daily"
+mode <- "yearly"
 types_all <- c("equity","fii","etf","bdr")
 
 if (mode == "yearly") {
@@ -1569,9 +2944,9 @@ if (!dir.exists(artifact_dir)) dir.create(artifact_dir, recursive = TRUE)
 saveRDS(dt_all, artifact_file)
 af2_log("AF2_B3:", "Wrote artifact: ", artifact_file)
 
-RUN_DAILY_SMOKE <- TRUE
+RUN_DAILY_SMOKE <- FALSE
 
-if (isTRUE(RUN_DAILY_SMOKE)) {
+if (mode == "yearly" && isTRUE(RUN_DAILY_SMOKE)) {
   end_date <- Sys.Date() - 1
   start_date <- end_date - 90  # ~3 months
   dt_daily_lazy <- af2_b3_fetch_daily_lazy(
@@ -1583,6 +2958,71 @@ if (isTRUE(RUN_DAILY_SMOKE)) {
   # just force a tiny collect to prove it works
   print(dt_daily_lazy |> dplyr::slice_head(n = 5) |> dplyr::collect())
 }
+
+
+
+###############################################################################
+### FILE: scripts/02a_smoke_corp_actions_quantmod.R
+###############################################################################
+# v2/scripts/02a_smoke_corp_actions_quantmod.R
+
+# Core
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# Universe (to get a recent symbol list)
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+# Corporate actions
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+
+cfg <- af2_get_config()
+
+# Use last config year, tiny types subset to keep smoke fast
+year_test <- max(cfg$years)
+types_test <- c("equity")
+
+af2_log("AF2_B3:", "SMOKE universe for corp-actions seed: year=", year_test)
+
+dt_univ <- af2_b3_build_universe_year(
+  year = year_test,
+  include_types = types_test,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+# Grab a small symbol slice
+syms <- unique(dt_univ$symbol)
+syms <- head(syms, 20)
+
+af2_log("AF2_CA:", "SMOKE fetching splits+dividends for 20 symbols...")
+
+dt_ca <- af2_ca_build_registry(
+  symbols = syms,
+  cfg = cfg,
+  from = as.Date(paste0(year_test - 3, "-01-01")),
+  to = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L
+)
+
+print(dt_ca)
+af2_log("AF2_CA:", "OK - corp-actions smoke finished.")
 
 
 
@@ -1631,6 +3071,102 @@ stopifnot(all(!is.na(res$full$rank_overall)))
 print(utils::head(res$full, 10))
 
 af2_log("AF2_SCR:", "OK - mock-only screener passed.")
+
+
+
+###############################################################################
+### FILE: scripts/04a_smoke_adjuster_small_window.R
+###############################################################################
+# v2/scripts/04a_smoke_adjuster_small_window.R
+
+# Core
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# Module 01 (universe)
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+# Module 03 (corp actions)
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+
+# Module 04 (adjuster)
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+cfg <- af2_get_config()
+
+# 1) Build small recent universe window
+end_date <- Sys.Date() - 1
+start_date <- end_date - 365  # 1 year smoke
+
+types_all <- c("equity","fii","etf","bdr")
+
+af2_log("AF2_SMOKE04:", "Universe window ", start_date, " to ", end_date)
+
+univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+# take a small symbol subset for faster Yahoo calls
+set.seed(1)
+syms <- sort(unique(univ$symbol))
+syms_small <- head(sample(syms, min(20, length(syms))), 20)
+
+af2_log("AF2_SMOKE04:", "Corp actions for ", length(syms_small), " symbols")
+
+ca <- af2_ca_build_registry(
+  symbols = syms_small,
+  cfg = cfg,
+  from = "2018-01-01",
+  to = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L
+)
+
+# 2) Filter universe to same subset
+univ_small <- univ[symbol %in% syms_small]
+
+# 3) Build adjusted panel
+res <- af2_build_panel_adj(
+  universe_raw = univ_small,
+  corp_actions = ca,
+  manual_events = NULL,
+  cfg = cfg,
+  verbose = TRUE
+)
+
+panel_adj <- res$panel_adj
+
+# 4) Validate
+af2_validate_panel_adj(panel_adj)
+
+# 5) Show sample
+print(utils::head(panel_adj, 20))
+
+af2_log("AF2_SMOKE04:", "OK - adjuster smoke passed.")
 
 
 

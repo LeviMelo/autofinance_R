@@ -53,8 +53,12 @@ af2_run_screener <- function(panel_adj,
   # 3) Score + rank
   out <- af2_score_and_rank(metrics, cfg$score_weights)
 
+  by_type <- split(out, out$asset_type)
+  by_type <- lapply(by_type, function(x) x[order(x$rank_type)])
+
   list(
-    full = out,
-    by_type = split(out[order(asset_type, rank_type)], out$asset_type)
+    full = out[order(rank_overall)],
+    by_type = by_type
   )
+
 }

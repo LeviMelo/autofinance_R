@@ -15,6 +15,7 @@ af2_score_and_rank <- function(metrics, score_weights) {
     if (!is.finite(s) || s == 0) next
 
     z <- (x - mu) / s
+    z[!is.finite(z) | is.na(z)] <- 0
     dt[, score := score + score_weights[[nm]] * z]
   }
 
