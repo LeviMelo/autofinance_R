@@ -29,8 +29,22 @@ af2_screener_config_default <- list(
 
 af2_get_screener_config <- function(config = NULL) {
   cfg <- af2_screener_config_default
+
   if (!is.null(config)) {
     for (nm in names(config)) cfg[[nm]] <- config[[nm]]
   }
+
+  # Defensive normalization
+  if (is.null(cfg$horizons_days)) cfg$horizons_days <- integer()
+  cfg$horizons_days <- as.integer(cfg$horizons_days)
+  cfg$lookback_days <- as.integer(cfg$lookback_days)
+
+  if (length(cfg$horizons_days)) {
+    max_h <- max(cfg$horizons_days, na.rm = TRUE)
+    if (is.finite(max_h) && cfg$lookback_days < (max_h + 1L)) {
+      cfg$lookback_days <- max_h + 1L
+    }
+  }
+
   cfg
 }

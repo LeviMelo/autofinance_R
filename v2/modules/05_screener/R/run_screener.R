@@ -36,9 +36,17 @@ af2_run_screener <- function(panel_adj,
 
   for (sym in syms) {
     sdt <- dt[symbol == sym]
-    if (nrow(sdt) > cfg$lookback_days) {
-      sdt <- sdt[(.N - cfg$lookback_days + 1):.N]
+    
+    # Ensure we keep enough rows to compute the longest horizon return.
+    need_n <- max(
+     as.integer(cfg$lookback_days),
+     as.integer(max(cfg$horizons_days)) + 1L
+    )
+
+    if (nrow(sdt) > need_n) {
+     sdt <- sdt[(.N - need_n + 1):.N]
     }
+
     m <- af2_compute_symbol_metrics(sdt, cfg$horizons_days)
     if (!is.null(m)) {
       # attach asset_type
