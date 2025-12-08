@@ -17,33 +17,67 @@ source("v2/modules/01_b3_universe/R/build_universe.R")
 
 cfg <- af2_get_config()
 
-years_small <- sort(unique(c(max(cfg$years) - 1L, max(cfg$years))))
+# Choose mode here to avoid future screener regressions.
+# "yearly" = backfill-style artifact
+# "daily"  = screener-grade recent window
+mode <- "daily"
 types_all <- c("equity","fii","etf","bdr")
 
-af2_log("AF2_B3:", "Building small-window universe: ",
-        paste(years_small, collapse = ", "),
-        " types=", paste(types_all, collapse = ","))
+if (mode == "yearly") {
 
-dt_all <- af2_b3_build_universe(
-  years = years_small,
-  include_types = types_all,
-  cfg = cfg,
-  verbose = TRUE,
-  use_cache = TRUE
-)
+  years_small <- sort(unique(c(max(cfg$years) - 1L, max(cfg$years))))
+
+  af2_log("AF2_B3:", "Building small-window universe (YEARLY): ",
+          paste(years_small, collapse = ", "),
+          " types=", paste(types_all, collapse = ","))
+
+  dt_all <- af2_b3_build_universe(
+    years = years_small,
+    include_types = types_all,
+    cfg = cfg,
+    verbose = TRUE,
+    use_cache = TRUE
+  )
+
+  artifact_file <- file.path(
+    file.path(cfg$raw_dir, "b3_universe"),
+    paste0("universe_raw_", min(years_small), "_", max(years_small), ".rds")
+  )
+
+} else {
+
+  # Recent ~2-year screener-style window
+  end_date <- Sys.Date() - 1
+  start_date <- end_date - 730
+
+  af2_log("AF2_B3:", "Building small-window universe (DAILY): ",
+          as.character(start_date), " to ", as.character(end_date),
+          " types=", paste(types_all, collapse = ","))
+
+  dt_all <- af2_b3_build_universe_window(
+    start_date = start_date,
+    end_date   = end_date,
+    include_types = types_all,
+    cfg = cfg,
+    verbose = TRUE,
+    use_cache = TRUE
+  )
+
+  artifact_file <- file.path(
+    file.path(cfg$raw_dir, "b3_universe"),
+    paste0("universe_raw_daily_",
+           format(as.Date(start_date), "%Y%m%d"), "_",
+           format(as.Date(end_date), "%Y%m%d"),
+           ".rds")
+  )
+}
 
 af2_log("AF2_B3:", "Universe rows total: ", nrow(dt_all))
 af2_log("AF2_B3:", "Symbols total: ", length(unique(dt_all$symbol)))
 
-# Save an artifact for next module (panel)
 artifact_dir <- file.path(cfg$raw_dir, "b3_universe")
 if (!dir.exists(artifact_dir)) dir.create(artifact_dir, recursive = TRUE)
 
-artifact_file <- file.path(
-  artifact_dir,
-  paste0("universe_raw_", min(years_small), "_", max(years_small), ".rds")
-)
-
 saveRDS(dt_all, artifact_file)
-
 af2_log("AF2_B3:", "Wrote artifact: ", artifact_file)
+

@@ -123,3 +123,102 @@ af2_b3_build_universe <- function(years = NULL,
 
   dt_all
 }
+
+af2_b3_cache_key_window <- function(start_date, end_date, include_types) {
+  paste0(
+    "cotahist_daily_",
+    format(as.Date(start_date), "%Y%m%d"), "_",
+    format(as.Date(end_date), "%Y%m%d"), "_",
+    paste(sort(include_types), collapse = "-"),
+    ".rds"
+  )
+}
+
+af2_b3_build_universe_window <- function(start_date, end_date,
+                                         include_types = NULL,
+                                         cfg = NULL,
+                                         verbose = TRUE,
+                                         use_cache = TRUE,
+                                         force_download = FALSE,
+                                         reprocess = FALSE) {
+
+  cfg <- cfg %||% af2_get_config()
+
+  include_types <- include_types %||% cfg$include_types
+  include_types <- af2_b3_validate_types(include_types)
+
+  start_date <- as.Date(start_date)
+  end_date   <- as.Date(end_date)
+
+  # Cache path
+  cache_dir <- file.path(cfg$cache_dir, "b3_universe")
+  if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+  cache_file <- file.path(cache_dir, af2_b3_cache_key_window(start_date, end_date, include_types))
+
+  if (isTRUE(use_cache) && file.exists(cache_file) && !isTRUE(force_download)) {
+    if (verbose) af2_log("AF2_B3:", "Using cache: ", cache_file)
+    dt_cached <- readRDS(cache_file)
+    return(data.table::as.data.table(dt_cached))
+  }
+
+  # 1) Lazy fetch daily window
+  df_lazy <- af2_b3_fetch_daily_lazy(
+    start_date = start_date,
+    end_date   = end_date,
+    cfg = cfg,
+    verbose = verbose,
+    force_download = force_download,
+    reprocess = reprocess
+  )
+
+  # 2) Apply type filters lazily
+  lazy_by_type <- af2_b3_apply_type_filters(df_lazy, include_types)
+
+  # 3) Collect each type separately (bounded)
+  out_list <- list()
+
+  for (tp in names(lazy_by_type)) {
+    if (verbose) af2_log("AF2_B3:", "Collecting type: ", tp,
+                         " for window ", start_date, " to ", end_date)
+
+    df_tp <- dplyr::collect(lazy_by_type[[tp]])
+    if (!nrow(df_tp)) next
+
+    dt_min <- af2_b3_select_min_cols(df_tp)
+    dt_liq <- af2_b3_unify_liquidity(dt_min)
+    dt_liq[, asset_type := tp]
+
+    out_list[[tp]] <- dt_liq
+  }
+
+  if (!length(out_list)) {
+    stop("af2_b3_build_universe_window: no data returned after filters.")
+  }
+
+  dt_win <- data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
+  data.table::setorder(dt_win, asset_type, symbol, refdate)
+
+  # 4) Validate contract
+  required <- c("symbol", "refdate", "open", "high", "low", "close",
+                "turnover", "qty", "asset_type")
+  miss <- setdiff(required, names(dt_win))
+  if (length(miss)) stop("Universe contract violated. Missing cols: ", paste(miss, collapse = ", "))
+
+  # 5) Drop obvious junk
+  dt_win <- dt_win[!is.na(symbol) & symbol != "" & !is.na(refdate) & is.finite(close)]
+
+  if (verbose) {
+    af2_log("AF2_B3:", "Window rows = ", nrow(dt_win))
+    af2_log("AF2_B3:", "Unique symbols = ", length(unique(dt_win$symbol)))
+    af2_log("AF2_B3:", "Counts by type:")
+    print(dt_win[, .N, by = asset_type][order(-N)])
+  }
+
+  if (isTRUE(use_cache)) {
+    saveRDS(dt_win, cache_file)
+    if (verbose) af2_log("AF2_B3:", "Wrote cache: ", cache_file)
+  }
+
+  dt_win
+}

@@ -1,5 +1,7 @@
 # v2/modules/00_core/R/utils.R
 
+`%||%` <- function(x, y) if (!is.null(x)) x else y
+
 af2_require <- function(pkgs) {
   pkgs <- unique(pkgs)
   missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]

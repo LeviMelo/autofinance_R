@@ -42,8 +42,11 @@ af2_b3_fetch_yearly_lazy <- function(year, cfg = NULL, verbose = TRUE,
     stop("cotahist_get('yearly') failed: ", conditionMessage(e))
   })
 
-  # Always filter by year lazily
-  df_lazy <- df_lazy |> dplyr::filter(lubridate::year(.data$refdate) == year)
+  start_y <- as.Date(paste0(year, "-01-01"))
+  end_y   <- as.Date(paste0(year + 1L, "-01-01"))
+
+  df_lazy <- df_lazy |>
+    dplyr::filter(.data$refdate >= start_y, .data$refdate < end_y)
 
   df_lazy
 }

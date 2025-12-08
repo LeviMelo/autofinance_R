@@ -1,0 +1,1396 @@
+Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
+===============================================================================
+  contracts/adjustments.md
+  contracts/panel_adj.md
+  contracts/screener_input.md
+  contracts/screener_output.md
+  contracts/universe_raw.md
+  modules/00_core/R/config.R
+  modules/00_core/R/logging.R
+  modules/00_core/R/utils.R
+  modules/00_core/README.md
+  modules/01_b3_universe/R/build_universe.R
+  modules/01_b3_universe/R/fetch_yearly.R
+  modules/01_b3_universe/R/filter_by_type_rb3.R
+  modules/01_b3_universe/R/rb3_init.R
+  modules/01_b3_universe/R/select_min_cols.R
+  modules/01_b3_universe/R/unify_liquidity.R
+  modules/01_b3_universe/R/validate_types.R
+  modules/01_b3_universe/R/zzz_depends.R
+  modules/01_b3_universe/README.md
+  modules/02_diagnostics/README.md
+  modules/03_corporate_actions/README.md
+  modules/04_adjuster/README.md
+  modules/05_screener/R/compute_metrics.R
+  modules/05_screener/R/liquidity_filter.R
+  modules/05_screener/R/run_screener.R
+  modules/05_screener/R/score_rank.R
+  modules/05_screener/R/screener_config.R
+  modules/05_screener/R/validate_screener_input.R
+  modules/05_screener/README.md
+  README.md
+  scripts/00_bootstrap_v2.R
+  scripts/00_make_fixtures.R
+  scripts/01a_smoke_b3_fetch_one_year.R
+  scripts/01b_build_universe_small_window.R
+  scripts/04_run_screener_mock_only.R
+
+
+
+###############################################################################
+### FILE: README.md
+###############################################################################
+# autofinance_R v2
+
+Principles:
+- In-memory first
+- Contract-first
+- Fixtures-first
+- Screener cannot fetch or adjust data
+- Adjuster is the single owner of history mutation
+
+
+
+###############################################################################
+### FILE: contracts/adjustments.md
+###############################################################################
+# adjustments.md
+
+This is a placeholder. Fill with the explicit schema + guarantees.
+
+
+
+###############################################################################
+### FILE: contracts/panel_adj.md
+###############################################################################
+# panel_adj.md
+
+This is a placeholder. Fill with the explicit schema + guarantees.
+
+
+
+###############################################################################
+### FILE: contracts/screener_input.md
+###############################################################################
+# screener_input.md
+
+This is a placeholder. Fill with the explicit schema + guarantees.
+
+
+
+###############################################################################
+### FILE: contracts/screener_output.md
+###############################################################################
+# screener_output.md
+
+This is a placeholder. Fill with the explicit schema + guarantees.
+
+
+
+###############################################################################
+### FILE: contracts/universe_raw.md
+###############################################################################
+# universe_raw.md
+
+This is a placeholder. Fill with the explicit schema + guarantees.
+
+
+
+###############################################################################
+### FILE: modules/00_core/R/config.R
+###############################################################################
+# v2/modules/00_core/R/config.R
+
+af2_config_default <- list(
+  # Universe scope (used later)
+  years = 2018:as.integer(format(Sys.Date(), "%Y")),
+  include_types = c("equity", "fii", "etf", "bdr"),
+
+  # Screener liquidity
+  min_turnover = 5e5,
+  min_days_traded_ratio = 0.8,
+
+  # Corporate actions toggles (used later)
+  enable_splits = TRUE,
+  enable_manual_events = TRUE,
+
+  # Paths
+  cache_dir  = "v2/data/cache",
+  raw_dir    = "v2/data/raw",
+  fixtures_dir = "v2/data/fixtures",
+  manual_dir = "v2/data/manual",
+  logs_dir   = "v2/logs",
+
+  # Safety
+  allow_unresolved_in_screener = FALSE
+)
+
+af2_get_config <- function(config = NULL) {
+  cfg <- af2_config_default
+  if (!is.null(config)) {
+    # shallow override for now (keep simple)
+    for (nm in names(config)) cfg[[nm]] <- config[[nm]]
+  }
+  # ensure dirs exist
+  dir.create(cfg$cache_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(cfg$raw_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(cfg$fixtures_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(cfg$manual_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(cfg$logs_dir, recursive = TRUE, showWarnings = FALSE)
+  cfg
+}
+
+
+
+###############################################################################
+### FILE: modules/00_core/R/logging.R
+###############################################################################
+# v2/modules/00_core/R/logging.R
+
+af2_log <- function(prefix, ...) {
+  msg <- paste0(prefix, " ", paste(..., collapse = ""))
+  message(msg)
+}
+
+af2_log_cfg <- function(config) {
+  af2_log("AF2_CFG:", "\n", paste(utils::capture.output(str(config)), collapse = "\n"))
+}
+
+
+
+###############################################################################
+### FILE: modules/00_core/R/utils.R
+###############################################################################
+# v2/modules/00_core/R/utils.R
+
+af2_require <- function(pkgs) {
+  pkgs <- unique(pkgs)
+  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing)) {
+    stop("Missing packages in v2 environment: ",
+         paste(missing, collapse = ", "),
+         "\nInstall them explicitly to keep v2 deterministic.",
+         call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+af2_assert_cols <- function(dt, cols, name = "object") {
+  if (is.null(dt)) stop(name, " is NULL.", call. = FALSE)
+  if (!is.data.frame(dt)) stop(name, " must be a data.frame/data.table.", call. = FALSE)
+  miss <- setdiff(cols, names(dt))
+  if (length(miss)) {
+    stop(name, " missing required columns: ", paste(miss, collapse = ", "), call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+af2_assert_no_dupes <- function(dt, key_cols, name = "object") {
+  af2_require("data.table")
+  x <- data.table::as.data.table(dt)
+  dup <- x[, .N, by = key_cols][N > 1L]
+  if (nrow(dup)) {
+    stop(name, " has duplicated keys on: ",
+         paste(key_cols, collapse = ", "),
+         "\nExample dup rows:\n",
+         paste(utils::capture.output(print(utils::head(dup, 10))), collapse = "\n"),
+         call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+af2_weekdays_only <- function(dates) {
+  w <- weekdays(dates)
+  !(w %in% c("Saturday", "Sunday", "sábado", "domingo"))
+}
+
+af2_make_bizdays_seq <- function(start_date, end_date) {
+  d <- seq.Date(as.Date(start_date), as.Date(end_date), by = "day")
+  d[af2_weekdays_only(d)]
+}
+
+
+
+
+###############################################################################
+### FILE: modules/00_core/README.md
+###############################################################################
+# Module
+
+Purpose:
+- Define INPUT contract
+- Define OUTPUT contract
+- List functions
+- List tests
+
+
+
+###############################################################################
+### FILE: modules/01_b3_universe/R/build_universe.R
+###############################################################################
+# v2/modules/01_b3_universe/R/build_universe.R
+
+af2_b3_cache_key <- function(year, include_types) {
+  paste0(
+    "cotahist_yearly_",
+    year, "_",
+    paste(sort(include_types), collapse = "-"),
+    ".rds"
+  )
+}
+
+af2_b3_build_universe_year <- function(year,
+                                       include_types = NULL,
+                                       cfg = NULL,
+                                       verbose = TRUE,
+                                       use_cache = TRUE,
+                                       force_download = FALSE,
+                                       reprocess = FALSE) {
+  cfg <- cfg %||% af2_get_config()
+
+  include_types <- include_types %||% cfg$include_types
+  include_types <- af2_b3_validate_types(include_types)
+
+  # Cache path
+  cache_dir <- file.path(cfg$cache_dir, "b3_universe")
+  if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+  cache_file <- file.path(cache_dir, af2_b3_cache_key(year, include_types))
+
+  if (isTRUE(use_cache) && file.exists(cache_file) && !isTRUE(force_download)) {
+    if (verbose) af2_log("AF2_B3:", "Using cache: ", cache_file)
+    dt_cached <- readRDS(cache_file)
+    return(data.table::as.data.table(dt_cached))
+  }
+
+  # 1) Lazy fetch
+  df_lazy <- af2_b3_fetch_yearly_lazy(
+    year = year, cfg = cfg, verbose = verbose,
+    force_download = force_download,
+    reprocess = reprocess
+  )
+
+  # 2) Apply type filters lazily
+  lazy_by_type <- af2_b3_apply_type_filters(df_lazy, include_types)
+
+  # 3) Collect each type separately (bounded)
+  out_list <- list()
+
+  for (tp in names(lazy_by_type)) {
+    if (verbose) af2_log("AF2_B3:", "Collecting type: ", tp, " for ", year)
+    df_tp <- dplyr::collect(lazy_by_type[[tp]])
+    if (!nrow(df_tp)) next
+
+    dt_min <- af2_b3_select_min_cols(df_tp)
+    dt_liq <- af2_b3_unify_liquidity(dt_min)
+    dt_liq[, asset_type := tp]
+
+    out_list[[tp]] <- dt_liq
+  }
+
+  if (!length(out_list)) {
+    stop("af2_b3_build_universe_year: no data returned after filters for year ", year)
+  }
+
+  dt_year <- data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
+  data.table::setorder(dt_year, asset_type, symbol, refdate)
+
+  # 4) Validate contract
+  required <- c("symbol", "refdate", "open", "high", "low", "close", "turnover", "qty", "asset_type")
+  miss <- setdiff(required, names(dt_year))
+  if (length(miss)) {
+    stop("Universe contract violated. Missing cols: ", paste(miss, collapse = ", "))
+  }
+
+  # 5) Drop obvious junk rows
+  dt_year <- dt_year[!is.na(symbol) & symbol != "" & !is.na(refdate) & is.finite(close)]
+
+  if (verbose) {
+    af2_log("AF2_B3:", "Year ", year, " rows = ", nrow(dt_year))
+    af2_log("AF2_B3:", "Unique symbols = ", length(unique(dt_year$symbol)))
+    af2_log("AF2_B3:", "Counts by type:")
+    print(dt_year[, .N, by = asset_type][order(-N)])
+  }
+
+  # 6) Save cache
+  if (isTRUE(use_cache)) {
+    saveRDS(dt_year, cache_file)
+    if (verbose) af2_log("AF2_B3:", "Wrote cache: ", cache_file)
+  }
+
+  dt_year
+}
+
+af2_b3_build_universe <- function(years = NULL,
+                                  include_types = NULL,
+                                  cfg = NULL,
+                                  verbose = TRUE,
+                                  use_cache = TRUE,
+                                  force_download = FALSE,
+                                  reprocess = FALSE) {
+  cfg <- cfg %||% af2_get_config()
+  years <- years %||% cfg$years
+  years <- sort(unique(as.integer(years)))
+
+  include_types <- include_types %||% cfg$include_types
+  include_types <- af2_b3_validate_types(include_types)
+
+  out <- list()
+  for (y in years) {
+    out[[as.character(y)]] <- af2_b3_build_universe_year(
+      year = y,
+      include_types = include_types,
+      cfg = cfg,
+      verbose = verbose,
+      use_cache = use_cache,
+      force_download = force_download,
+      reprocess = reprocess
+    )
+  }
+
+  dt_all <- data.table::rbindlist(out, use.names = TRUE, fill = TRUE)
+  data.table::setorder(dt_all, asset_type, symbol, refdate)
+
+  dt_all
+}
+
+
+
+###############################################################################
+### FILE: modules/01_b3_universe/R/fetch_yearly.R
+###############################################################################
+# v2/modules/01_b3_universe/R/fetch_yearly.R
+# Fetch one year with rb3, then return *lazy* dataset handle
+
+af2_b3_fetch_yearly_lazy <- function(year, cfg = NULL, verbose = TRUE,
+                                     force_download = FALSE,
+                                     reprocess = FALSE) {
+  cfg <- cfg %||% af2_get_config()
+  af2_b3_init_rb3(cfg, verbose = verbose)
+
+  year <- as.integer(year)
+
+  if (verbose) af2_log("AF2_B3:", "fetch_marketdata yearly: ", year)
+
+  ok <- TRUE
+  tryCatch({
+    rb3::fetch_marketdata(
+      "b3-cotahist-yearly",
+      year = year,
+      throttle = TRUE,
+      force_download = isTRUE(force_download),
+      reprocess = isTRUE(reprocess)
+    )
+  }, error = function(e) {
+    ok <<- FALSE
+    af2_log("AF2_B3:", "fetch_marketdata failed for ", year, ": ", conditionMessage(e))
+  })
+
+  if (!ok) {
+    # Fallback path
+    tryCatch({
+      meta <- rb3::download_marketdata("b3-cotahist-yearly", year = year)
+      rb3::read_marketdata(meta)
+      af2_log("AF2_B3:", "fallback download/read OK for ", year)
+    }, error = function(e2) {
+      stop("rb3 fallback download/read failed for ", year, ": ", conditionMessage(e2))
+    })
+  }
+
+  df_lazy <- tryCatch({
+    rb3::cotahist_get("yearly")
+  }, error = function(e) {
+    stop("cotahist_get('yearly') failed: ", conditionMessage(e))
+  })
+
+  # Always filter by year lazily
+  df_lazy <- df_lazy |> dplyr::filter(lubridate::year(.data$refdate) == year)
+
+  df_lazy
+}
+
+
+
+###############################################################################
+### FILE: modules/01_b3_universe/R/filter_by_type_rb3.R
+###############################################################################
+# v2/modules/01_b3_universe/R/filter_by_type_rb3.R
+# Apply rb3 class filters BEFORE collect
+
+af2_b3_apply_type_filters <- function(df_lazy, include_types) {
+  include_types <- af2_b3_validate_types(include_types)
+
+  # Start with empty list of lazy datasets, bind after filtering
+  out_list <- list()
+
+  if ("equity" %in% include_types) {
+    out_list[["equity"]] <- rb3::cotahist_filter_equity(df_lazy)
+  }
+  if ("fii" %in% include_types) {
+    out_list[["fii"]] <- rb3::cotahist_filter_fii(df_lazy)
+  }
+  if ("etf" %in% include_types) {
+    out_list[["etf"]] <- rb3::cotahist_filter_etf(df_lazy)
+  }
+  if ("bdr" %in% include_types) {
+    out_list[["bdr"]] <- rb3::cotahist_filter_bdr(df_lazy)
+  }
+
+  if (!length(out_list)) {
+    stop("No include_types provided after validation.")
+  }
+
+  out_list
+}
+
+
+
+###############################################################################
+### FILE: modules/01_b3_universe/R/rb3_init.R
+###############################################################################
+# v2/modules/01_b3_universe/R/rb3_init.R
+# Deterministic rb3 cache bootstrap for v2
+
+af2_b3_init_rb3 <- function(cfg = NULL, verbose = TRUE) {
+  cfg <- cfg %||% af2_get_config()
+
+  cache_dir <- file.path(cfg$cache_dir, "rb3")
+  if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+  options(rb3.cachedir = normalizePath(cache_dir, winslash = "/", mustWork = FALSE))
+
+  if (verbose) {
+    af2_log("AF2_B3:", "rb3.cachedir = ", getOption("rb3.cachedir"))
+  }
+
+  # Bootstrap templates DB (safe no-op if already initialized)
+  tryCatch({
+    rb3::rb3_bootstrap()
+    if (verbose) af2_log("AF2_B3:", "rb3_bootstrap OK.")
+  }, error = function(e) {
+    # We don't hard fail here because rb3 can still read cached data;
+    # but we DO log clearly.
+    af2_log("AF2_B3:", "rb3_bootstrap warning: ", conditionMessage(e))
+  })
+
+  invisible(TRUE)
+}
+
+
+
+###############################################################################
+### FILE: modules/01_b3_universe/R/select_min_cols.R
+###############################################################################
+# v2/modules/01_b3_universe/R/select_min_cols.R
+# Normalize column names across potential rb3 schema differences
+
+af2_b3_pick_col <- function(dt, alternatives) {
+  cand <- intersect(alternatives, names(dt))
+  if (length(cand)) cand[1L] else NA_character_
+}
+
+af2_b3_select_min_cols <- function(dt) {
+  # dt is a collected data.frame/data.table from rb3
+
+  # Defensive mapping of OHLC + liquidity
+  col_symbol <- af2_b3_pick_col(dt, c("symbol", "ticker"))
+  col_ref    <- af2_b3_pick_col(dt, c("refdate", "date"))
+  col_open   <- af2_b3_pick_col(dt, c("open", "price.open", "preco_abertura"))
+  col_high   <- af2_b3_pick_col(dt, c("high", "price.high", "preco_maximo"))
+  col_low    <- af2_b3_pick_col(dt, c("low", "price.low", "preco_minimo"))
+  col_close  <- af2_b3_pick_col(dt, c("close", "price.close", "preco_ultimo"))
+
+  # Liquidity candidates:
+  # - financial_volume / volume in BRL
+  # - trade_quantity in units
+  col_volfin <- af2_b3_pick_col(dt, c("financial_volume", "volume", "vol_fin"))
+  col_qty    <- af2_b3_pick_col(dt, c("trade_quantity", "quantity", "qty", "number_trades"))
+
+  missing_core <- c(
+    symbol = col_symbol,
+    refdate = col_ref,
+    close = col_close
+  )
+  if (any(is.na(missing_core))) {
+    stop(
+      "COTAHIST schema missing core columns. Found names: ",
+      paste(names(dt), collapse = ", ")
+    )
+  }
+
+  out <- data.table::as.data.table(dt)
+
+  out_min <- data.table::data.table(
+    symbol  = trimws(as.character(out[[col_symbol]])),
+    refdate = as.Date(out[[col_ref]]),
+    open    = if (!is.na(col_open))  as.numeric(out[[col_open]])  else NA_real_,
+    high    = if (!is.na(col_high))  as.numeric(out[[col_high]])  else NA_real_,
+    low     = if (!is.na(col_low))   as.numeric(out[[col_low]])   else NA_real_,
+    close   = as.numeric(out[[col_close]]),
+    vol_fin = if (!is.na(col_volfin)) as.numeric(out[[col_volfin]]) else NA_real_,
+    qty_raw = if (!is.na(col_qty))    as.numeric(out[[col_qty]])    else NA_real_
+  )
+
+  out_min
+}
+
+
+
+###############################################################################
+### FILE: modules/01_b3_universe/R/unify_liquidity.R
+###############################################################################
+# v2/modules/01_b3_universe/R/unify_liquidity.R
+# Convert raw liquidity into standardized 'turnover' and 'qty'
+
+af2_b3_unify_liquidity <- function(dt_min) {
+  dt <- data.table::as.data.table(dt_min)
+
+  if (!all(c("symbol", "refdate", "close") %in% names(dt))) {
+    stop("Liquidity unify requires at least symbol/refdate/close.")
+  }
+
+  # qty meaning in rb3 can be ambiguous across templates.
+  # We treat 'qty_raw' as units proxy and keep it as qty.
+  if (!("qty_raw" %in% names(dt))) dt[, qty_raw := NA_real_]
+  if (!("vol_fin" %in% names(dt))) dt[, vol_fin := NA_real_]
+
+  dt[, qty := qty_raw]
+
+  # turnover in BRL:
+  # Prefer provided financial volume when present, otherwise fallback to qty * close.
+  dt[, turnover := data.table::fifelse(
+    is.finite(vol_fin) & vol_fin > 0,
+    vol_fin,
+    data.table::fifelse(
+      is.finite(qty) & qty > 0 & is.finite(close),
+      qty * close,
+      NA_real_
+    )
+  )]
+
+  dt[, c("vol_fin", "qty_raw") := NULL]
+
+  dt
+}
+
+
+
+###############################################################################
+### FILE: modules/01_b3_universe/R/validate_types.R
+###############################################################################
+# v2/modules/01_b3_universe/R/validate_types.R
+
+af2_b3_allowed_types <- c("equity", "fii", "etf", "bdr")
+
+af2_b3_validate_types <- function(include_types) {
+  include_types <- unique(tolower(include_types))
+  bad <- setdiff(include_types, af2_b3_allowed_types)
+  if (length(bad)) {
+    stop(
+      "Invalid include_types: ", paste(bad, collapse = ", "),
+      ". Allowed: ", paste(af2_b3_allowed_types, collapse = ", ")
+    )
+  }
+  include_types
+}
+
+
+
+###############################################################################
+### FILE: modules/01_b3_universe/R/zzz_depends.R
+###############################################################################
+# v2/modules/01_b3_universe/R/zzz_depends.R
+# Centralized dependency + core imports (NO recursion)
+
+if (!exists("af2_get_config")) {
+  stop("af2_get_config not found. Source v2/modules/00_core/R/config.R first.")
+}
+if (!exists("af2_log")) {
+  stop("af2_log not found. Source v2/modules/00_core/R/logging.R first.")
+}
+
+# Keep it dumb and safe: no wrapper, no indirection.
+af2_b3_require <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      stop("Missing package: ", p)
+    }
+  }
+  invisible(TRUE)
+}
+
+af2_b3_require(c("data.table", "dplyr", "lubridate", "rb3"))
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(lubridate)
+  library(rb3)
+})
+
+
+
+###############################################################################
+### FILE: modules/01_b3_universe/README.md
+###############################################################################
+# Module
+
+Purpose:
+- Define INPUT contract
+- Define OUTPUT contract
+- List functions
+- List tests
+
+
+
+###############################################################################
+### FILE: modules/02_diagnostics/README.md
+###############################################################################
+# Module
+
+Purpose:
+- Define INPUT contract
+- Define OUTPUT contract
+- List functions
+- List tests
+
+
+
+###############################################################################
+### FILE: modules/03_corporate_actions/README.md
+###############################################################################
+# Module
+
+Purpose:
+- Define INPUT contract
+- Define OUTPUT contract
+- List functions
+- List tests
+
+
+
+###############################################################################
+### FILE: modules/04_adjuster/README.md
+###############################################################################
+# Module
+
+Purpose:
+- Define INPUT contract
+- Define OUTPUT contract
+- List functions
+- List tests
+
+
+
+###############################################################################
+### FILE: modules/05_screener/R/compute_metrics.R
+###############################################################################
+# v2/modules/05_screener/R/compute_metrics.R
+
+af2_compute_symbol_metrics <- function(dt_sym, horizons_days) {
+  af2_require("data.table")
+  dt_sym <- data.table::as.data.table(dt_sym)
+  data.table::setorder(dt_sym, refdate)
+
+  n <- nrow(dt_sym)
+  if (n < 30L) return(NULL)
+
+  # Returns from adjusted final price
+  dt_sym[, close_lag := data.table::shift(close_adj_final, 1L), by = symbol]
+  dt_sym[, ret_simple := ifelse(
+    !is.na(close_lag) & close_lag != 0,
+    (close_adj_final / close_lag) - 1,
+    NA_real_
+  )]
+  dt_sym[, close_lag := NULL]
+
+  last_idx <- n
+  out <- list(symbol = dt_sym$symbol[1])
+
+  # Momentum + short/long vol
+  # PATCH 2025-12-08: robust horizon indexing + NA-safe return calc
+  safe_price_ret <- function(p0, p1) {
+    if (is.na(p0) || is.na(p1)) return(NA_real_)
+    if (!is.finite(p0) || !is.finite(p1)) return(NA_real_)
+    if (p0 == 0) return(NA_real_)
+    (p1 / p0) - 1
+  }
+
+  for (h in horizons_days) {
+    h <- as.integer(h)
+
+    # Need at least h+1 points to compute a price-to-price horizon
+    if (h > 1L && (last_idx - h) >= 1L) {
+
+      idx0 <- last_idx - h
+      p0 <- dt_sym$close_adj_final[idx0]
+      p1 <- dt_sym$close_adj_final[last_idx]
+
+      out[[paste0("ret_", h, "d")]] <- safe_price_ret(p0, p1)
+
+      # Vol over last h observations of daily returns
+      idx_start <- max(1L, last_idx - h + 1L)
+      rwin <- dt_sym$ret_simple[idx_start:last_idx]
+      out[[paste0("vol_", h, "d")]] <- stats::sd(rwin, na.rm = TRUE) * sqrt(252)
+
+    } else {
+      # Explicitly populate missing horizons to avoid silent shape drift
+      out[[paste0("ret_", h, "d")]] <- NA_real_
+      out[[paste0("vol_", h, "d")]] <- NA_real_
+    }
+  }
+
+
+  # Drawdown + Ulcer
+  prices <- dt_sym$close_adj_final
+  cummax_p <- cummax(prices)
+  dd <- prices / cummax_p - 1
+  out$max_dd <- suppressWarnings(min(dd, na.rm = TRUE))
+  out$ulcer_index <- sqrt(mean((dd * 100)^2, na.rm = TRUE))
+
+  # Amihud-like illiquidity
+  if (!"turnover" %in% names(dt_sym) && "vol_fin" %in% names(dt_sym)) {
+    dt_sym[, turnover := vol_fin]
+  }
+  valid <- is.finite(dt_sym$ret_simple) & is.finite(dt_sym$turnover) & dt_sym$turnover > 0
+  out$amihud <- if (any(valid)) {
+    mean(abs(dt_sym$ret_simple[valid]) / dt_sym$turnover[valid], na.rm = TRUE)
+  } else NA_real_
+
+  data.table::as.data.table(out)
+}
+
+
+
+###############################################################################
+### FILE: modules/05_screener/R/liquidity_filter.R
+###############################################################################
+# v2/modules/05_screener/R/liquidity_filter.R
+
+af2_compute_liquidity_from_panel <- function(panel_adj,
+                                             min_turnover,
+                                             min_days_traded_ratio) {
+  af2_require("data.table")
+  dt <- data.table::as.data.table(panel_adj)
+
+  # unify turnover column name
+  if (!"turnover" %in% names(dt) && "vol_fin" %in% names(dt)) {
+    dt[, turnover := vol_fin]
+  }
+
+  dt[, traded_flag := is.finite(close_adj_final) & !is.na(close_adj_final)]
+
+  liq <- dt[, .(
+    median_turnover = stats::median(turnover, na.rm = TRUE),
+    days_traded_ratio = mean(traded_flag, na.rm = TRUE)
+  ), by = symbol]
+
+  liq[is.na(median_turnover), median_turnover := 0]
+  liq[is.na(days_traded_ratio), days_traded_ratio := 0]
+
+  liq[
+    median_turnover >= min_turnover &
+      days_traded_ratio >= min_days_traded_ratio
+  ]
+}
+
+
+
+###############################################################################
+### FILE: modules/05_screener/R/run_screener.R
+###############################################################################
+# v2/modules/05_screener/R/run_screener.R
+
+af2_run_screener <- function(panel_adj,
+                             config = NULL,
+                             allow_unresolved = FALSE) {
+
+  af2_require("data.table")
+
+  cfg <- af2_get_screener_config(config)
+
+  # 0) Validate input contract hard
+  af2_validate_screener_input(panel_adj, allow_unresolved = allow_unresolved)
+
+  dt <- data.table::as.data.table(panel_adj)
+  dt[, refdate := as.Date(refdate)]
+
+  # unify turnover name
+  if (!"turnover" %in% names(dt) && "vol_fin" %in% names(dt)) {
+    dt[, turnover := vol_fin]
+  }
+
+  # 1) Liquidity filter
+  liq <- af2_compute_liquidity_from_panel(
+    dt,
+    min_turnover = cfg$min_turnover,
+    min_days_traded_ratio = cfg$min_days_traded_ratio
+  )
+  if (!nrow(liq)) stop("af2_run_screener: no symbols pass liquidity filter.", call. = FALSE)
+
+  dt <- dt[symbol %in% liq$symbol]
+  data.table::setorder(dt, symbol, refdate)
+
+  # 2) Compute metrics per symbol on last lookback window
+  metrics_list <- list()
+  syms <- unique(dt$symbol)
+
+  for (sym in syms) {
+    sdt <- dt[symbol == sym]
+    if (nrow(sdt) > cfg$lookback_days) {
+      sdt <- sdt[(.N - cfg$lookback_days + 1):.N]
+    }
+    m <- af2_compute_symbol_metrics(sdt, cfg$horizons_days)
+    if (!is.null(m)) {
+      # attach asset_type
+      m[, asset_type := unique(sdt$asset_type)[1]]
+      metrics_list[[sym]] <- m
+    }
+  }
+
+  metrics <- data.table::rbindlist(metrics_list, fill = TRUE)
+  if (!nrow(metrics)) stop("af2_run_screener: metrics computation yielded zero rows.", call. = FALSE)
+
+  # 3) Score + rank
+  out <- af2_score_and_rank(metrics, cfg$score_weights)
+
+  list(
+    full = out,
+    by_type = split(out[order(asset_type, rank_type)], out$asset_type)
+  )
+}
+
+
+
+###############################################################################
+### FILE: modules/05_screener/R/score_rank.R
+###############################################################################
+# v2/modules/05_screener/R/score_rank.R
+
+af2_score_and_rank <- function(metrics, score_weights) {
+  af2_require("data.table")
+  dt <- data.table::as.data.table(metrics)
+
+  dt[, score := 0]
+
+  for (nm in names(score_weights)) {
+    if (!nm %in% names(dt)) next
+    x <- dt[[nm]]
+    if (all(is.na(x))) next
+    mu <- mean(x, na.rm = TRUE)
+    s  <- stats::sd(x, na.rm = TRUE)
+    if (!is.finite(s) || s == 0) next
+
+    z <- (x - mu) / s
+    dt[, score := score + score_weights[[nm]] * z]
+  }
+
+  dt[, rank_overall := rank(-score, ties.method = "first")]
+  if ("asset_type" %in% names(dt)) {
+    dt[, rank_type := rank(-score, ties.method = "first"), by = asset_type]
+  } else {
+    dt[, rank_type := NA_integer_]
+  }
+
+  dt[order(rank_overall)]
+}
+
+
+
+###############################################################################
+### FILE: modules/05_screener/R/screener_config.R
+###############################################################################
+# v2/modules/05_screener/R/screener_config.R
+
+af2_screener_config_default <- list(
+  lookback_days   = 252L,
+  horizons_days   = c(21L, 63L, 126L, 252L),
+
+  # Liquidity
+  min_turnover = 5e5,
+  min_days_traded_ratio = 0.8,
+
+  # Scoring weights (z-score aggregation)
+  score_weights = list(
+    # Momentum
+    ret_21d  = +0.3,
+    ret_63d  = +0.6,
+    ret_126d = +0.9,
+    ret_252d = +1.0,
+
+    # Risk / stability penalties
+    vol_21d  = -0.4,
+    vol_252d = -0.7,
+    max_dd   = -0.8,
+    ulcer_index = -0.8,
+
+    # Liquidity penalty
+    amihud = -0.5
+  )
+)
+
+af2_get_screener_config <- function(config = NULL) {
+  cfg <- af2_screener_config_default
+  if (!is.null(config)) {
+    for (nm in names(config)) cfg[[nm]] <- config[[nm]]
+  }
+  cfg
+}
+
+
+
+###############################################################################
+### FILE: modules/05_screener/R/validate_screener_input.R
+###############################################################################
+# v2/modules/05_screener/R/validate_screener_input.R
+
+af2_validate_screener_input <- function(panel_adj, allow_unresolved = FALSE) {
+  af2_require(c("data.table"))
+  af2_assert_cols(
+    panel_adj,
+    c("symbol", "refdate", "close_adj_final", "asset_type", "adjustment_state"),
+    name = "panel_adj"
+  )
+
+  dt <- data.table::as.data.table(panel_adj)
+  dt[, refdate := as.Date(refdate)]
+
+  # Basic type sanity
+  if (!is.character(dt$symbol)) stop("panel_adj$symbol must be character.", call. = FALSE)
+  if (!is.character(dt$asset_type)) stop("panel_adj$asset_type must be character.", call. = FALSE)
+  if (!is.character(dt$adjustment_state)) stop("panel_adj$adjustment_state must be character.", call. = FALSE)
+
+  # Must have at least one liquidity column
+  has_turnover <- "turnover" %in% names(dt)
+  has_vol_fin  <- "vol_fin" %in% names(dt)
+  if (!has_turnover && !has_vol_fin) {
+    stop("panel_adj must contain either 'turnover' or 'vol_fin' for liquidity logic.", call. = FALSE)
+  }
+
+  # No duplicate rows per symbol-date
+  af2_assert_no_dupes(dt, c("symbol", "refdate"), name = "panel_adj")
+
+  # Adjustment state policy
+  bad <- dt[adjustment_state == "suspect_unresolved"]
+  if (nrow(bad) && !isTRUE(allow_unresolved)) {
+    stop(
+      "Screener input contains unresolved suspects.\n",
+      "You must fix upstream adjuster/manual registry OR set allow_unresolved=TRUE.\n",
+      "Example symbols: ", paste(unique(utils::head(bad$symbol, 10)), collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  invisible(TRUE)
+}
+
+
+
+###############################################################################
+### FILE: modules/05_screener/README.md
+###############################################################################
+# Module
+
+Purpose:
+- Define INPUT contract
+- Define OUTPUT contract
+- List functions
+- List tests
+
+
+
+###############################################################################
+### FILE: scripts/00_bootstrap_v2.R
+###############################################################################
+# v2/scripts/00_bootstrap_v2.R
+# Creates the v2 directory structure + minimal placeholder READMEs.
+# Run from project root: source("v2/scripts/00_bootstrap_v2.R")
+
+af2_bootstrap_v2 <- function(root = "v2", verbose = TRUE) {
+  dirs <- c(
+    root,
+    file.path(root, "README.md"),
+    file.path(root, "contracts"),
+    file.path(root, "data", "raw"),
+    file.path(root, "data", "cache"),
+    file.path(root, "data", "fixtures"),
+    file.path(root, "data", "manual"),
+    file.path(root, "logs"),
+    file.path(root, "modules"),
+    file.path(root, "modules", "00_core", "R"),
+    file.path(root, "modules", "00_core", "tests"),
+    file.path(root, "modules", "01_universe", "R"),
+    file.path(root, "modules", "01_universe", "tests"),
+    file.path(root, "modules", "02_diagnostics", "R"),
+    file.path(root, "modules", "02_diagnostics", "tests"),
+    file.path(root, "modules", "03_corporate_actions", "R"),
+    file.path(root, "modules", "03_corporate_actions", "tests"),
+    file.path(root, "modules", "04_adjuster", "R"),
+    file.path(root, "modules", "04_adjuster", "tests"),
+    file.path(root, "modules", "05_screener", "R"),
+    file.path(root, "modules", "05_screener", "tests"),
+    file.path(root, "modules", "06_risk", "R"),
+    file.path(root, "modules", "06_risk", "tests"),
+    file.path(root, "modules", "07_portfolio", "R"),
+    file.path(root, "modules", "07_portfolio", "tests"),
+    file.path(root, "modules", "08_backtest", "R"),
+    file.path(root, "modules", "08_backtest", "tests"),
+    file.path(root, "scripts")
+  )
+
+  # Create directories (ignore .md entries)
+  dir_paths <- dirs[!grepl("\\.md$", dirs)]
+  for (d in dir_paths) {
+    if (!dir.exists(d)) {
+      dir.create(d, recursive = TRUE, showWarnings = FALSE)
+      if (verbose) message("Created: ", d)
+    }
+  }
+
+  # Minimal contracts placeholders
+  contract_files <- c(
+    "universe_raw.md",
+    "adjustments.md",
+    "panel_adj.md",
+    "screener_input.md",
+    "screener_output.md"
+  )
+  for (f in contract_files) {
+    p <- file.path(root, "contracts", f)
+    if (!file.exists(p)) {
+      writeLines(
+        c(
+          paste0("# ", f),
+          "",
+          "This is a placeholder. Fill with the explicit schema + guarantees."
+        ),
+        con = p
+      )
+      if (verbose) message("Seeded contract: ", p)
+    }
+  }
+
+  # Module READMEs
+  module_readmes <- c(
+    file.path(root, "modules", "00_core", "README.md"),
+    file.path(root, "modules", "01_universe", "README.md"),
+    file.path(root, "modules", "02_diagnostics", "README.md"),
+    file.path(root, "modules", "03_corporate_actions", "README.md"),
+    file.path(root, "modules", "04_adjuster", "README.md"),
+    file.path(root, "modules", "05_screener", "README.md")
+  )
+  for (p in module_readmes) {
+    if (!file.exists(p)) {
+      writeLines(
+        c(
+          "# Module",
+          "",
+          "Purpose:",
+          "- Define INPUT contract",
+          "- Define OUTPUT contract",
+          "- List functions",
+          "- List tests"
+        ),
+        con = p
+      )
+      if (verbose) message("Seeded README: ", p)
+    }
+  }
+
+  # Root README
+  root_readme <- file.path(root, "README.md")
+  if (!file.exists(root_readme)) {
+    writeLines(
+      c(
+        "# autofinance_R v2",
+        "",
+        "Principles:",
+        "- In-memory first",
+        "- Contract-first",
+        "- Fixtures-first",
+        "- Screener cannot fetch or adjust data",
+        "- Adjuster is the single owner of history mutation"
+      ),
+      con = root_readme
+    )
+    if (verbose) message("Seeded: ", root_readme)
+  }
+
+  invisible(TRUE)
+}
+
+af2_bootstrap_v2()
+
+
+
+###############################################################################
+### FILE: scripts/00_make_fixtures.R
+###############################################################################
+# v2/scripts/00_make_fixtures.R
+# Generates deterministic mock panels for screener development.
+# Run from project root:
+#   source("v2/modules/00_core/R/utils.R")
+#   source("v2/modules/00_core/R/config.R")
+#   source("v2/scripts/00_make_fixtures.R")
+
+af2_make_price_path <- function(dates, start_price = 10,
+                                drift = 0.0003, vol = 0.01,
+                                seed = 1L) {
+  set.seed(seed)
+  n <- length(dates)
+  eps <- rnorm(n, mean = drift, sd = vol)
+  px <- start_price * cumprod(1 + eps)
+  pmax(px, 0.01)
+}
+
+af2_write_fixture <- function(dt, name, cfg) {
+  p <- file.path(cfg$fixtures_dir, paste0(name, ".rds"))
+  saveRDS(dt, p)
+  message("Wrote fixture: ", p)
+}
+
+af2_make_fixtures <- function(config = NULL) {
+  af2_require(c("data.table", "lubridate"))
+  cfg <- af2_get_config(config)
+
+  # ~260 business days ending today
+  end_date <- Sys.Date()
+  start_date <- end_date - 400
+  dates <- af2_make_bizdays_seq(start_date, end_date)
+  dates <- tail(dates, 260)
+
+  symbols <- c("AAA4", "BBB11", "CCC34", "DDD11")
+  asset_type_map <- c(
+    AAA4 = "equity",
+    BBB11 = "fii",
+    CCC34 = "bdr",
+    DDD11 = "etf"
+  )
+
+  # Construct 4 different behaviors
+  px_A <- af2_make_price_path(dates, 10, drift = 0.0008, vol = 0.007, seed = 11)  # strong uptrend
+  px_B <- af2_make_price_path(dates, 100, drift = 0.0001, vol = 0.003, seed = 22) # low vol/flat
+  px_C <- af2_make_price_path(dates, 30, drift = 0.0003, vol = 0.020, seed = 33)  # volatile
+  px_D <- af2_make_price_path(dates, 50, drift = -0.0002, vol = 0.010, seed = 44) # mild down
+
+  price_list <- list(AAA4 = px_A, BBB11 = px_B, CCC34 = px_C, DDD11 = px_D)
+
+  # Base liquidity
+  liq_level <- c(AAA4 = 2e6, BBB11 = 8e5, CCC34 = 1.5e6, DDD11 = 1.2e6)
+
+  rows <- list()
+  for (sym in symbols) {
+    px <- price_list[[sym]]
+    turnover <- liq_level[[sym]] * (1 + rnorm(length(px), 0, 0.1))
+    turnover <- pmax(turnover, 1e4)
+
+    dt <- data.table::data.table(
+      symbol = sym,
+      refdate = dates,
+      close_raw = px,
+      close_adj_split = px,
+      close_adj_final = px,
+      turnover = turnover,
+      qty = round(turnover / px),
+      asset_type = asset_type_map[[sym]],
+      adjustment_state = "ok"
+    )
+    rows[[sym]] <- dt
+  }
+
+  panel_mock_small <- data.table::rbindlist(rows)
+  data.table::setorder(panel_mock_small, symbol, refdate)
+
+  # Edge cases fixture
+  panel_mock_edge <- data.table::copy(panel_mock_small)
+
+  # Make one symbol illiquid
+  panel_mock_edge[symbol == "BBB11", turnover := 1e4]
+
+  # Insert missing block for CCC34
+  miss_idx <- panel_mock_edge[symbol == "CCC34", .I][50:70]
+  panel_mock_edge[miss_idx, close_adj_final := NA_real_]
+
+  # Mark DDD11 unresolved suspect
+  panel_mock_edge[symbol == "DDD11", adjustment_state := "suspect_unresolved"]
+
+  # "Split case" fixture (simulates pre-adjustment discontinuity,
+  # but we store final as already fixed for screener use)
+  panel_mock_split <- data.table::copy(panel_mock_small)
+  # create raw discontinuity for AAA4 around mid
+  mid <- panel_mock_split[symbol == "AAA4", .I][130]
+  panel_mock_split[mid:nrow(panel_mock_split)][symbol == "AAA4", close_raw := close_raw / 5]
+  # but keep adjusted final coherent
+  panel_mock_split[symbol == "AAA4", close_adj_split := close_adj_final]
+  panel_mock_split[symbol == "AAA4", adjustment_state := "split_only"]
+
+  # Save
+  af2_write_fixture(panel_mock_small, "panel_mock_small", cfg)
+  af2_write_fixture(panel_mock_edge, "panel_mock_edge_cases", cfg)
+  af2_write_fixture(panel_mock_split, "panel_mock_split_case", cfg)
+
+  invisible(TRUE)
+}
+
+af2_make_fixtures()
+
+
+
+###############################################################################
+### FILE: scripts/01a_smoke_b3_fetch_one_year.R
+###############################################################################
+# v2/scripts/01a_smoke_b3_fetch_one_year.R
+# Real-data smoke test:
+# - fetch 1 year
+# - include only 1-2 types
+# - confirm contract + speed + caching
+
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+cfg <- af2_get_config()
+af2_log("AF2_CFG:", "\n", paste(capture.output(str(cfg)), collapse = "\n"))
+
+year_test <- max(cfg$years)
+types_test <- c("equity", "etf")
+
+af2_log("AF2_B3:", "SMOKE: year=", year_test, " types=", paste(types_test, collapse = ","))
+
+t0 <- Sys.time()
+dt <- af2_b3_build_universe_year(
+  year = year_test,
+  include_types = types_test,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_download = FALSE,
+  reprocess = FALSE
+)
+t1 <- Sys.time()
+
+af2_log("AF2_B3:", "SMOKE elapsed seconds: ", round(as.numeric(difftime(t1, t0, units = "secs")), 2))
+
+af2_log("AF2_B3:", "Head:")
+print(utils::head(dt, 10))
+
+# Contract check
+req <- c("symbol","refdate","open","high","low","close","turnover","qty","asset_type")
+stopifnot(all(req %in% names(dt)))
+
+af2_log("AF2_B3:", "SMOKE OK.")
+
+
+
+###############################################################################
+### FILE: scripts/01b_build_universe_small_window.R
+###############################################################################
+# v2/scripts/01b_build_universe_small_window.R
+# Build a small 2-year universe for all 4 types
+# and save a narrow raw panel artifact.
+
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+cfg <- af2_get_config()
+
+years_small <- sort(unique(c(max(cfg$years) - 1L, max(cfg$years))))
+types_all <- c("equity","fii","etf","bdr")
+
+af2_log("AF2_B3:", "Building small-window universe: ",
+        paste(years_small, collapse = ", "),
+        " types=", paste(types_all, collapse = ","))
+
+dt_all <- af2_b3_build_universe(
+  years = years_small,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+af2_log("AF2_B3:", "Universe rows total: ", nrow(dt_all))
+af2_log("AF2_B3:", "Symbols total: ", length(unique(dt_all$symbol)))
+
+# Save an artifact for next module (panel)
+artifact_dir <- file.path(cfg$raw_dir, "b3_universe")
+if (!dir.exists(artifact_dir)) dir.create(artifact_dir, recursive = TRUE)
+
+artifact_file <- file.path(
+  artifact_dir,
+  paste0("universe_raw_", min(years_small), "_", max(years_small), ".rds")
+)
+
+saveRDS(dt_all, artifact_file)
+
+af2_log("AF2_B3:", "Wrote artifact: ", artifact_file)
+
+
+
+###############################################################################
+### FILE: scripts/04_run_screener_mock_only.R
+###############################################################################
+# v2/scripts/04_run_screener_mock_only.R
+# Runs the v2 screener ONLY on fixtures.
+# This is your daily sanity anchor.
+
+# Core
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# Screener
+source("v2/modules/05_screener/R/screener_config.R")
+source("v2/modules/05_screener/R/validate_screener_input.R")
+source("v2/modules/05_screener/R/liquidity_filter.R")
+source("v2/modules/05_screener/R/compute_metrics.R")
+source("v2/modules/05_screener/R/score_rank.R")
+source("v2/modules/05_screener/R/run_screener.R")
+
+cfg <- af2_get_config()
+
+fixture_path <- file.path(cfg$fixtures_dir, "panel_mock_small.rds")
+if (!file.exists(fixture_path)) {
+  stop("Fixture not found: ", fixture_path,
+       "\nRun: source('v2/scripts/00_make_fixtures.R')", call. = FALSE)
+}
+
+panel <- readRDS(fixture_path)
+
+af2_log_cfg(cfg)
+af2_log("AF2_SCR:", "Running screener on mock_small...")
+
+res <- af2_run_screener(panel)
+
+stopifnot(is.list(res), "full" %in% names(res))
+stopifnot(nrow(res$full) == 4L)
+stopifnot(all(c("AAA4","BBB11","CCC34","DDD11") %in% res$full$symbol))
+
+# Rankings should be complete for this fixture
+stopifnot(all(!is.na(res$full$rank_overall)))
+
+print(utils::head(res$full, 10))
+
+af2_log("AF2_SCR:", "OK - mock-only screener passed.")
+
+
+
