@@ -26,7 +26,34 @@ af2_config_default <- list(
   logs_dir   = "v2/logs",
 
   # Safety
-  allow_unresolved_in_screener = FALSE
+  allow_unresolved_in_screener = FALSE,
+
+  # Corporate actions toggles (used later)
+  enable_splits = TRUE,
+  enable_manual_events = TRUE,
+
+  # -------------------------------
+  # Selective corporate-actions policy (the "trick")
+  # -------------------------------
+  enable_selective_actions = TRUE,
+
+  # Cache strategy for corp actions:
+  # - "batch" keeps current behavior (hash by symbol set)
+  # - "by_symbol" enables incremental caching per ticker
+  ca_cache_mode = "batch",
+
+  # Prefilter heuristics (B3-only)
+  ca_prefilter_recent_days   = 252L,
+  ca_prefilter_top_n_overall = 200L,
+  ca_prefilter_top_n_by_type = 50L,
+  ca_prefilter_max_candidates = 300L,
+
+  # One-day gap thresholds by type (very cheap anomaly filter)
+  ca_prefilter_gap_equity = -0.20,
+  ca_prefilter_gap_fii    = -0.12,
+  ca_prefilter_gap_etf    = -0.15,
+  ca_prefilter_gap_bdr    = -0.20,
+
 )
 
 af2_get_config <- function(config = NULL) {
