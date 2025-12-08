@@ -134,6 +134,10 @@ af2_log("AF2_SMOKE05:", "Running real-data screener (allow_unresolved=TRUE for s
 
 res <- af2_run_screener(
   panel_adj,
+  config = list(
+    lookback_days = 80L,
+    horizons_days = c(21L, 63L)
+  ),
   allow_unresolved = TRUE
 )
 

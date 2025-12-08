@@ -33,8 +33,8 @@ af2_build_panel_adj <- function(universe_raw,
 
   # 1) Build event table (split_value + div_cash per symbol-date)
   events <- af2_adj_build_events(
-    corp_actions = corp_actions,
-    manual_events = manual_events,
+    corp_actions = if (isTRUE(cfg$enable_splits)) corp_actions else NULL,
+    manual_events = if (isTRUE(cfg$enable_manual_events)) manual_events else NULL,
     verbose = verbose
   )
 

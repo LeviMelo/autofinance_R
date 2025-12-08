@@ -2,9 +2,14 @@
 
 af2_run_screener <- function(panel_adj,
                              config = NULL,
-                             allow_unresolved = FALSE) {
+                             allow_unresolved = NULL) {
 
   af2_require("data.table")
+  # If caller didn't specify, default to core config policy
+  if (is.null(allow_unresolved)) {
+    cfg_core <- af2_get_config()
+    allow_unresolved <- isTRUE(cfg_core$allow_unresolved_in_screener)
+  }
 
   cfg <- af2_get_screener_config(config)
 
@@ -36,7 +41,7 @@ af2_run_screener <- function(panel_adj,
 
   for (sym in syms) {
     sdt <- dt[symbol == sym]
-    
+
     # Ensure we keep enough rows to compute the longest horizon return.
     need_n <- max(
      as.integer(cfg$lookback_days),
