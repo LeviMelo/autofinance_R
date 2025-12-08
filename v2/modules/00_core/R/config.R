@@ -52,7 +52,14 @@ af2_config_default <- list(
   ca_prefilter_gap_equity = -0.20,
   ca_prefilter_gap_fii    = -0.12,
   ca_prefilter_gap_etf    = -0.15,
-  ca_prefilter_gap_bdr    = -0.20
+  ca_prefilter_gap_bdr    = -0.20,
+
+  # Activeness / recency guards for selective CA
+  ca_prefilter_active_days = 10L,
+
+  # Use a shorter window for liquidity scoring (robust to old junk)
+  ca_prefilter_liq_window_days = 63L
+
 )
 
 af2_get_config <- function(config = NULL) {

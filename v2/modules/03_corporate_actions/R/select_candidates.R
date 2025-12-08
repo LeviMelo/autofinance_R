@@ -1,39 +1,87 @@
 # v2/modules/03_corporate_actions/R/select_candidates.R
-# B3-only heuristics to decide which symbols deserve Yahoo corporate actions.
 
-af2_ca_select_candidates <- function(universe_raw,
-                                     cfg = NULL,
-                                     verbose = TRUE) {
+af2_ca_select_candidates <- function(universe_raw, cfg = NULL, verbose = TRUE) {
 
-  af2_require("data.table")
+  af2_require(c("data.table"))
   cfg <- cfg %||% af2_get_config()
 
   dt <- data.table::as.data.table(universe_raw)
 
-  # Universe raw must be B3-grade data
-  # Allow either turnover or vol_fin
+  # Allow either turnover or vol_fin (rb3 differences)
   if (!"turnover" %in% names(dt) && "vol_fin" %in% names(dt)) {
     dt[, turnover := vol_fin]
   }
 
+  # Minimal columns needed for the prefilter
   af2_assert_cols(
     dt,
     c("symbol", "refdate", "close", "turnover", "asset_type"),
-    name = "universe_raw(for ca prefilter)"
+    name = "universe_raw(prefilter)"
   )
 
+  # Normalize
   dt[, symbol := toupper(trimws(as.character(symbol)))]
   dt[, asset_type := tolower(trimws(as.character(asset_type)))]
   dt[, refdate := as.Date(refdate)]
-
-  data.table::setorder(dt, symbol, refdate)
+  dt[, close := as.numeric(close)]
+  dt[, turnover := as.numeric(turnover)]
 
   # -------------------------------
-  # 0) Cheap liquidity gate
+  # 0) Define recent window
   # -------------------------------
-  dt[, traded_flag := is.finite(close) & !is.na(close)]
+  end_date <- max(dt$refdate, na.rm = TRUE)
 
-  liq <- dt[, .(
+  recent_days <- as.integer(cfg$ca_prefilter_recent_days %||% 252L)
+  if (!is.finite(recent_days) || recent_days < 20L) recent_days <- 252L
+
+  # Optional tighter liquidity window (new knob; fallback to recent_days)
+  liq_window_days <- as.integer(cfg$ca_prefilter_liq_window_days %||% 63L)
+  if (!is.finite(liq_window_days) || liq_window_days < 20L) liq_window_days <- min(63L, recent_days)
+
+  # Active trading filter (new knob)
+  active_days <- as.integer(cfg$ca_prefilter_active_days %||% 10L)
+  if (!is.finite(active_days) || active_days < 1L) active_days <- 10L
+
+  # We approximate "last N bizdays" by date window,
+  # since universe_raw already comes from B3 business dates.
+  recent_start <- end_date - ceiling(recent_days * 1.6)
+  liq_start    <- end_date - ceiling(liq_window_days * 1.6)
+  active_start <- end_date - ceiling(active_days * 1.6)
+
+  dt_recent <- dt[refdate >= recent_start & refdate <= end_date]
+  data.table::setorder(dt_recent, symbol, refdate)
+  dt_recent <- dt_recent[, tail(.SD, recent_days), by = symbol]
+
+  dt_liqwin <- dt[refdate >= liq_start & refdate <= end_date]
+
+  # -------------------------------
+  # 1) Active symbols (must trade recently)
+  # -------------------------------
+  # A "trade" is any day with a finite close
+  active_dt <- dt_recent[is.finite(close) & !is.na(close),
+                         .(last_trade = max(refdate, na.rm = TRUE)),
+                         by = .(symbol, asset_type)]
+
+  active_dt[, is_active := last_trade >= active_start]
+  active_syms <- active_dt[is_active == TRUE, unique(symbol)]
+
+  if (verbose) {
+    af2_log("AF2_CA_PREF:", "Active symbols= ", length(active_syms))
+  }
+
+  # If active filter is too strict in some environments, fail soft
+  if (!length(active_syms)) {
+    active_syms <- unique(dt_recent$symbol)
+  }
+
+  # -------------------------------
+  # 2) Liquidity filter (short window)
+  # -------------------------------
+  dt_liqwin <- dt_liqwin[symbol %in% active_syms]
+
+  dt_liqwin[, traded_flag := is.finite(close) & !is.na(close)]
+
+  liq <- dt_liqwin[, .(
     median_turnover = stats::median(turnover, na.rm = TRUE),
     days_traded_ratio = mean(traded_flag, na.rm = TRUE)
   ), by = .(symbol, asset_type)]
@@ -41,100 +89,100 @@ af2_ca_select_candidates <- function(universe_raw,
   liq[is.na(median_turnover), median_turnover := 0]
   liq[is.na(days_traded_ratio), days_traded_ratio := 0]
 
-  liq_ok <- liq[
-    median_turnover >= cfg$min_turnover &
-      days_traded_ratio >= cfg$min_days_traded_ratio
+  liq_ok_dt <- liq[
+    median_turnover >= (cfg$min_turnover %||% 5e5) &
+      days_traded_ratio >= (cfg$min_days_traded_ratio %||% 0.8)
   ]
 
-  if (!nrow(liq_ok)) {
-    if (verbose) af2_log("AF2_CA_PREF:", "No symbols pass liquidity prefilter.")
-    return(character())
-  }
+  liq_ok_syms <- liq_ok_dt$symbol
 
-  dt <- dt[symbol %in% liq_ok$symbol]
-
-  # -------------------------------
-  # 1) Restrict to recent window
-  # -------------------------------
-  recent_days <- as.integer(cfg$ca_prefilter_recent_days %||% 252L)
-  if (!is.na(recent_days) && recent_days > 0) {
-    dt <- dt[, tail(.SD, recent_days), by = symbol]
+  if (verbose) {
+    af2_log("AF2_CA_PREF:", "Liquidity ok symbols= ", length(unique(liq_ok_syms)))
   }
 
   # -------------------------------
-  # 2) One-day gap detector
+  # 3) Gap-flag detector (recent window)
   # -------------------------------
-  dt[, close_lag := data.table::shift(close, 1L), by = symbol]
-  dt[, ret_1d := data.table::fifelse(
-    is.finite(close_lag) & close_lag > 0,
-    (close / close_lag) - 1,
+  dt_gap <- dt_recent[symbol %in% liq_ok_syms]
+  data.table::setorder(dt_gap, symbol, refdate)
+
+  dt_gap[, close_lag := data.table::shift(close, 1L), by = symbol]
+  dt_gap[, ret_1d := data.table::fifelse(
+    is.finite(close) & is.finite(close_lag) & close_lag > 0,
+    close / close_lag - 1,
     NA_real_
   )]
-  dt[, close_lag := NULL]
+  dt_gap[, close_lag := NULL]
 
-  gaps <- dt[, .(
-    min_ret_1d = suppressWarnings(min(ret_1d, na.rm = TRUE))
-  ), by = .(symbol, asset_type)]
-
-  thr <- list(
-    equity = cfg$ca_prefilter_gap_equity %||% -0.20,
-    fii    = cfg$ca_prefilter_gap_fii    %||% -0.12,
-    etf    = cfg$ca_prefilter_gap_etf    %||% -0.15,
-    bdr    = cfg$ca_prefilter_gap_bdr    %||% -0.20
+  # Apply per-type thresholds
+  thr_map <- data.table::data.table(
+    asset_type = c("equity", "fii", "etf", "bdr"),
+    thr = c(
+      cfg$ca_prefilter_gap_equity %||% -0.20,
+      cfg$ca_prefilter_gap_fii    %||% -0.12,
+      cfg$ca_prefilter_gap_etf    %||% -0.15,
+      cfg$ca_prefilter_gap_bdr    %||% -0.20
+    )
   )
 
-  gaps[, thr := vapply(
-    asset_type,
-    function(tp) thr[[tp]] %||% -0.20,
-    numeric(1)
-  )]
+  dt_gap <- merge(dt_gap, thr_map, by = "asset_type", all.x = TRUE)
 
-  gaps_flag <- gaps[min_ret_1d <= thr, unique(symbol)]
+  gap_flags <- dt_gap[
+    is.finite(ret_1d) & ret_1d <= thr,
+    .(has_gap = TRUE),
+    by = .(symbol)
+  ]
 
-  # -------------------------------
-  # 3) Cheap momentum gate
-  # -------------------------------
-  get_ret_h <- function(x, h) {
-    n <- length(x)
-    if (n < (h + 1L)) return(NA_real_)
-    p0 <- x[n - h]
-    p1 <- x[n]
-    if (!is.finite(p0) || p0 <= 0 || !is.finite(p1)) return(NA_real_)
-    (p1 / p0) - 1
+  gap_syms <- gap_flags$symbol
+
+  if (verbose) {
+    af2_log("AF2_CA_PREF:", "Gap-flag symbols= ", length(unique(gap_syms)))
   }
 
-  mom <- dt[, .(
-    ret_21d = get_ret_h(close, 21L),
-    ret_63d = get_ret_h(close, 63L)
-  ), by = .(symbol, asset_type)]
+  # -------------------------------
+  # 4) Priority ranking source
+  # -------------------------------
+  # Priority = liquidity rank within liq_ok set
+  # (Cheap, robust, and type-aware)
+  liq_ok_dt[, liq_rank_overall := data.table::frank(-median_turnover, ties.method = "first")]
+  liq_ok_dt[, liq_rank_type := data.table::frank(-median_turnover, ties.method = "first"), by = asset_type]
 
-  mom[, mom_score := data.table::fifelse(
-    is.finite(ret_63d), ret_63d, ret_21d
-  )]
+  top_overall <- as.integer(cfg$ca_prefilter_top_n_overall %||% 200L)
+  top_by_type <- as.integer(cfg$ca_prefilter_top_n_by_type %||% 50L)
+  max_cand    <- as.integer(cfg$ca_prefilter_max_candidates %||% 300L)
 
-  mom <- mom[order(-mom_score)]
+  if (!is.finite(top_overall) || top_overall < 1L) top_overall <- 200L
+  if (!is.finite(top_by_type) || top_by_type < 1L) top_by_type <- 50L
+  if (!is.finite(max_cand) || max_cand < 50L) max_cand <- 300L
 
-  top_overall_n <- as.integer(cfg$ca_prefilter_top_n_overall %||% 200L)
-  top_by_type_n <- as.integer(cfg$ca_prefilter_top_n_by_type %||% 50L)
-  max_cand_n    <- as.integer(cfg$ca_prefilter_max_candidates %||% 300L)
+  c1 <- liq_ok_dt[liq_rank_overall <= top_overall, unique(symbol)]
+  c2 <- liq_ok_dt[liq_rank_type <= top_by_type, unique(symbol)]
 
-  top_overall <- head(mom$symbol, top_overall_n)
-  top_by_type <- mom[, head(symbol, top_by_type_n), by = asset_type]$V1
+  # -------------------------------
+  # 5) Union + cap
+  # -------------------------------
+  cand_all <- unique(c(c1, c2, gap_syms))
 
-  cands <- unique(c(gaps_flag, top_overall, top_by_type))
+  # If still empty (edge-case data), fall back to liquidity-ok
+  if (!length(cand_all)) cand_all <- unique(liq_ok_syms)
 
-  # If we exceed max cap, prioritize gap-flag + momentum order
-  if (length(cands) > max_cand_n) {
-    mom_order <- mom$symbol
-    cands <- unique(c(gaps_flag, mom_order))
-    cands <- head(cands, max_cand_n)
+  # Apply hard cap using priority order
+  if (length(cand_all) > max_cand && nrow(liq_ok_dt)) {
+    # Build a priority table for deterministic trimming
+    pri <- liq_ok_dt[, .(symbol, priority = liq_rank_overall)]
+    pri <- pri[order(priority)]
+    pri_syms <- pri$symbol
+
+    # Keep candidate order: priority first, then anything else
+    ordered <- unique(c(intersect(pri_syms, cand_all), cand_all))
+    cand_all <- head(ordered, max_cand)
   }
 
   if (verbose) {
-    af2_log("AF2_CA_PREF:", "Liquidity ok symbols=", nrow(liq_ok))
-    af2_log("AF2_CA_PREF:", "Gap-flag symbols=", length(gaps_flag))
-    af2_log("AF2_CA_PREF:", "Candidates final=", length(cands))
+    af2_log("AF2_CA_PREF:", "Candidates final= ", length(cand_all))
+    #af2_log("AF2_CA_PREF:", "Selective actions enabled= ", isTRUE(cfg$enable_selective_actions))
+    #af2_log("AF2_CA_PREF:", "Yahoo candidate symbols= ", length(cand_all))
   }
 
-  sort(unique(cands))
+  cand_all
 }
