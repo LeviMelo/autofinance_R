@@ -21,7 +21,7 @@ cfg <- af2_get_config()
 # Choose mode here to avoid future screener regressions.
 # "yearly" = backfill-style artifact
 # "daily"  = screener-grade recent window
-mode <- "daily"
+mode <- "yearly"
 types_all <- c("equity","fii","etf","bdr")
 
 if (mode == "yearly") {
@@ -82,9 +82,9 @@ if (!dir.exists(artifact_dir)) dir.create(artifact_dir, recursive = TRUE)
 saveRDS(dt_all, artifact_file)
 af2_log("AF2_B3:", "Wrote artifact: ", artifact_file)
 
-RUN_DAILY_SMOKE <- TRUE
+RUN_DAILY_SMOKE <- FALSE
 
-if (isTRUE(RUN_DAILY_SMOKE)) {
+if (mode == "yearly" && isTRUE(RUN_DAILY_SMOKE)) {
   end_date <- Sys.Date() - 1
   start_date <- end_date - 90  # ~3 months
   dt_daily_lazy <- af2_b3_fetch_daily_lazy(

@@ -15,8 +15,8 @@ af2_bootstrap_v2 <- function(root = "v2", verbose = TRUE) {
     file.path(root, "modules"),
     file.path(root, "modules", "00_core", "R"),
     file.path(root, "modules", "00_core", "tests"),
-    file.path(root, "modules", "01_universe", "R"),
-    file.path(root, "modules", "01_universe", "tests"),
+    file.path(root, "modules", "01_b3_universe", "R"),
+    file.path(root, "modules", "01_b3_universe", "tests"),
     file.path(root, "modules", "02_diagnostics", "R"),
     file.path(root, "modules", "02_diagnostics", "tests"),
     file.path(root, "modules", "03_corporate_actions", "R"),
@@ -69,7 +69,7 @@ af2_bootstrap_v2 <- function(root = "v2", verbose = TRUE) {
   # Module READMEs
   module_readmes <- c(
     file.path(root, "modules", "00_core", "README.md"),
-    file.path(root, "modules", "01_universe", "README.md"),
+    file.path(root, "modules", "01_b3_universe", "README.md"),
     file.path(root, "modules", "02_diagnostics", "README.md"),
     file.path(root, "modules", "03_corporate_actions", "README.md"),
     file.path(root, "modules", "04_adjuster", "README.md"),
