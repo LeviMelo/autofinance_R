@@ -45,36 +45,11 @@ af2_adj_normalize_corp_actions <- function(corp_actions, cfg = NULL) {
   dt[action_type == "split" & is.finite(value) & value > 0,
      value := 1 / value]
 
-  # -------------------------------
-  # PATCH: plausibility gate (post-normalization)
-  # -------------------------------
-  if (isTRUE(cfg$enable_split_plausibility_gate)) {
-    vmin <- as.numeric(cfg$split_value_min %||% 0.05)
-    vmax <- as.numeric(cfg$split_value_max %||% 10)
-
-    bad <- dt[
-      action_type == "split" &
-      source == "yahoo" &
-      (value < vmin | value > vmax)
-    ]
-
-    if (nrow(bad)) {
-      af2_log(
-        "AF2_ADJ:",
-        "WARNING: quarantining ", nrow(bad),
-        " Yahoo split rows outside [", vmin, ", ", vmax, "]."
-      )
-      # Drop them for now; manual can re-add later
-      dt <- dt[!(action_type == "split" &
-                 source == "yahoo" &
-                 (value < vmin | value > vmax))]
-    }
-  }
-
   dt
 }
 
-af2_adj_normalize_manual_events <- function(manual_events) {
+af2_adj_normalize_manual_events <- function(manual_events, cfg = NULL) {
+  cfg <- cfg %||% af2_get_config()
   if (is.null(manual_events)) {
     return(data.table(
       symbol = character(),
@@ -103,32 +78,6 @@ af2_adj_normalize_manual_events <- function(manual_events) {
   dt[action_type == "split" & is.finite(value) & value > 0,
      value := 1 / value]
 
-  # -------------------------------
-  # PATCH: plausibility gate (post-normalization)
-  # -------------------------------
-  if (isTRUE(cfg$enable_split_plausibility_gate)) {
-    vmin <- as.numeric(cfg$split_value_min %||% 0.05)
-    vmax <- as.numeric(cfg$split_value_max %||% 10)
-
-    bad <- dt[
-      action_type == "split" &
-      source == "yahoo" &
-      (value < vmin | value > vmax)
-    ]
-
-    if (nrow(bad)) {
-      af2_log(
-        "AF2_ADJ:",
-        "WARNING: quarantining ", nrow(bad),
-        " Yahoo split rows outside [", vmin, ", ", vmax, "]."
-      )
-      # Drop them for now; manual can re-add later
-      dt <- dt[!(action_type == "split" &
-                 source == "yahoo" &
-                 (value < vmin | value > vmax))]
-    }
-  }
-
   dt
 }
 
@@ -137,9 +86,12 @@ af2_adj_build_events <- function(corp_actions,
                                  cfg = NULL,
                                  verbose = TRUE) {
 
-  ca <- af2_adj_normalize_corp_actions(corp_actions)
-  me <- af2_adj_normalize_manual_events(manual_events)
   cfg <- cfg %||% af2_get_config()
+
+  ca <- af2_adj_normalize_corp_actions(corp_actions, cfg = cfg)
+  me <- af2_adj_normalize_manual_events(manual_events, cfg = cfg)
+
+  dt_all <- data.table::rbindlist(list(ca, me), use.names = TRUE, fill = TRUE)
 
   dt_all <- data.table::rbindlist(list(ca, me), use.names = TRUE, fill = TRUE)
   if (!nrow(dt_all)) {

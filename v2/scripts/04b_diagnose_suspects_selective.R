@@ -47,13 +47,16 @@ source("v2/modules/04_adjuster/R/validate_panel_adj.R")
 cfg_dbg <- af2_get_config(list(
   # First pass: disable selective so you see raw Yahoo behavior
   # You can flip this to TRUE in a second run.
-  enable_selective_actions = TRUE,
+  enable_selective_actions = FALSE,
 
   # Good for incremental cache behavior
   ca_cache_mode = "by_symbol",
 
   # First pass: do NOT gate splits
-  enable_split_plausibility_gate = FALSE
+  enable_split_plausibility_gate = FALSE,
+
+  #split_gate_min = 0.05,
+  #split_gate_max = 20
 ))
 
 af2_log_cfg(cfg_dbg)
