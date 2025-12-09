@@ -28,10 +28,6 @@ af2_config_default <- list(
   # Safety
   allow_unresolved_in_screener = FALSE,
 
-  # Corporate actions toggles (used later)
-  enable_splits = TRUE,
-  enable_manual_events = TRUE,
-
   # -------------------------------
   # Selective corporate-actions policy (the "trick")
   # -------------------------------
@@ -74,5 +70,20 @@ af2_get_config <- function(config = NULL) {
   dir.create(cfg$fixtures_dir, recursive = TRUE, showWarnings = FALSE)
   dir.create(cfg$manual_dir, recursive = TRUE, showWarnings = FALSE)
   dir.create(cfg$logs_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # -------------------------------
+  # Validation of sensitive knobs
+  # -------------------------------
+  if (!is.null(cfg$ca_cache_mode) &&
+      !cfg$ca_cache_mode %in% c("batch", "by_symbol")) {
+    stop("Invalid ca_cache_mode: ", cfg$ca_cache_mode,
+         ". Allowed: batch, by_symbol", call. = FALSE)
+  }
+
+  cfg$ca_prefilter_recent_days <- as.integer(cfg$ca_prefilter_recent_days %||% 252L)
+  cfg$ca_prefilter_top_n_overall <- as.integer(cfg$ca_prefilter_top_n_overall %||% 200L)
+  cfg$ca_prefilter_top_n_by_type <- as.integer(cfg$ca_prefilter_top_n_by_type %||% 50L)
+  cfg$ca_prefilter_max_candidates <- as.integer(cfg$ca_prefilter_max_candidates %||% 300L)
+
   cfg
 }

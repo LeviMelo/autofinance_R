@@ -24,12 +24,15 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   modules/03_corporate_actions/R/build_registry.R
   modules/03_corporate_actions/R/fetch_dividends_quantmod.R
   modules/03_corporate_actions/R/fetch_splits_quantmod.R
+  modules/03_corporate_actions/R/select_candidates.R
+  modules/03_corporate_actions/R/yahoo_retry.R
   modules/03_corporate_actions/R/yahoo_symbol_map.R
   modules/03_corporate_actions/R/zzz_depends.R
   modules/03_corporate_actions/README.md
   modules/04_adjuster/R/apply_adjustments.R
   modules/04_adjuster/R/build_adjustments.R
   modules/04_adjuster/R/build_panel_adj.R
+  modules/04_adjuster/R/build_panel_adj_selective.R
   modules/04_adjuster/R/validate_panel_adj.R
   modules/04_adjuster/R/zzz_depends.R
   modules/04_adjuster/README.md
@@ -49,6 +52,7 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   scripts/04_run_screener_mock_only.R
   scripts/04a_smoke_adjuster_small_window.R
   scripts/05a_smoke_screener_real_small_window.R
+  scripts/05b_hard_screener_full_selective.R
 
 
 
@@ -142,7 +146,40 @@ af2_config_default <- list(
   logs_dir   = "v2/logs",
 
   # Safety
-  allow_unresolved_in_screener = FALSE
+  allow_unresolved_in_screener = FALSE,
+
+  # Corporate actions toggles (used later)
+  enable_splits = TRUE,
+  enable_manual_events = TRUE,
+
+  # -------------------------------
+  # Selective corporate-actions policy (the "trick")
+  # -------------------------------
+  enable_selective_actions = TRUE,
+
+  # Cache strategy for corp actions:
+  # - "batch" keeps current behavior (hash by symbol set)
+  # - "by_symbol" enables incremental caching per ticker
+  ca_cache_mode = "batch",
+
+  # Prefilter heuristics (B3-only)
+  ca_prefilter_recent_days   = 252L,
+  ca_prefilter_top_n_overall = 200L,
+  ca_prefilter_top_n_by_type = 50L,
+  ca_prefilter_max_candidates = 300L,
+
+  # One-day gap thresholds by type (very cheap anomaly filter)
+  ca_prefilter_gap_equity = -0.20,
+  ca_prefilter_gap_fii    = -0.12,
+  ca_prefilter_gap_etf    = -0.15,
+  ca_prefilter_gap_bdr    = -0.20,
+
+  # Activeness / recency guards for selective CA
+  ca_prefilter_active_days = 10L,
+
+  # Use a shorter window for liquidity scoring (robust to old junk)
+  ca_prefilter_liq_window_days = 63L
+
 )
 
 af2_get_config <- function(config = NULL) {
@@ -872,6 +909,18 @@ af2_ca_cache_file <- function(cfg, tag = "splits_dividends") {
   file.path(cache_dir, paste0("corp_actions_", tag, ".rds"))
 }
 
+# Per-symbol cache directory
+af2_ca_cache_dir_by_symbol <- function(cfg) {
+  d <- file.path(cfg$cache_dir, "corp_actions", "by_symbol")
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+  d
+}
+
+af2_ca_cache_file_symbol <- function(cfg, symbol) {
+  symbol <- toupper(trimws(as.character(symbol)))
+  file.path(af2_ca_cache_dir_by_symbol(cfg), paste0(symbol, ".rds"))
+}
+
 af2_ca_build_registry <- function(symbols,
                                   asset_types = NULL,
                                   cfg = NULL,
@@ -880,13 +929,36 @@ af2_ca_build_registry <- function(symbols,
                                   verbose = TRUE,
                                   use_cache = TRUE,
                                   force_refresh = FALSE,
-                                  n_workers = 1L) {
+                                  n_workers = 1L,
+                                  cache_mode = c("batch", "by_symbol")) {
 
   cfg <- cfg %||% af2_get_config()
   symbols <- as.character(symbols)
   symbols <- toupper(trimws(symbols))
   symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
   symbols <- sort(unique(symbols))
+
+  if (!exists("af2_ca_build_registry_by_symbol")) {
+    stop("by_symbol cache_mode requested but af2_ca_build_registry_by_symbol is not defined.",
+         call. = FALSE)
+  }
+
+  cache_mode <- match.arg(cache_mode)
+
+  if (cache_mode == "by_symbol") {
+    return(
+      af2_ca_build_registry_by_symbol(
+        symbols = symbols,
+        asset_types = asset_types,
+        cfg = cfg,
+        from = from,
+        to = to,
+        verbose = verbose,
+        use_cache = use_cache,
+        force_refresh = force_refresh
+      )
+    )
+  }
 
   if (!length(symbols)) stop("af2_ca_build_registry: empty symbols.", call. = FALSE)
 
@@ -1019,12 +1091,125 @@ af2_ca_build_registry <- function(symbols,
   dt_all
 }
 
+af2_ca_build_registry_by_symbol <- function(symbols,
+                                            asset_types = NULL,
+                                            cfg = NULL,
+                                            from = "2018-01-01",
+                                            to = Sys.Date(),
+                                            verbose = TRUE,
+                                            use_cache = TRUE,
+                                            force_refresh = FALSE) {
+
+  cfg <- cfg %||% af2_get_config()
+
+  symbols <- as.character(symbols)
+  symbols <- toupper(trimws(symbols))
+  symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
+  symbols <- sort(unique(symbols))
+
+  if (!length(symbols)) {
+    stop("af2_ca_build_registry_by_symbol: empty symbols.", call. = FALSE)
+  }
+
+  from <- as.Date(from)
+  to   <- as.Date(to)
+
+  yahoo_syms <- af2_yahoo_symbol_vec(symbols, asset_types)
+  map_dt <- data.table::data.table(
+    symbol = symbols,
+    yahoo_symbol = yahoo_syms
+  )
+  map_dt <- map_dt[!is.na(yahoo_symbol)]
+
+  if (!nrow(map_dt)) {
+    stop("af2_ca_build_registry_by_symbol: no Yahoo symbols could be mapped.", call. = FALSE)
+  }
+
+  if (verbose) {
+    af2_log("AF2_CA:", "by_symbol mode: candidates=", nrow(map_dt))
+  }
+
+  res_list <- vector("list", nrow(map_dt))
+
+  for (i in seq_len(nrow(map_dt))) {
+
+    sym  <- map_dt$symbol[i]
+    ysym <- map_dt$yahoo_symbol[i]
+
+    cache_file <- af2_ca_cache_file_symbol(cfg, sym)
+
+    if (isTRUE(use_cache) && file.exists(cache_file) && !isTRUE(force_refresh)) {
+      dt_cached <- readRDS(cache_file)
+      dt_cached <- data.table::as.data.table(dt_cached)
+      if (nrow(dt_cached)) {
+        dt_cached[, refdate := as.Date(refdate)]
+        dt_cached <- dt_cached[refdate >= from & refdate <= to]
+      }
+      res_list[[i]] <- dt_cached
+      next
+    }
+
+    dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
+    dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE)
+
+    out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
+
+    if (!nrow(out)) {
+      out <- data.table::data.table(
+        symbol = character(),
+        yahoo_symbol = character(),
+        refdate = as.Date(character()),
+        action_type = character(),
+        value = numeric(),
+        source = character()
+      )[0]
+    } else {
+      out[, symbol := sym]
+      out[, yahoo_symbol := ysym]
+    }
+
+    if (isTRUE(use_cache)) {
+      # Save even empty to avoid refetch storms
+      saveRDS(out, cache_file)
+    }
+
+    res_list[[i]] <- out
+
+    if (verbose && i %% 50 == 0) {
+      af2_log("AF2_CA:", "by_symbol progress: ", i, "/", nrow(map_dt))
+    }
+  }
+
+  dt_all <- data.table::rbindlist(res_list, use.names = TRUE, fill = TRUE)
+
+  if (!nrow(dt_all)) {
+    dt_all <- data.table::data.table(
+      symbol = character(),
+      yahoo_symbol = character(),
+      refdate = as.Date(character()),
+      action_type = character(),
+      value = numeric(),
+      source = character()
+    )
+  }
+
+  dt_all[, refdate := as.Date(refdate)]
+  dt_all <- dt_all[order(symbol, action_type, refdate)]
+
+  req <- c("symbol", "yahoo_symbol", "refdate", "action_type", "value", "source")
+  miss <- setdiff(req, names(dt_all))
+  if (length(miss)) stop("Corporate actions registry missing cols: ", paste(miss, collapse = ", "))
+
+  dt_all
+}
+
 
 
 ###############################################################################
 ### FILE: modules/03_corporate_actions/R/fetch_dividends_quantmod.R
 ###############################################################################
 # v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R
+source("v2/modules/03_corporate_actions/R/yahoo_retry.R")
 
 af2_ca_fetch_dividends_one <- function(yahoo_symbol,
                                        from = "2018-01-01",
@@ -1033,19 +1218,20 @@ af2_ca_fetch_dividends_one <- function(yahoo_symbol,
                                        split.adjust = TRUE) {
   if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
 
-  x <- tryCatch(
-    quantmod::getDividends(
-      yahoo_symbol,
-      from = from,
-      to = to,
-      auto.assign = FALSE,
-      verbose = verbose,
-      split.adjust = split.adjust
-    ),
-    error = function(e) {
-      if (verbose) af2_log("AF2_CA:", "getDividends failed for ", yahoo_symbol, ": ", conditionMessage(e))
-      NULL
-    }
+  x <- af2_ca_with_retry(
+    function() {
+      quantmod::getDividends(
+        yahoo_symbol,
+        from = from,
+        to = to,
+        auto.assign = FALSE,
+        verbose = verbose,
+        split.adjust = split.adjust
+      )
+    },
+    max_tries = 4L,
+    base_sleep = 1.5,
+    verbose = verbose
   )
 
   if (is.null(x)) return(NULL)
@@ -1068,6 +1254,7 @@ af2_ca_fetch_dividends_one <- function(yahoo_symbol,
 ### FILE: modules/03_corporate_actions/R/fetch_splits_quantmod.R
 ###############################################################################
 # v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R
+source("v2/modules/03_corporate_actions/R/yahoo_retry.R")
 
 af2_ca_fetch_splits_one <- function(yahoo_symbol,
                                     from = "2018-01-01",
@@ -1075,18 +1262,19 @@ af2_ca_fetch_splits_one <- function(yahoo_symbol,
                                     verbose = FALSE) {
   if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
 
-  x <- tryCatch(
-    quantmod::getSplits(
-      yahoo_symbol,
-      from = from,
-      to = to,
-      auto.assign = FALSE,
-      verbose = verbose
-    ),
-    error = function(e) {
-      if (verbose) af2_log("AF2_CA:", "getSplits failed for ", yahoo_symbol, ": ", conditionMessage(e))
-      NULL
-    }
+  x <- af2_ca_with_retry(
+    function() {
+      quantmod::getSplits(
+        yahoo_symbol,
+        from = from,
+        to = to,
+        auto.assign = FALSE,
+        verbose = verbose
+      )
+    },
+    max_tries = 4L,
+    base_sleep = 1.5,
+    verbose = verbose
   )
 
   # quantmod returns NA if no split data
@@ -1106,6 +1294,251 @@ af2_ca_fetch_splits_one <- function(yahoo_symbol,
 
   dt[is.finite(value) & !is.na(refdate)]
 }
+
+
+###############################################################################
+### FILE: modules/03_corporate_actions/R/select_candidates.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/select_candidates.R
+
+af2_ca_select_candidates <- function(universe_raw, cfg = NULL, verbose = TRUE) {
+
+  af2_require(c("data.table"))
+  cfg <- cfg %||% af2_get_config()
+
+  dt <- data.table::as.data.table(universe_raw)
+
+  # Allow either turnover or vol_fin (rb3 differences)
+  if (!"turnover" %in% names(dt) && "vol_fin" %in% names(dt)) {
+    dt[, turnover := vol_fin]
+  }
+
+  # Minimal columns needed for the prefilter
+  af2_assert_cols(
+    dt,
+    c("symbol", "refdate", "close", "turnover", "asset_type"),
+    name = "universe_raw(prefilter)"
+  )
+
+  # Normalize
+  dt[, symbol := toupper(trimws(as.character(symbol)))]
+  dt[, asset_type := tolower(trimws(as.character(asset_type)))]
+  dt[, refdate := as.Date(refdate)]
+  dt[, close := as.numeric(close)]
+  dt[, turnover := as.numeric(turnover)]
+
+  # -------------------------------
+  # 0) Define recent window
+  # -------------------------------
+  end_date <- max(dt$refdate, na.rm = TRUE)
+
+  recent_days <- as.integer(cfg$ca_prefilter_recent_days %||% 252L)
+  if (!is.finite(recent_days) || recent_days < 20L) recent_days <- 252L
+
+  # Optional tighter liquidity window (new knob; fallback to recent_days)
+  liq_window_days <- as.integer(cfg$ca_prefilter_liq_window_days %||% 63L)
+  if (!is.finite(liq_window_days) || liq_window_days < 20L) liq_window_days <- min(63L, recent_days)
+
+  # Active trading filter (new knob)
+  active_days <- as.integer(cfg$ca_prefilter_active_days %||% 10L)
+  if (!is.finite(active_days) || active_days < 1L) active_days <- 10L
+
+  # We approximate "last N bizdays" by date window,
+  # since universe_raw already comes from B3 business dates.
+  recent_start <- end_date - ceiling(recent_days * 1.6)
+  liq_start    <- end_date - ceiling(liq_window_days * 1.6)
+  active_start <- end_date - ceiling(active_days * 1.6)
+
+  dt_recent <- dt[refdate >= recent_start & refdate <= end_date]
+  data.table::setorder(dt_recent, symbol, refdate)
+  dt_recent <- dt_recent[, tail(.SD, recent_days), by = symbol]
+
+  dt_liqwin <- dt[refdate >= liq_start & refdate <= end_date]
+
+  # -------------------------------
+  # 1) Active symbols (must trade recently)
+  # -------------------------------
+  # A "trade" is any day with a finite close
+  active_dt <- dt_recent[is.finite(close) & !is.na(close),
+                         .(last_trade = max(refdate, na.rm = TRUE)),
+                         by = .(symbol, asset_type)]
+
+  active_dt[, is_active := last_trade >= active_start]
+  active_syms <- active_dt[is_active == TRUE, unique(symbol)]
+
+  if (verbose) {
+    af2_log("AF2_CA_PREF:", "Active symbols= ", length(active_syms))
+  }
+
+  # If active filter is too strict in some environments, fail soft
+  if (!length(active_syms)) {
+    active_syms <- unique(dt_recent$symbol)
+  }
+
+  # -------------------------------
+  # 2) Liquidity filter (short window)
+  # -------------------------------
+  dt_liqwin <- dt_liqwin[symbol %in% active_syms]
+
+  dt_liqwin[, traded_flag := is.finite(close) & !is.na(close)]
+
+  liq <- dt_liqwin[, .(
+    median_turnover = stats::median(turnover, na.rm = TRUE),
+    days_traded_ratio = mean(traded_flag, na.rm = TRUE)
+  ), by = .(symbol, asset_type)]
+
+  liq[is.na(median_turnover), median_turnover := 0]
+  liq[is.na(days_traded_ratio), days_traded_ratio := 0]
+
+  liq_ok_dt <- liq[
+    median_turnover >= (cfg$min_turnover %||% 5e5) &
+      days_traded_ratio >= (cfg$min_days_traded_ratio %||% 0.8)
+  ]
+
+  liq_ok_syms <- liq_ok_dt$symbol
+
+  if (verbose) {
+    af2_log("AF2_CA_PREF:", "Liquidity ok symbols= ", length(unique(liq_ok_syms)))
+  }
+
+  # -------------------------------
+  # 3) Gap-flag detector (recent window)
+  # -------------------------------
+  dt_gap <- dt_recent[symbol %in% liq_ok_syms]
+  data.table::setorder(dt_gap, symbol, refdate)
+
+  dt_gap[, close_lag := data.table::shift(close, 1L), by = symbol]
+  dt_gap[, ret_1d := data.table::fifelse(
+    is.finite(close) & is.finite(close_lag) & close_lag > 0,
+    close / close_lag - 1,
+    NA_real_
+  )]
+  dt_gap[, close_lag := NULL]
+
+  # Apply per-type thresholds
+  thr_map <- data.table::data.table(
+    asset_type = c("equity", "fii", "etf", "bdr"),
+    thr = c(
+      cfg$ca_prefilter_gap_equity %||% -0.20,
+      cfg$ca_prefilter_gap_fii    %||% -0.12,
+      cfg$ca_prefilter_gap_etf    %||% -0.15,
+      cfg$ca_prefilter_gap_bdr    %||% -0.20
+    )
+  )
+
+  dt_gap <- merge(dt_gap, thr_map, by = "asset_type", all.x = TRUE)
+
+  gap_flags <- dt_gap[
+    is.finite(ret_1d) & ret_1d <= thr,
+    .(has_gap = TRUE),
+    by = .(symbol)
+  ]
+
+  gap_syms <- gap_flags$symbol
+
+  if (verbose) {
+    af2_log("AF2_CA_PREF:", "Gap-flag symbols= ", length(unique(gap_syms)))
+  }
+
+  # -------------------------------
+  # 4) Priority ranking source
+  # -------------------------------
+  # Priority = liquidity rank within liq_ok set
+  # (Cheap, robust, and type-aware)
+  liq_ok_dt[, liq_rank_overall := data.table::frank(-median_turnover, ties.method = "first")]
+  liq_ok_dt[, liq_rank_type := data.table::frank(-median_turnover, ties.method = "first"), by = asset_type]
+
+  top_overall <- as.integer(cfg$ca_prefilter_top_n_overall %||% 200L)
+  top_by_type <- as.integer(cfg$ca_prefilter_top_n_by_type %||% 50L)
+  max_cand    <- as.integer(cfg$ca_prefilter_max_candidates %||% 300L)
+
+  if (!is.finite(top_overall) || top_overall < 1L) top_overall <- 200L
+  if (!is.finite(top_by_type) || top_by_type < 1L) top_by_type <- 50L
+  if (!is.finite(max_cand) || max_cand < 50L) max_cand <- 300L
+
+  c1 <- liq_ok_dt[liq_rank_overall <= top_overall, unique(symbol)]
+  c2 <- liq_ok_dt[liq_rank_type <= top_by_type, unique(symbol)]
+
+  # -------------------------------
+  # 5) Union + cap
+  # -------------------------------
+  cand_all <- unique(c(c1, c2, gap_syms))
+
+  # If still empty (edge-case data), fall back to liquidity-ok
+  if (!length(cand_all)) cand_all <- unique(liq_ok_syms)
+
+  # Apply hard cap using priority order
+  if (length(cand_all) > max_cand && nrow(liq_ok_dt)) {
+    # Build a priority table for deterministic trimming
+    pri <- liq_ok_dt[, .(symbol, priority = liq_rank_overall)]
+    pri <- pri[order(priority)]
+    pri_syms <- pri$symbol
+
+    # Keep candidate order: priority first, then anything else
+    ordered <- unique(c(intersect(pri_syms, cand_all), cand_all))
+    cand_all <- head(ordered, max_cand)
+  }
+
+  if (verbose) {
+    af2_log("AF2_CA_PREF:", "Candidates final= ", length(cand_all))
+    #af2_log("AF2_CA_PREF:", "Selective actions enabled= ", isTRUE(cfg$enable_selective_actions))
+    #af2_log("AF2_CA_PREF:", "Yahoo candidate symbols= ", length(cand_all))
+  }
+
+  cand_all
+}
+
+
+
+###############################################################################
+### FILE: modules/03_corporate_actions/R/yahoo_retry.R
+###############################################################################
+# v2/modules/03_corporate_actions/R/yahoo_retry.R
+
+af2_ca_is_rate_limit_error <- function(msg) {
+  if (is.null(msg) || !nzchar(msg)) return(FALSE)
+  grepl("429|Too Many Requests|rate limit", msg, ignore.case = TRUE)
+}
+
+af2_ca_with_retry <- function(fun,
+                              max_tries = 4L,
+                              base_sleep = 1.5,
+                              jitter = 0.2,
+                              verbose = FALSE) {
+
+  max_tries <- as.integer(max_tries)
+  if (is.na(max_tries) || max_tries < 1L) max_tries <- 1L
+
+  for (k in seq_len(max_tries)) {
+    out <- tryCatch(fun(), error = function(e) e)
+
+    if (!inherits(out, "error")) return(out)
+
+    msg <- conditionMessage(out)
+
+    # Only backoff if it looks like rate limiting
+    if (!af2_ca_is_rate_limit_error(msg)) {
+      if (verbose) af2_log("AF2_CA:", "Non-429 error: ", msg)
+      return(NULL)
+    }
+
+    # Backoff
+    if (k < max_tries) {
+      sleep_s <- base_sleep * (2^(k - 1))
+      sleep_s <- sleep_s * runif(1, 1 - jitter, 1 + jitter)
+      if (verbose) {
+        af2_log("AF2_CA:", "429 detected. Retry ", k, "/", max_tries,
+                " sleeping ~", round(sleep_s, 2), "s")
+      }
+      Sys.sleep(sleep_s)
+    } else {
+      if (verbose) af2_log("AF2_CA:", "429 persisted after retries.")
+    }
+  }
+
+  NULL
+}
+
 
 
 ###############################################################################
@@ -1885,6 +2318,26 @@ af2_build_panel_adj <- function(universe_raw,
   dt[, symbol := toupper(trimws(as.character(symbol)))]
   dt[, refdate := as.Date(refdate)]
 
+  # ------------------------------------------------------------------
+  # Defensive dedupe (rb3 edge cases)
+  # We keep the first row per symbol/refdate after ordering.
+  # This prevents hard failures on occasional upstream duplicates.
+  # ------------------------------------------------------------------
+  data.table::setorder(dt, asset_type, symbol, refdate)
+
+  dup_check <- dt[, .N, by = .(symbol, refdate)][N > 1L]
+  if (nrow(dup_check)) {
+    af2_log(
+      "AF2_ADJ:",
+      "WARNING: universe_raw had duplicated symbol/refdate rows. ",
+      "Examples: ",
+      paste(utils::head(paste0(dup_check$symbol, "@", dup_check$refdate), 5), collapse = ", "),
+      ". Keeping first row per key."
+    )
+    dt <- dt[, .SD[1L], by = .(symbol, refdate)]
+  }
+
+
   af2_assert_no_dupes(dt, c("symbol", "refdate"), name = "universe_raw")
 
   # 1) Build event table (split_value + div_cash per symbol-date)
@@ -1993,6 +2446,76 @@ af2_build_panel_adj <- function(universe_raw,
     panel_adj = panel,
     adjustments = adj_tl,
     events = events
+  )
+}
+
+
+
+###############################################################################
+### FILE: modules/04_adjuster/R/build_panel_adj_selective.R
+###############################################################################
+# v2/modules/04_adjuster/R/build_panel_adj_selective.R
+# High-level wrapper implementing the selective Yahoo "trick".
+
+af2_build_panel_adj_selective <- function(universe_raw,
+                                          manual_events = NULL,
+                                          cfg = NULL,
+                                          from_ca = "2018-01-01",
+                                          to_ca = Sys.Date(),
+                                          verbose = TRUE,
+                                          use_cache = TRUE,
+                                          force_refresh = FALSE,
+                                          n_workers = 1L) {
+
+  cfg <- cfg %||% af2_get_config()
+
+  dt <- data.table::as.data.table(universe_raw)
+  af2_assert_cols(
+    dt,
+    c("symbol", "refdate", "open", "high", "low", "close", "turnover", "qty", "asset_type"),
+    name = "universe_raw"
+  )
+
+  # 1) Decide candidate symbols for Yahoo actions
+  if (isTRUE(cfg$enable_selective_actions)) {
+    cand <- af2_ca_select_candidates(
+      universe_raw = dt,
+      cfg = cfg,
+      verbose = verbose
+    )
+  } else {
+    cand <- sort(unique(toupper(dt$symbol)))
+  }
+
+  if (verbose) {
+    af2_log("AF2_CA_PREF:", "Selective actions enabled=", isTRUE(cfg$enable_selective_actions))
+    af2_log("AF2_CA_PREF:", "Yahoo candidate symbols=", length(cand))
+  }
+
+  # 2) Fetch registry ONLY for candidates
+  ca <- NULL
+  if (length(cand)) {
+    ca <- af2_ca_build_registry(
+      symbols = cand,
+      asset_types = NULL,
+      cfg = cfg,
+      from = from_ca,
+      to = to_ca,
+      verbose = verbose,
+      use_cache = use_cache,
+      force_refresh = force_refresh,
+      n_workers = n_workers,
+      cache_mode = cfg$ca_cache_mode %||% "batch"
+    )
+  }
+
+  # 3) Run the normal adjuster builder
+  af2_build_panel_adj(
+    universe_raw = dt,
+    corp_actions = ca,
+    manual_events = manual_events,
+    cfg = cfg,
+    verbose = verbose
   )
 }
 
@@ -3200,6 +3723,134 @@ for (tp in names(res$by_type)) {
 }
 
 af2_log("AF2_SMOKE05:", "OK - real-data screener smoke passed.")
+
+
+
+###############################################################################
+### FILE: scripts/05b_hard_screener_full_selective.R
+###############################################################################
+# v2/scripts/05b_hard_screener_full_selective.R
+# Full-B3-ish hard test WITH the selective Yahoo "trick".
+# Expectation:
+# - Universe may have ~2000+ symbols
+# - Yahoo fetch should be a small fraction (candidates)
+# - Per-symbol caching can be enabled
+
+# ----------------------------
+# 00) Core
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+cfg <- af2_get_config(list(
+  # Turn on the real architecture knobs here
+  enable_selective_actions = TRUE,
+
+  # Strongly recommended for the hard run:
+  ca_cache_mode = "by_symbol",
+
+  # You can tighten/loosen these as you learn
+  ca_prefilter_top_n_overall = 200L,
+  ca_prefilter_top_n_by_type = 50L,
+  ca_prefilter_max_candidates = 300L
+))
+
+af2_log_cfg(cfg)
+
+# ----------------------------
+# 01) Universe (rb3)
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+types_all <- c("equity", "fii", "etf", "bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - 730
+
+af2_log("AF2_HARD05:", "Universe window ", as.character(start_date), " to ", as.character(end_date))
+
+dt_univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+af2_log("AF2_HARD05:", "Universe rows=", nrow(dt_univ),
+        " symbols=", length(unique(dt_univ$symbol)))
+
+# ----------------------------
+# 02) Corporate actions + Adjuster (selective wrapper)
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+source("v2/modules/03_corporate_actions/R/select_candidates.R")
+
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/build_panel_adj_selective.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+af2_log("AF2_HARD05:", "Building adjusted panel with selective Yahoo registry...")
+
+res_adj <- af2_build_panel_adj_selective(
+  universe_raw = dt_univ,
+  manual_events = NULL,
+  cfg = cfg,
+  from_ca = "2018-01-01",
+  to_ca   = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L
+)
+
+panel_adj <- res_adj$panel_adj
+af2_validate_panel_adj(panel_adj)
+
+af2_log("AF2_HARD05:", "panel_adj rows=", nrow(panel_adj),
+        " symbols=", length(unique(panel_adj$symbol)))
+
+# ----------------------------
+# 03) Screener
+# ----------------------------
+source("v2/modules/05_screener/R/screener_config.R")
+source("v2/modules/05_screener/R/validate_screener_input.R")
+source("v2/modules/05_screener/R/liquidity_filter.R")
+source("v2/modules/05_screener/R/compute_metrics.R")
+source("v2/modules/05_screener/R/score_rank.R")
+source("v2/modules/05_screener/R/run_screener.R")
+
+af2_log("AF2_HARD05:", "Running screener on full adjusted panel...")
+
+res <- af2_run_screener(
+  panel_adj,
+  config = list(
+    lookback_days = 252L,
+    horizons_days = c(21L, 63L, 126L, 252L)
+  ),
+  allow_unresolved = NULL
+)
+
+af2_log("AF2_HARD05:", "Top 20 overall:")
+print(utils::head(res$full, 20))
+
+af2_log("AF2_HARD05:", "OK - hard selective full run finished.")
 
 
 

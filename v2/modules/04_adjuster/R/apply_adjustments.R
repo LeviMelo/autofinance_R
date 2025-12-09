@@ -40,8 +40,7 @@ af2_adj_compute_symbol_adjustments <- function(dt_sym, ev_sym) {
   dt[, has_manual := FALSE]
 
   if (nrow(ev)) {
-    dt[ev,
-       on = .(refdate),
+    dt[ev, on = .(symbol, refdate),
        `:=`(
          split_value = i.split_value,
          div_cash = i.div_cash,

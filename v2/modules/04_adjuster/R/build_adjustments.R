@@ -35,6 +35,14 @@ af2_adj_normalize_corp_actions <- function(corp_actions) {
 
   dt <- dt[!is.na(symbol) & nzchar(symbol) & !is.na(refdate)]
   dt <- dt[action_type %in% c("split", "dividend")]
+  # --------------------------------------------
+  # Normalize split values to PRICE FACTORS
+  # Yahoo/quantmod typically returns split ratios
+  # (e.g., 2 for 2:1). For backward price adjustment,
+  # we need the inverse (1/ratio).
+  # --------------------------------------------
+  dt[action_type == "split" & is.finite(value) & value > 0,
+     value := 1 / value]
 
   dt
 }
@@ -65,6 +73,8 @@ af2_adj_normalize_manual_events <- function(manual_events) {
 
   dt <- dt[!is.na(symbol) & nzchar(symbol) & !is.na(refdate)]
   dt <- dt[action_type %in% c("split", "dividend")]
+  dt[action_type == "split" & is.finite(value) & value > 0,
+     value := 1 / value]
 
   dt
 }

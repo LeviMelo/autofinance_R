@@ -35,14 +35,13 @@ af2_ca_build_registry <- function(symbols,
   symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
   symbols <- sort(unique(symbols))
 
-  if (!exists("af2_ca_build_registry_by_symbol")) {
-    stop("by_symbol cache_mode requested but af2_ca_build_registry_by_symbol is not defined.",
-         call. = FALSE)
-  }
-
   cache_mode <- match.arg(cache_mode)
 
   if (cache_mode == "by_symbol") {
+    if (!exists("af2_ca_build_registry_by_symbol")) {
+      stop("by_symbol cache_mode requested but af2_ca_build_registry_by_symbol is not defined.",
+           call. = FALSE)
+    }
     return(
       af2_ca_build_registry_by_symbol(
         symbols = symbols,
@@ -134,7 +133,10 @@ af2_ca_build_registry <- function(symbols,
         "map_dt",
         "from", "to",
         "af2_ca_fetch_splits_one",
-        "af2_ca_fetch_dividends_one"
+        "af2_ca_fetch_dividends_one",
+        "af2_ca_with_retry",
+        "af2_ca_is_rate_limit_error",
+        "af2_log"
       ),
       envir = environment()
     )

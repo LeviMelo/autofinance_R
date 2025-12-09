@@ -8,17 +8,23 @@ af2_ca_fetch_dividends_one <- function(yahoo_symbol,
                                        split.adjust = TRUE) {
   if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
 
+  div_fun <- quantmod::getDividends
+  fml <- names(formals(div_fun))
+
+  call_args <- list(
+    Symbols = yahoo_symbol,
+    from = from,
+    to = to,
+    auto.assign = FALSE,
+    verbose = verbose
+  )
+
+  if ("split.adjust" %in% fml) {
+    call_args$split.adjust <- split.adjust
+  }
+
   x <- af2_ca_with_retry(
-    function() {
-      quantmod::getDividends(
-        yahoo_symbol,
-        from = from,
-        to = to,
-        auto.assign = FALSE,
-        verbose = verbose,
-        split.adjust = split.adjust
-      )
-    },
+    function() do.call(div_fun, call_args),
     max_tries = 4L,
     base_sleep = 1.5,
     verbose = verbose

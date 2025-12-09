@@ -21,7 +21,7 @@ af2_b3_select_min_cols <- function(dt) {
   # - financial_volume / volume in BRL
   # - trade_quantity in units
   col_volfin <- af2_b3_pick_col(dt, c("financial_volume", "volume", "vol_fin"))
-  col_qty    <- af2_b3_pick_col(dt, c("trade_quantity", "quantity", "qty", "number_trades"))
+  col_qty <- af2_b3_pick_col(dt, c("trade_quantity", "quantity", "qty"))
 
   missing_core <- c(
     symbol = col_symbol,

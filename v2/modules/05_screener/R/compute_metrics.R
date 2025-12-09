@@ -53,9 +53,12 @@ af2_compute_symbol_metrics <- function(dt_sym, horizons_days) {
     }
   }
 
-
-  # Drawdown + Ulcer
+  # Drawdown + Ulcer (NA-robust)
   prices <- dt_sym$close_adj_final
+  if (requireNamespace("zoo", quietly = TRUE)) {
+    prices <- zoo::na.locf(prices, na.rm = FALSE)
+  }
+
   cummax_p <- cummax(prices)
   dd <- prices / cummax_p - 1
   out$max_dd <- suppressWarnings(min(dd, na.rm = TRUE))
