@@ -7,7 +7,8 @@
 # Output event table:
 #   symbol, refdate, split_value, div_cash, source_mask, has_manual
 
-af2_adj_normalize_corp_actions <- function(corp_actions) {
+af2_adj_normalize_corp_actions <- function(corp_actions, cfg = NULL) {
+  cfg <- cfg %||% af2_get_config()
   if (is.null(corp_actions)) {
     return(data.table(
       symbol = character(),
@@ -44,6 +45,32 @@ af2_adj_normalize_corp_actions <- function(corp_actions) {
   dt[action_type == "split" & is.finite(value) & value > 0,
      value := 1 / value]
 
+  # -------------------------------
+  # PATCH: plausibility gate (post-normalization)
+  # -------------------------------
+  if (isTRUE(cfg$enable_split_plausibility_gate)) {
+    vmin <- as.numeric(cfg$split_value_min %||% 0.05)
+    vmax <- as.numeric(cfg$split_value_max %||% 10)
+
+    bad <- dt[
+      action_type == "split" &
+      source == "yahoo" &
+      (value < vmin | value > vmax)
+    ]
+
+    if (nrow(bad)) {
+      af2_log(
+        "AF2_ADJ:",
+        "WARNING: quarantining ", nrow(bad),
+        " Yahoo split rows outside [", vmin, ", ", vmax, "]."
+      )
+      # Drop them for now; manual can re-add later
+      dt <- dt[!(action_type == "split" &
+                 source == "yahoo" &
+                 (value < vmin | value > vmax))]
+    }
+  }
+
   dt
 }
 
@@ -76,15 +103,43 @@ af2_adj_normalize_manual_events <- function(manual_events) {
   dt[action_type == "split" & is.finite(value) & value > 0,
      value := 1 / value]
 
+  # -------------------------------
+  # PATCH: plausibility gate (post-normalization)
+  # -------------------------------
+  if (isTRUE(cfg$enable_split_plausibility_gate)) {
+    vmin <- as.numeric(cfg$split_value_min %||% 0.05)
+    vmax <- as.numeric(cfg$split_value_max %||% 10)
+
+    bad <- dt[
+      action_type == "split" &
+      source == "yahoo" &
+      (value < vmin | value > vmax)
+    ]
+
+    if (nrow(bad)) {
+      af2_log(
+        "AF2_ADJ:",
+        "WARNING: quarantining ", nrow(bad),
+        " Yahoo split rows outside [", vmin, ", ", vmax, "]."
+      )
+      # Drop them for now; manual can re-add later
+      dt <- dt[!(action_type == "split" &
+                 source == "yahoo" &
+                 (value < vmin | value > vmax))]
+    }
+  }
+
   dt
 }
 
 af2_adj_build_events <- function(corp_actions,
                                  manual_events = NULL,
+                                 cfg = NULL,
                                  verbose = TRUE) {
 
   ca <- af2_adj_normalize_corp_actions(corp_actions)
   me <- af2_adj_normalize_manual_events(manual_events)
+  cfg <- cfg %||% af2_get_config()
 
   dt_all <- data.table::rbindlist(list(ca, me), use.names = TRUE, fill = TRUE)
   if (!nrow(dt_all)) {
@@ -96,6 +151,42 @@ af2_adj_build_events <- function(corp_actions,
       source_mask = character(),
       has_manual = logical()
     ))
+  }
+
+  # ------------------------------------------------------------
+  # Optional Yahoo split plausibility gate (quarantine, not edit)
+  # Applies ONLY to Yahoo-sourced split rows before aggregation.
+  # ------------------------------------------------------------
+  if (isTRUE(cfg$enable_split_plausibility_gate)) {
+
+    minv <- as.numeric(cfg$split_gate_min %||% 0.05)
+    maxv <- as.numeric(cfg$split_gate_max %||% 20)
+
+    if (!is.finite(minv) || minv <= 0) minv <- 0.05
+    if (!is.finite(maxv) || maxv <= 0) maxv <- 20
+
+    bad_splits <- dt_all[
+      action_type == "split" &
+        source == "yahoo" &
+        (value < minv | value > maxv)
+    ]
+
+    if (nrow(bad_splits) && verbose) {
+      af2_log("AF2_ADJ:",
+              "Split gate active. Quarantining ", nrow(bad_splits),
+              " Yahoo split rows outside [", minv, ", ", maxv, "].")
+      # Print a small sample for visibility
+      print(utils::head(bad_splits[order(symbol, refdate)], 10))
+    }
+
+    # Drop only the suspicious Yahoo split rows from factor construction
+    if (nrow(bad_splits)) {
+      dt_all <- dt_all[!(
+        action_type == "split" &
+          source == "yahoo" &
+          (value < minv | value > maxv)
+      )]
+    }
   }
 
   # Aggregate same-day events:

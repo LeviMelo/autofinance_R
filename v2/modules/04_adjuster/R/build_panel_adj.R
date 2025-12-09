@@ -55,6 +55,7 @@ af2_build_panel_adj <- function(universe_raw,
   events <- af2_adj_build_events(
     corp_actions = if (isTRUE(cfg$enable_splits)) corp_actions else NULL,
     manual_events = if (isTRUE(cfg$enable_manual_events)) manual_events else NULL,
+    cfg = cfg,
     verbose = verbose
   )
 

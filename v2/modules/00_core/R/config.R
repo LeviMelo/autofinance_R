@@ -54,7 +54,17 @@ af2_config_default <- list(
   ca_prefilter_active_days = 10L,
 
   # Use a shorter window for liquidity scoring (robust to old junk)
-  ca_prefilter_liq_window_days = 63L
+  ca_prefilter_liq_window_days = 63L,
+
+  # -------------------------------
+  # Split sanity gates (debug + safety)
+  # Values are PRICE FACTORS after normalization.
+  # Typical forward splits: 0.5, 0.333..., 0.2
+  # Typical reverse splits: 2, 5, 10 (rare)
+  # -------------------------------
+  enable_split_plausibility_gate = TRUE,
+  split_value_min = 0.05,  # conservative, allows 20:1
+  split_value_max = 10.0   # conservative, allows 1:10 reverse
 
 )
 

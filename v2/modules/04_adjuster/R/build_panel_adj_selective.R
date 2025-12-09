@@ -9,7 +9,9 @@ af2_build_panel_adj_selective <- function(universe_raw,
                                           verbose = TRUE,
                                           use_cache = TRUE,
                                           force_refresh = FALSE,
-                                          n_workers = 1L) {
+                                          n_workers = 1L,
+                                          force_symbols = NULL
+                                          ) {
 
   cfg <- cfg %||% af2_get_config()
 
@@ -34,6 +36,25 @@ af2_build_panel_adj_selective <- function(universe_raw,
   if (verbose) {
     af2_log("AF2_CA_PREF:", "Selective actions enabled=", isTRUE(cfg$enable_selective_actions))
     af2_log("AF2_CA_PREF:", "Yahoo candidate symbols=", length(cand))
+  }
+
+  if (isTRUE(cfg$enable_selective_actions)) {
+    cand <- af2_ca_select_candidates(
+      universe_raw = dt,
+      cfg = cfg,
+      verbose = verbose
+    )
+  } else {
+    cand <- sort(unique(toupper(dt$symbol)))
+  }
+
+  # -------------------------------
+  # PATCH: allow explicit forced symbols
+  # -------------------------------
+  if (!is.null(force_symbols)) {
+    force_symbols <- toupper(trimws(as.character(force_symbols)))
+    force_symbols <- force_symbols[!is.na(force_symbols) & nzchar(force_symbols)]
+    cand <- sort(unique(c(cand, force_symbols)))
   }
 
   # 2) Fetch registry ONLY for candidates
