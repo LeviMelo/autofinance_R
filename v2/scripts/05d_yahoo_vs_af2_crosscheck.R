@@ -14,7 +14,10 @@ source("v2/modules/00_core/R/logging.R")
 cfg <- af2_get_config(list(
   enable_selective_actions = TRUE,
   ca_cache_mode = "by_symbol",
-  enable_split_plausibility_gate = FALSE
+  enable_split_plausibility_gate = FALSE,
+  # NEW:
+  enable_split_gap_validation = TRUE,
+  split_gap_tol_log = 0.35
 ))
 af2_log_cfg(cfg)
 
@@ -231,7 +234,12 @@ for (s in sus) {
   print(sm)
 
   # Keep for manual inspection
-  out_list[[s]] <- dt
+  dt_final <- Reduce(function(x, y) merge(x, y, by = c("symbol","refdate"), all = TRUE),
+                   list(dt_y, dt_b3, dt_af2))
+
+  # compute diffs using dt_final
+  ...
+  out_list[[s]] <- dt_final
 }
 
 af2_log("AF2_YX05D:", "Done. Inspect out_list for per-symbol tables.")
