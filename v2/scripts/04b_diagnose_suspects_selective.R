@@ -53,10 +53,10 @@ cfg_dbg <- af2_get_config(list(
   ca_cache_mode = "by_symbol",
 
   # First pass: do NOT gate splits
-  enable_split_plausibility_gate = FALSE,
+  enable_split_plausibility_gate = TRUE,
 
-  #split_gate_min = 0.05,
-  #split_gate_max = 20
+  split_gate_min = 0.05,
+  split_gate_max = 20
 ))
 
 af2_log_cfg(cfg_dbg)
