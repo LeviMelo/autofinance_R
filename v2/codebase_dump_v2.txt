@@ -5,6 +5,25 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   contracts/screener_input.md
   contracts/screener_output.md
   contracts/universe_raw.md
+  diagnostics/plots_splits/ALZR11_raw_vs_adj_splits.png
+  diagnostics/plots_splits/AMBP3_raw_vs_adj_splits.png
+  diagnostics/plots_splits/AMER3_raw_vs_adj_splits.png
+  diagnostics/plots_splits/AURA33_raw_vs_adj_splits.png
+  diagnostics/plots_splits/AVGO34_raw_vs_adj_splits.png
+  diagnostics/plots_splits/GGRC11_raw_vs_adj_splits.png
+  diagnostics/plots_splits/HAPV3_raw_vs_adj_splits.png
+  diagnostics/plots_splits/HFOF11_raw_vs_adj_splits.png
+  diagnostics/plots_splits/HGBS11_raw_vs_adj_splits.png
+  diagnostics/plots_splits/JSAF11_raw_vs_adj_splits.png
+  diagnostics/plots_splits/M2ST34_raw_vs_adj_splits.png
+  diagnostics/plots_splits/MGLU3_raw_vs_adj_splits.png
+  diagnostics/plots_splits/NFLX34_raw_vs_adj_splits.png
+  diagnostics/plots_splits/NVDC34_raw_vs_adj_splits.png
+  diagnostics/plots_splits/OIBR3_raw_vs_adj_splits.png
+  diagnostics/plots_splits/RBVA11_raw_vs_adj_splits.png
+  diagnostics/plots_splits/TEPP11_raw_vs_adj_splits.png
+  diagnostics/plots_splits/TIMS3_raw_vs_adj_splits.png
+  diagnostics/plots_splits/WALM34_raw_vs_adj_splits.png
   modules/00_core/R/config.R
   modules/00_core/R/logging.R
   modules/00_core/R/utils.R
@@ -148,10 +167,6 @@ af2_config_default <- list(
   # Safety
   allow_unresolved_in_screener = FALSE,
 
-  # Corporate actions toggles (used later)
-  enable_splits = TRUE,
-  enable_manual_events = TRUE,
-
   # -------------------------------
   # Selective corporate-actions policy (the "trick")
   # -------------------------------
@@ -194,6 +209,21 @@ af2_get_config <- function(config = NULL) {
   dir.create(cfg$fixtures_dir, recursive = TRUE, showWarnings = FALSE)
   dir.create(cfg$manual_dir, recursive = TRUE, showWarnings = FALSE)
   dir.create(cfg$logs_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # -------------------------------
+  # Validation of sensitive knobs
+  # -------------------------------
+  if (!is.null(cfg$ca_cache_mode) &&
+      !cfg$ca_cache_mode %in% c("batch", "by_symbol")) {
+    stop("Invalid ca_cache_mode: ", cfg$ca_cache_mode,
+         ". Allowed: batch, by_symbol", call. = FALSE)
+  }
+
+  cfg$ca_prefilter_recent_days <- as.integer(cfg$ca_prefilter_recent_days %||% 252L)
+  cfg$ca_prefilter_top_n_overall <- as.integer(cfg$ca_prefilter_top_n_overall %||% 200L)
+  cfg$ca_prefilter_top_n_by_type <- as.integer(cfg$ca_prefilter_top_n_by_type %||% 50L)
+  cfg$ca_prefilter_max_candidates <- as.integer(cfg$ca_prefilter_max_candidates %||% 300L)
+
   cfg
 }
 
@@ -746,7 +776,7 @@ af2_b3_select_min_cols <- function(dt) {
   # - financial_volume / volume in BRL
   # - trade_quantity in units
   col_volfin <- af2_b3_pick_col(dt, c("financial_volume", "volume", "vol_fin"))
-  col_qty    <- af2_b3_pick_col(dt, c("trade_quantity", "quantity", "qty", "number_trades"))
+  col_qty <- af2_b3_pick_col(dt, c("trade_quantity", "quantity", "qty"))
 
   missing_core <- c(
     symbol = col_symbol,
@@ -938,14 +968,13 @@ af2_ca_build_registry <- function(symbols,
   symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
   symbols <- sort(unique(symbols))
 
-  if (!exists("af2_ca_build_registry_by_symbol")) {
-    stop("by_symbol cache_mode requested but af2_ca_build_registry_by_symbol is not defined.",
-         call. = FALSE)
-  }
-
   cache_mode <- match.arg(cache_mode)
 
   if (cache_mode == "by_symbol") {
+    if (!exists("af2_ca_build_registry_by_symbol")) {
+      stop("by_symbol cache_mode requested but af2_ca_build_registry_by_symbol is not defined.",
+           call. = FALSE)
+    }
     return(
       af2_ca_build_registry_by_symbol(
         symbols = symbols,
@@ -1037,7 +1066,10 @@ af2_ca_build_registry <- function(symbols,
         "map_dt",
         "from", "to",
         "af2_ca_fetch_splits_one",
-        "af2_ca_fetch_dividends_one"
+        "af2_ca_fetch_dividends_one",
+        "af2_ca_with_retry",
+        "af2_ca_is_rate_limit_error",
+        "af2_log"
       ),
       envir = environment()
     )
@@ -1218,17 +1250,23 @@ af2_ca_fetch_dividends_one <- function(yahoo_symbol,
                                        split.adjust = TRUE) {
   if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
 
+  div_fun <- quantmod::getDividends
+  fml <- names(formals(div_fun))
+
+  call_args <- list(
+    Symbols = yahoo_symbol,
+    from = from,
+    to = to,
+    auto.assign = FALSE,
+    verbose = verbose
+  )
+
+  if ("split.adjust" %in% fml) {
+    call_args$split.adjust <- split.adjust
+  }
+
   x <- af2_ca_with_retry(
-    function() {
-      quantmod::getDividends(
-        yahoo_symbol,
-        from = from,
-        to = to,
-        auto.assign = FALSE,
-        verbose = verbose,
-        split.adjust = split.adjust
-      )
-    },
+    function() do.call(div_fun, call_args),
     max_tries = 4L,
     base_sleep = 1.5,
     verbose = verbose
@@ -1980,8 +2018,7 @@ af2_adj_compute_symbol_adjustments <- function(dt_sym, ev_sym) {
   dt[, has_manual := FALSE]
 
   if (nrow(ev)) {
-    dt[ev,
-       on = .(refdate),
+    dt[ev, on = .(symbol, refdate),
        `:=`(
          split_value = i.split_value,
          div_cash = i.div_cash,
@@ -2180,6 +2217,14 @@ af2_adj_normalize_corp_actions <- function(corp_actions) {
 
   dt <- dt[!is.na(symbol) & nzchar(symbol) & !is.na(refdate)]
   dt <- dt[action_type %in% c("split", "dividend")]
+  # --------------------------------------------
+  # Normalize split values to PRICE FACTORS
+  # Yahoo/quantmod typically returns split ratios
+  # (e.g., 2 for 2:1). For backward price adjustment,
+  # we need the inverse (1/ratio).
+  # --------------------------------------------
+  dt[action_type == "split" & is.finite(value) & value > 0,
+     value := 1 / value]
 
   dt
 }
@@ -2210,6 +2255,8 @@ af2_adj_normalize_manual_events <- function(manual_events) {
 
   dt <- dt[!is.na(symbol) & nzchar(symbol) & !is.na(refdate)]
   dt <- dt[action_type %in% c("split", "dividend")]
+  dt[action_type == "split" & is.finite(value) & value > 0,
+     value := 1 / value]
 
   dt
 }
@@ -2668,9 +2715,12 @@ af2_compute_symbol_metrics <- function(dt_sym, horizons_days) {
     }
   }
 
-
-  # Drawdown + Ulcer
+  # Drawdown + Ulcer (NA-robust)
   prices <- dt_sym$close_adj_final
+  if (requireNamespace("zoo", quietly = TRUE)) {
+    prices <- zoo::na.locf(prices, na.rm = FALSE)
+  }
+
   cummax_p <- cummax(prices)
   dd <- prices / cummax_p - 1
   out$max_dd <- suppressWarnings(min(dd, na.rm = TRUE))
