@@ -57,6 +57,7 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   #   H1: expected = value
   #   H2: expected = 1/value
   tol <- as.numeric(cfg$split_gap_tol_log %||% 0.35)
+  if (!is.finite(tol) || tol <= 0) tol <- 0.35
 
   safe_log <- function(x) {
     ifelse(is.finite(x) & x > 0, log(x), NA_real_)
@@ -80,7 +81,7 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   # Mark rows that don't match raw at all
   ys2[, ok := is.finite(chosen_err) & chosen_err <= tol]
 
-  bad <- ys2[!ok]
+  bad  <- ys2[is.na(ok) | ok == FALSE]
 
   if (verbose) {
     af2_log("AF2_CA_PREF:",
@@ -89,19 +90,31 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
             nrow(bad), " dropped (no raw match).")
   }
 
-  # Apply replacements for GOOD rows
-  good <- ys2[ok, .(symbol, refdate, chosen_value)]
-  if (nrow(good)) {
-    ca[good, on = .(symbol, refdate),
-       value := i.chosen_value]
+  # Apply replacements for GOOD rows (ONLY Yahoo split rows)
+  good_keys <- ys2[ok == TRUE, .(
+    symbol,
+    refdate,
+    action_type = "split",
+    source = "yahoo",
+    value_new = chosen_value
+  )]
+
+  if (nrow(good_keys)) {
+    ca[good_keys,
+       on = .(symbol, refdate, action_type, source),
+       value := i.value_new]
   }
 
-  # Drop BAD rows
+  # Drop BAD rows (ONLY Yahoo split rows)
   if (nrow(bad)) {
-    ca <- ca[!(
-      action_type == "split" & source == "yahoo" &
-        paste(symbol, refdate) %in% paste(bad$symbol, bad$refdate)
-    )]
+    bad_keys <- unique(bad[, .(
+      symbol,
+      refdate,
+      action_type = "split",
+      source = "yahoo"
+    )])
+
+    ca <- ca[!bad_keys, on = .(symbol, refdate, action_type, source)]
   }
 
   ca

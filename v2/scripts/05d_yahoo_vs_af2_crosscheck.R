@@ -81,17 +81,23 @@ univ <- af2_b3_build_universe_window(
 
 univ_sus <- univ[symbol %in% sus]
 
-res_adj <- af2_build_panel_adj_selective(
-  universe_raw = univ_sus,
-  manual_events = NULL,
-  cfg = cfg,
-  from_ca = "2018-01-01",
-  to_ca   = Sys.Date(),
-  verbose = TRUE,
-  use_cache = TRUE,
-  force_refresh = FALSE,
-  n_workers = 1L,
-  force_symbols = sus
+res_adj <- tryCatch(
+  af2_build_panel_adj_selective(
+    universe_raw = univ_sus,
+    manual_events = NULL,
+    cfg = cfg,
+    from_ca = "2018-01-01",
+    to_ca   = Sys.Date(),
+    verbose = TRUE,
+    use_cache = TRUE,
+    force_refresh = FALSE,
+    n_workers = 1L,
+    force_symbols = sus
+  ),
+  error = function(err) {
+    af2_log("AF2_YX05D:", "ERROR building AF2 panel: ", conditionMessage(err))
+    stop(conditionMessage(err), call. = FALSE)
+  }
 )
 
 panel <- as.data.table(res_adj$panel_adj)
@@ -233,12 +239,13 @@ for (s in sus) {
   af2_log("AF2_YX05D:", "Summary diagnostics for ", s)
   print(sm)
 
-  # Keep for manual inspection
-  dt_final <- Reduce(function(x, y) merge(x, y, by = c("symbol","refdate"), all = TRUE),
-                   list(dt_y, dt_b3, dt_af2))
+  # At this point, 'dt' already contains:
+  # - Yahoo raw
+  # - Yahoo Adjusted column
+  # - Yahoo adjustOHLC rebuild
+  # and we then merged AF2/B3 into it.
+  dt_final <- copy(dt)
 
-  # compute diffs using dt_final
-  ...
   out_list[[s]] <- dt_final
 }
 
