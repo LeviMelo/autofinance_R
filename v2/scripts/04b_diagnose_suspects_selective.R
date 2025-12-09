@@ -53,7 +53,7 @@ cfg_dbg <- af2_get_config(list(
   ca_cache_mode = "by_symbol",
 
   # First pass: do NOT gate splits
-  enable_split_plausibility_gate = TRUE,
+  enable_split_plausibility_gate = FALSE,
 
   split_gate_min = 0.05,
   split_gate_max = 20
@@ -113,6 +113,108 @@ res <- af2_build_panel_adj_selective(
 
 panel_adj <- res$panel_adj
 af2_validate_panel_adj(panel_adj)
+
+# ----------------------------
+# PATCH C — Split-day shock sanity check (collision-proof)
+# ----------------------------
+# Goal:
+# On dates where a split exists:
+#   - raw close should show a large 1-day mechanical jump
+#   - adjusted close should show a much smaller jump
+#
+# This version avoids merge name collisions with panel_adj.
+
+events <- data.table::as.data.table(res$events)
+
+# Keep only actual split events (price factors != 1)
+spl_ev <- events[
+  is.finite(split_value) & split_value != 1,
+  .(
+    symbol,
+    refdate,
+    split_value_event = split_value,
+    source_mask_event = source_mask,
+    has_manual_event  = has_manual
+  )
+]
+
+panel_chk <- data.table::as.data.table(panel_adj)
+data.table::setorder(panel_chk, symbol, refdate)
+
+# Attach event-side split info WITHOUT clobbering any existing split_value
+panel_chk <- merge(
+  panel_chk,
+  spl_ev,
+  by = c("symbol", "refdate"),
+  all.x = TRUE
+)
+
+# Choose a unified split factor column for diagnostics:
+# Prefer the event table value when present; fall back to panel's split_value if it exists.
+panel_chk[, split_factor := split_value_event]
+
+if ("split_value" %in% names(panel_chk)) {
+  panel_chk[is.na(split_factor) & is.finite(split_value) & split_value != 1,
+            split_factor := split_value]
+}
+
+# Safety: ensure expected price columns exist
+need_cols <- c("close_raw", "close_adj_final")
+missing_cols <- setdiff(need_cols, names(panel_chk))
+if (length(missing_cols)) {
+  stop("PATCH C error: missing columns in panel_adj: ",
+       paste(missing_cols, collapse = ", "))
+}
+
+# Day-to-day ratios
+panel_chk[, `:=`(
+  raw_ratio = close_raw / data.table::shift(close_raw),
+  adj_ratio = close_adj_final / data.table::shift(close_adj_final)
+), by = symbol]
+
+# Scale-free shock size
+panel_chk[, `:=`(
+  raw_shock = abs(log(raw_ratio)),
+  adj_shock = abs(log(adj_ratio))
+)]
+
+# Only true split days
+split_days <- panel_chk[
+  is.finite(split_factor) & split_factor != 1
+]
+
+if (nrow(split_days)) {
+
+  cat("\nAF2_DIAG04B: Split-day shock summary",
+      "(expect adj_shock << raw_shock)\n")
+
+  by_sym <- split_days[, .(
+    n_split_days   = .N,
+    mean_raw_shock = mean(raw_shock, na.rm = TRUE),
+    mean_adj_shock = mean(adj_shock, na.rm = TRUE),
+    pct_improved   = mean(adj_shock < raw_shock, na.rm = TRUE)
+  ), by = symbol][order(-n_split_days, -pct_improved)]
+
+  print(by_sym)
+
+  cat("\nAF2_DIAG04B: Worst raw split-day jumps (top 20)\n")
+  print(
+    split_days[
+      order(-raw_shock)
+    ][1:min(20L, .N),
+      .(
+        symbol, refdate,
+        split_factor,
+        close_raw, raw_ratio, raw_shock,
+        close_adj_final, adj_ratio, adj_shock,
+        source_mask_event, has_manual_event
+      )
+    ]
+  )
+
+} else {
+  cat("\nAF2_DIAG04B: No split days found in this window.\n")
+}
 
 af2_log("AF2_DIAG04B:", "panel_adj rows=", nrow(panel_adj),
         " symbols=", length(unique(panel_adj$symbol)))
