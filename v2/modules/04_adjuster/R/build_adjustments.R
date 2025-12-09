@@ -44,6 +44,10 @@ af2_adj_normalize_corp_actions <- function(corp_actions, cfg = NULL) {
   # return PRICE FACTORS (1/ratio).
   # So we do NOT invert here.
   # --------------------------------------------
+  # getSplits() may return ratio OR price factor depending on the symbol/market feed.
+  # We keep values as-is here.
+  # Orientation is validated later by split-gap logic when enabled.
+
   # Keep only valid positive numeric values.
   dt[action_type == "split" & (!is.finite(value) | value <= 0),
      value := NA_real_]

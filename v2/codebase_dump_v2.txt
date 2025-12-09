@@ -5,25 +5,6 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   contracts/screener_input.md
   contracts/screener_output.md
   contracts/universe_raw.md
-  diagnostics/plots_splits/ALZR11_raw_vs_adj_splits.png
-  diagnostics/plots_splits/AMBP3_raw_vs_adj_splits.png
-  diagnostics/plots_splits/AMER3_raw_vs_adj_splits.png
-  diagnostics/plots_splits/AURA33_raw_vs_adj_splits.png
-  diagnostics/plots_splits/AVGO34_raw_vs_adj_splits.png
-  diagnostics/plots_splits/GGRC11_raw_vs_adj_splits.png
-  diagnostics/plots_splits/HAPV3_raw_vs_adj_splits.png
-  diagnostics/plots_splits/HFOF11_raw_vs_adj_splits.png
-  diagnostics/plots_splits/HGBS11_raw_vs_adj_splits.png
-  diagnostics/plots_splits/JSAF11_raw_vs_adj_splits.png
-  diagnostics/plots_splits/M2ST34_raw_vs_adj_splits.png
-  diagnostics/plots_splits/MGLU3_raw_vs_adj_splits.png
-  diagnostics/plots_splits/NFLX34_raw_vs_adj_splits.png
-  diagnostics/plots_splits/NVDC34_raw_vs_adj_splits.png
-  diagnostics/plots_splits/OIBR3_raw_vs_adj_splits.png
-  diagnostics/plots_splits/RBVA11_raw_vs_adj_splits.png
-  diagnostics/plots_splits/TEPP11_raw_vs_adj_splits.png
-  diagnostics/plots_splits/TIMS3_raw_vs_adj_splits.png
-  diagnostics/plots_splits/WALM34_raw_vs_adj_splits.png
   modules/00_core/R/config.R
   modules/00_core/R/logging.R
   modules/00_core/R/utils.R
@@ -70,8 +51,11 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   scripts/02a_smoke_corp_actions_quantmod.R
   scripts/04_run_screener_mock_only.R
   scripts/04a_smoke_adjuster_small_window.R
+  scripts/04b_diagnose_suspects_selective.R
   scripts/05a_smoke_screener_real_small_window.R
   scripts/05b_hard_screener_full_selective.R
+  scripts/05c_hard_selective_split_audit.R
+  scripts/05d_yahoo_vs_af2_crosscheck.R
 
 
 
@@ -193,7 +177,17 @@ af2_config_default <- list(
   ca_prefilter_active_days = 10L,
 
   # Use a shorter window for liquidity scoring (robust to old junk)
-  ca_prefilter_liq_window_days = 63L
+  ca_prefilter_liq_window_days = 63L,
+
+  # -------------------------------
+  # Split sanity gates (debug + safety)
+  # Values are PRICE FACTORS after normalization.
+  # Typical forward splits: 0.5, 0.333..., 0.2
+  # Typical reverse splits: 2, 5, 10 (rare)
+  # -------------------------------
+  enable_split_plausibility_gate = TRUE,
+  split_gate_min = 0.05,  # conservative, allows 20:1
+  split_gate_max = 10.0   # conservative, allows 1:10 reverse
 
 )
 
@@ -2189,7 +2183,8 @@ af2_adj_apply_adjustments <- function(universe_raw,
 # Output event table:
 #   symbol, refdate, split_value, div_cash, source_mask, has_manual
 
-af2_adj_normalize_corp_actions <- function(corp_actions) {
+af2_adj_normalize_corp_actions <- function(corp_actions, cfg = NULL) {
+  cfg <- cfg %||% af2_get_config()
   if (is.null(corp_actions)) {
     return(data.table(
       symbol = character(),
@@ -2217,19 +2212,25 @@ af2_adj_normalize_corp_actions <- function(corp_actions) {
 
   dt <- dt[!is.na(symbol) & nzchar(symbol) & !is.na(refdate)]
   dt <- dt[action_type %in% c("split", "dividend")]
+  # Yahoo/quantmod getSplits() appears to return
+  # PRICE FACTORS already (1/ratio).
+  # We keep values as-is and only validate positivity.
   # --------------------------------------------
-  # Normalize split values to PRICE FACTORS
-  # Yahoo/quantmod typically returns split ratios
-  # (e.g., 2 for 2:1). For backward price adjustment,
-  # we need the inverse (1/ratio).
+  # Yahoo/quantmod getSplits() appears to already
+  # return PRICE FACTORS (1/ratio).
+  # So we do NOT invert here.
   # --------------------------------------------
-  dt[action_type == "split" & is.finite(value) & value > 0,
-     value := 1 / value]
+  # Keep only valid positive numeric values.
+  dt[action_type == "split" & (!is.finite(value) | value <= 0),
+     value := NA_real_]
+
+  dt <- dt[is.na(value) == FALSE]
 
   dt
 }
 
-af2_adj_normalize_manual_events <- function(manual_events) {
+af2_adj_normalize_manual_events <- function(manual_events, cfg = NULL) {
+  cfg <- cfg %||% af2_get_config()
   if (is.null(manual_events)) {
     return(data.table(
       symbol = character(),
@@ -2255,18 +2256,26 @@ af2_adj_normalize_manual_events <- function(manual_events) {
 
   dt <- dt[!is.na(symbol) & nzchar(symbol) & !is.na(refdate)]
   dt <- dt[action_type %in% c("split", "dividend")]
-  dt[action_type == "split" & is.finite(value) & value > 0,
-     value := 1 / value]
+  # Manual convention in v2:
+  # store split values as PRICE FACTORS
+  # consistent with Yahoo (1/ratio).
+  dt[action_type == "split" & (!is.finite(value) | value <= 0),
+     value := NA_real_]
+
+  dt <- dt[is.na(value) == FALSE]
 
   dt
 }
 
 af2_adj_build_events <- function(corp_actions,
                                  manual_events = NULL,
+                                 cfg = NULL,
                                  verbose = TRUE) {
 
-  ca <- af2_adj_normalize_corp_actions(corp_actions)
-  me <- af2_adj_normalize_manual_events(manual_events)
+  cfg <- cfg %||% af2_get_config()
+
+  ca <- af2_adj_normalize_corp_actions(corp_actions, cfg = cfg)
+  me <- af2_adj_normalize_manual_events(manual_events, cfg = cfg)
 
   dt_all <- data.table::rbindlist(list(ca, me), use.names = TRUE, fill = TRUE)
   if (!nrow(dt_all)) {
@@ -2278,6 +2287,42 @@ af2_adj_build_events <- function(corp_actions,
       source_mask = character(),
       has_manual = logical()
     ))
+  }
+
+  # ------------------------------------------------------------
+  # Optional Yahoo split plausibility gate (quarantine, not edit)
+  # Applies ONLY to Yahoo-sourced split rows before aggregation.
+  # ------------------------------------------------------------
+  if (isTRUE(cfg$enable_split_plausibility_gate)) {
+
+    minv <- as.numeric(cfg$split_gate_min %||% 0.05)
+    maxv <- as.numeric(cfg$split_gate_max %||% 20)
+
+    if (!is.finite(minv) || minv <= 0) minv <- 0.05
+    if (!is.finite(maxv) || maxv <= 0) maxv <- 20
+
+    bad_splits <- dt_all[
+      action_type == "split" &
+        source == "yahoo" &
+        (value < minv | value > maxv)
+    ]
+
+    if (nrow(bad_splits) && verbose) {
+      af2_log("AF2_ADJ:",
+              "Split gate active. Quarantining ", nrow(bad_splits),
+              " Yahoo split rows outside [", minv, ", ", maxv, "].")
+      # Print a small sample for visibility
+      print(utils::head(bad_splits[order(symbol, refdate)], 10))
+    }
+
+    # Drop only the suspicious Yahoo split rows from factor construction
+    if (nrow(bad_splits)) {
+      dt_all <- dt_all[!(
+        action_type == "split" &
+          source == "yahoo" &
+          (value < minv | value > maxv)
+      )]
+    }
   }
 
   # Aggregate same-day events:
@@ -2391,6 +2436,7 @@ af2_build_panel_adj <- function(universe_raw,
   events <- af2_adj_build_events(
     corp_actions = if (isTRUE(cfg$enable_splits)) corp_actions else NULL,
     manual_events = if (isTRUE(cfg$enable_manual_events)) manual_events else NULL,
+    cfg = cfg,
     verbose = verbose
   )
 
@@ -2504,6 +2550,125 @@ af2_build_panel_adj <- function(universe_raw,
 # v2/modules/04_adjuster/R/build_panel_adj_selective.R
 # High-level wrapper implementing the selective Yahoo "trick".
 
+# ------------------------------------------------------------
+# PATCH D2 helper:
+# Validate and auto-orient Yahoo split values using Cotahist raw.
+# Works even if getSplits() mixes conventions across symbols.
+# ------------------------------------------------------------
+af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
+                                               universe_raw,
+                                               cfg = NULL,
+                                               verbose = TRUE) {
+  cfg <- cfg %||% af2_get_config()
+
+  ca <- data.table::as.data.table(corp_actions)
+  if (!nrow(ca)) return(ca)
+
+  dt <- data.table::as.data.table(universe_raw)
+  if (!nrow(dt)) return(ca)
+
+  # Required columns
+  af2_assert_cols(ca, c("symbol","refdate","action_type","value","source"),
+                  name = "corp_actions")
+  af2_assert_cols(dt, c("symbol","refdate","close"),
+                  name = "universe_raw")
+
+  ca[, symbol := toupper(symbol)]
+  dt[, symbol := toupper(symbol)]
+  ca[, refdate := as.Date(refdate)]
+  dt[, refdate := as.Date(refdate)]
+
+  # Only Yahoo splits
+  ys <- ca[action_type == "split" & source == "yahoo" &
+             is.finite(value) & value > 0]
+  if (!nrow(ys)) return(ca)
+
+  data.table::setorder(dt, symbol, refdate)
+  dt[, close_prev := data.table::shift(close, 1L), by = symbol]
+  dt[, close_next := data.table::shift(close, -1L), by = symbol]
+
+  ys2 <- merge(
+    ys,
+    dt[, .(symbol, refdate, close_prev, close, close_next)],
+    by = c("symbol","refdate"),
+    all.x = TRUE
+  )
+
+  # Raw ratios around event day
+  ys2[, ratio_prev := fifelse(is.finite(close_prev) & close_prev > 0,
+                              close / close_prev, NA_real_)]
+  ys2[, ratio_next := fifelse(is.finite(close) & close > 0,
+                              close_next / close, NA_real_)]
+
+  # Expected raw jump should match split RATIO
+  # But Yahoo value may be ratio OR factor depending on symbol.
+  # We test both hypotheses:
+  #   H1: expected = value
+  #   H2: expected = 1/value
+  tol <- as.numeric(cfg$split_gap_tol_log %||% 0.35)
+  if (!is.finite(tol) || tol <= 0) tol <- 0.35
+
+  safe_log <- function(x) {
+    ifelse(is.finite(x) & x > 0, log(x), NA_real_)
+  }
+
+  ys2[, log_rprev := safe_log(ratio_prev)]
+  ys2[, log_rnext := safe_log(ratio_next)]
+  ys2[, log_v    := safe_log(value)]
+  ys2[, log_inv  := safe_log(1 / value)]
+
+  # Compute best local error for each hypothesis
+  ys2[, err_val := pmin(abs(log_rprev - log_v),
+                        abs(log_rnext - log_v), na.rm = TRUE)]
+  ys2[, err_inv := pmin(abs(log_rprev - log_inv),
+                        abs(log_rnext - log_inv), na.rm = TRUE)]
+
+  # Choose orientation that fits raw better
+  ys2[, chosen_value := fifelse(err_inv < err_val, 1 / value, value)]
+  ys2[, chosen_err   := pmin(err_val, err_inv, na.rm = TRUE)]
+
+  # Mark rows that don't match raw at all
+  ys2[, ok := is.finite(chosen_err) & chosen_err <= tol]
+
+  bad  <- ys2[is.na(ok) | ok == FALSE]
+
+  if (verbose) {
+    af2_log("AF2_CA_PREF:",
+            "Split-gap auto-orient: ",
+            nrow(ys2) - nrow(bad), " Yahoo split rows kept/normalized; ",
+            nrow(bad), " dropped (no raw match).")
+  }
+
+  # Apply replacements for GOOD rows (ONLY Yahoo split rows)
+  good_keys <- ys2[ok == TRUE, .(
+    symbol,
+    refdate,
+    action_type = "split",
+    source = "yahoo",
+    value_new = chosen_value
+  )]
+
+  if (nrow(good_keys)) {
+    ca[good_keys,
+       on = .(symbol, refdate, action_type, source),
+       value := i.value_new]
+  }
+
+  # Drop BAD rows (ONLY Yahoo split rows)
+  if (nrow(bad)) {
+    bad_keys <- unique(bad[, .(
+      symbol,
+      refdate,
+      action_type = "split",
+      source = "yahoo"
+    )])
+
+    ca <- ca[!bad_keys, on = .(symbol, refdate, action_type, source)]
+  }
+
+  ca
+}
+
 af2_build_panel_adj_selective <- function(universe_raw,
                                           manual_events = NULL,
                                           cfg = NULL,
@@ -2512,7 +2677,9 @@ af2_build_panel_adj_selective <- function(universe_raw,
                                           verbose = TRUE,
                                           use_cache = TRUE,
                                           force_refresh = FALSE,
-                                          n_workers = 1L) {
+                                          n_workers = 1L,
+                                          force_symbols = NULL
+                                          ) {
 
   cfg <- cfg %||% af2_get_config()
 
@@ -2539,6 +2706,15 @@ af2_build_panel_adj_selective <- function(universe_raw,
     af2_log("AF2_CA_PREF:", "Yahoo candidate symbols=", length(cand))
   }
 
+  # -------------------------------
+  # PATCH: allow explicit forced symbols
+  # -------------------------------
+  if (!is.null(force_symbols)) {
+    force_symbols <- toupper(trimws(as.character(force_symbols)))
+    force_symbols <- force_symbols[!is.na(force_symbols) & nzchar(force_symbols)]
+    cand <- sort(unique(c(cand, force_symbols)))
+  }
+
   # 2) Fetch registry ONLY for candidates
   ca <- NULL
   if (length(cand)) {
@@ -2553,6 +2729,21 @@ af2_build_panel_adj_selective <- function(universe_raw,
       force_refresh = force_refresh,
       n_workers = n_workers,
       cache_mode = cfg$ca_cache_mode %||% "batch"
+    )
+  }
+
+  # -------------------------------
+  # PATCH D2: reconcile Yahoo split conventions
+  # against Cotahist raw gaps (auto-orient + drop)
+  # -------------------------------
+  if (!is.null(ca) && nrow(ca) &&
+      isTRUE(cfg$enable_split_gap_validation)) {
+
+    ca <- af2_ca_fix_yahoo_splits_by_raw_gap(
+      corp_actions = ca,
+      universe_raw = dt,
+      cfg = cfg,
+      verbose = verbose
     )
   }
 
@@ -3615,6 +3806,234 @@ af2_log("AF2_SMOKE04:", "OK - adjuster smoke passed.")
 
 
 ###############################################################################
+### FILE: scripts/04b_diagnose_suspects_selective.R
+###############################################################################
+# v2/scripts/04b_diagnose_suspects_selective.R
+# Focused diagnostic run for known bad actors.
+# Uses selective wrapper + force_symbols capability.
+
+# ----------------------------
+# 00) Core
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# ----------------------------
+# 01) Universe
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+# ----------------------------
+# 02) Corporate actions + selective prefilter
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+source("v2/modules/03_corporate_actions/R/select_candidates.R")
+
+# ----------------------------
+# 03) Adjuster
+# ----------------------------
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/build_panel_adj_selective.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+# ----------------------------
+# Step 0 — Config overrides for a clean diagnostic
+# ----------------------------
+cfg_dbg <- af2_get_config(list(
+  # First pass: disable selective so you see raw Yahoo behavior
+  # You can flip this to TRUE in a second run.
+  enable_selective_actions = FALSE,
+
+  # Good for incremental cache behavior
+  ca_cache_mode = "by_symbol",
+
+  # First pass: do NOT gate splits
+  enable_split_plausibility_gate = FALSE,
+
+  split_gate_min = 0.05,
+  split_gate_max = 20
+))
+
+af2_log_cfg(cfg_dbg)
+
+# ----------------------------
+# Step 1 — Your known bad actors
+# ----------------------------
+sus <- c("AMER3","MGLU3","OIBR3","TIMS3","HAPV3","AURA33",
+         "ALZR11","HFOF11","RBVA11","TEPP11",
+         "NFLX34","WALM34","AVGO34")
+
+# ----------------------------
+# 04) Build a small recent universe window
+# ----------------------------
+types_all <- c("equity","fii","etf","bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - 365
+
+af2_log("AF2_DIAG04B:", "Universe window ", start_date, " to ", end_date)
+
+univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg_dbg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+# Restrict universe to suspects to reduce workload noise
+univ_sus <- univ[symbol %in% sus]
+
+af2_log("AF2_DIAG04B:", "Suspect rows=", nrow(univ_sus),
+        " symbols=", length(unique(univ_sus$symbol)))
+
+# ----------------------------
+# 05) Build adjusted panel via selective wrapper
+# ----------------------------
+res <- af2_build_panel_adj_selective(
+  universe_raw = univ_sus,
+  manual_events = NULL,
+  cfg = cfg_dbg,
+  from_ca = "2018-01-01",
+  to_ca   = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L,
+
+  # This now works after Patch 1
+  force_symbols = sus
+)
+
+panel_adj <- res$panel_adj
+af2_validate_panel_adj(panel_adj)
+
+# ----------------------------
+# PATCH C — Split-day shock sanity check (collision-proof)
+# ----------------------------
+# Goal:
+# On dates where a split exists:
+#   - raw close should show a large 1-day mechanical jump
+#   - adjusted close should show a much smaller jump
+#
+# This version avoids merge name collisions with panel_adj.
+
+events <- data.table::as.data.table(res$events)
+
+# Keep only actual split events (price factors != 1)
+spl_ev <- events[
+  is.finite(split_value) & split_value != 1,
+  .(
+    symbol,
+    refdate,
+    split_value_event = split_value,
+    source_mask_event = source_mask,
+    has_manual_event  = has_manual
+  )
+]
+
+panel_chk <- data.table::as.data.table(panel_adj)
+data.table::setorder(panel_chk, symbol, refdate)
+
+# Attach event-side split info WITHOUT clobbering any existing split_value
+panel_chk <- merge(
+  panel_chk,
+  spl_ev,
+  by = c("symbol", "refdate"),
+  all.x = TRUE
+)
+
+# Choose a unified split factor column for diagnostics:
+# Prefer the event table value when present; fall back to panel's split_value if it exists.
+panel_chk[, split_factor := split_value_event]
+
+if ("split_value" %in% names(panel_chk)) {
+  panel_chk[is.na(split_factor) & is.finite(split_value) & split_value != 1,
+            split_factor := split_value]
+}
+
+# Safety: ensure expected price columns exist
+need_cols <- c("close_raw", "close_adj_final")
+missing_cols <- setdiff(need_cols, names(panel_chk))
+if (length(missing_cols)) {
+  stop("PATCH C error: missing columns in panel_adj: ",
+       paste(missing_cols, collapse = ", "))
+}
+
+# Day-to-day ratios
+panel_chk[, `:=`(
+  raw_ratio = close_raw / data.table::shift(close_raw),
+  adj_ratio = close_adj_final / data.table::shift(close_adj_final)
+), by = symbol]
+
+# Scale-free shock size
+panel_chk[, `:=`(
+  raw_shock = abs(log(raw_ratio)),
+  adj_shock = abs(log(adj_ratio))
+)]
+
+# Only true split days
+split_days <- panel_chk[
+  is.finite(split_factor) & split_factor != 1
+]
+
+if (nrow(split_days)) {
+
+  cat("\nAF2_DIAG04B: Split-day shock summary",
+      "(expect adj_shock << raw_shock)\n")
+
+  by_sym <- split_days[, .(
+    n_split_days   = .N,
+    mean_raw_shock = mean(raw_shock, na.rm = TRUE),
+    mean_adj_shock = mean(adj_shock, na.rm = TRUE),
+    pct_improved   = mean(adj_shock < raw_shock, na.rm = TRUE)
+  ), by = symbol][order(-n_split_days, -pct_improved)]
+
+  print(by_sym)
+
+  cat("\nAF2_DIAG04B: Worst raw split-day jumps (top 20)\n")
+  print(
+    split_days[
+      order(-raw_shock)
+    ][1:min(20L, .N),
+      .(
+        symbol, refdate,
+        split_factor,
+        close_raw, raw_ratio, raw_shock,
+        close_adj_final, adj_ratio, adj_shock,
+        source_mask_event, has_manual_event
+      )
+    ]
+  )
+
+} else {
+  cat("\nAF2_DIAG04B: No split days found in this window.\n")
+}
+
+af2_log("AF2_DIAG04B:", "panel_adj rows=", nrow(panel_adj),
+        " symbols=", length(unique(panel_adj$symbol)))
+
+print(panel_adj[, .N, by = adjustment_state][order(-N)])
+
+
+
+###############################################################################
 ### FILE: scripts/05a_smoke_screener_real_small_window.R
 ###############################################################################
 # v2/scripts/05a_smoke_screener_real_small_window.R
@@ -3901,6 +4320,661 @@ af2_log("AF2_HARD05:", "Top 20 overall:")
 print(utils::head(res$full, 20))
 
 af2_log("AF2_HARD05:", "OK - hard selective full run finished.")
+
+
+
+###############################################################################
+### FILE: scripts/05c_hard_selective_split_audit.R
+###############################################################################
+# v2/scripts/05c_hard_selective_split_audit.R
+# Full-universe HARD diagnostic:
+# - Uses the real selective CA architecture
+# - Builds a full adjusted panel
+# - Audits split consistency at scale
+#
+# Goal:
+# Identify whether split misinterpretation / duplication / missing data
+# is systemic beyond your 13-symbol suspect list.
+
+# ----------------------------
+# 00) Core
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# data.table is assumed elsewhere, but load defensively
+suppressWarnings(suppressMessages({
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("data.table required for this script.")
+  }
+}))
+library(data.table)
+
+# ----------------------------
+# 00b) Audit knobs (edit here)
+# ----------------------------
+audit_cfg <- list(
+  # Universe length
+  lookback_days_universe = 730L,
+
+  # RAW-gap thresholds for "split-like" candidates
+  # We intentionally use multiple cutoffs to avoid a single presumptive band.
+  raw_ratio_bands = list(
+    band1 = c(0.20, 5.00),
+    band2 = c(0.10, 10.0),
+    band3 = c(0.05, 20.0)
+  ),
+
+  # What counts as "raw barely moved"
+  # Used to flag suspicious split events that don't match COTAHIST reality.
+  small_move_band = c(0.80, 1.25),
+
+  # How many rows to print for each suspicious bucket
+  top_n_print = 25L
+)
+
+# ----------------------------
+# 00c) Real architecture config (selective ON)
+# ----------------------------
+cfg <- af2_get_config(list(
+  enable_selective_actions = TRUE,
+  ca_cache_mode = "by_symbol",
+
+  # Keep prefilter limits realistic for full run
+  ca_prefilter_top_n_overall   = 200L,
+  ca_prefilter_top_n_by_type   = 50L,
+  ca_prefilter_max_candidates  = 300L,
+
+  # IMPORTANT:
+  # For this audit we want to SEE Yahoo behavior,
+  # not suppress it. So keep this OFF here.
+  enable_split_plausibility_gate = FALSE
+))
+
+af2_log_cfg(cfg)
+
+# ----------------------------
+# 01) Universe (rb3)
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+types_all <- c("equity", "fii", "etf", "bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - as.integer(audit_cfg$lookback_days_universe)
+
+af2_log("AF2_AUDIT05C:", "Universe window ", as.character(start_date),
+        " to ", as.character(end_date))
+
+dt_univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+af2_log("AF2_AUDIT05C:", "Universe rows=", nrow(dt_univ),
+        " symbols=", length(unique(dt_univ$symbol)))
+
+# ----------------------------
+# 02) Corporate actions + Adjuster (selective wrapper)
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+source("v2/modules/03_corporate_actions/R/select_candidates.R")
+
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/build_panel_adj_selective.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+af2_log("AF2_AUDIT05C:", "Building adjusted panel with selective Yahoo registry...")
+
+res_adj <- af2_build_panel_adj_selective(
+  universe_raw = dt_univ,
+  manual_events = NULL,
+  cfg = cfg,
+  from_ca = "2018-01-01",
+  to_ca   = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L
+)
+
+panel_adj <- as.data.table(res_adj$panel_adj)
+events    <- as.data.table(res_adj$events)
+
+af2_validate_panel_adj(panel_adj)
+
+af2_log("AF2_AUDIT05C:", "panel_adj rows=", nrow(panel_adj),
+        " symbols=", length(unique(panel_adj$symbol)))
+af2_log("AF2_AUDIT05C:", "events rows=", nrow(events),
+        " symbols=", length(unique(events$symbol)))
+
+# Defensive: ensure we have the expected columns
+needed_panel <- c("symbol","refdate","asset_type","close_raw","close_adj_final")
+missing_panel <- setdiff(needed_panel, names(panel_adj))
+if (length(missing_panel)) {
+  af2_log("AF2_AUDIT05C:", "ERROR: panel missing cols: ",
+          paste(missing_panel, collapse = ", "))
+  stop("panel_adj missing required columns for audit.")
+}
+
+needed_events <- c("symbol","refdate","split_value","source_mask","has_manual")
+missing_events <- setdiff(needed_events, names(events))
+if (length(missing_events)) {
+  af2_log("AF2_AUDIT05C:", "ERROR: events missing cols: ",
+          paste(missing_events, collapse = ", "))
+  stop("events missing required columns for audit.")
+}
+
+# ----------------------------
+# 03) Build RAW and ADJ shock series
+# ----------------------------
+setorder(panel_adj, symbol, refdate)
+
+panel_adj[, raw_ratio := close_raw / shift(close_raw, 1L), by = symbol]
+panel_adj[, adj_ratio := close_adj_final / shift(close_adj_final, 1L), by = symbol]
+
+panel_adj[, raw_shock := abs(log(raw_ratio))]
+panel_adj[, adj_shock := abs(log(adj_ratio))]
+
+# Clean impossible rows
+panel_adj <- panel_adj[
+  is.finite(raw_ratio) & raw_ratio > 0 &
+  is.finite(adj_ratio) & adj_ratio > 0
+]
+
+# ----------------------------
+# 04) Event-driven split days
+# ----------------------------
+ev_splits <- events[is.finite(split_value) & split_value != 1]
+
+# Join split info into panel on same date
+panel_ev <- merge(
+  panel_adj,
+  ev_splits[, .(symbol, refdate, split_factor = split_value,
+                source_mask_event = source_mask,
+                has_manual_event = has_manual)],
+  by = c("symbol","refdate"),
+  all.x = TRUE
+)
+
+panel_ev[, is_split_day_event := !is.na(split_factor)]
+
+af2_log("AF2_AUDIT05C:", "Event-driven split days detected: ",
+        uniqueN(panel_ev[is_split_day_event == TRUE, .(symbol, refdate)]),
+        " (symbol-date pairs)")
+
+# ----------------------------
+# 05) RAW-gap-driven split-like candidates
+# ----------------------------
+make_raw_candidates <- function(dt, band, label) {
+  lo <- band[1]; hi <- band[2]
+  out <- dt[
+    raw_ratio < lo | raw_ratio > hi,
+    .(symbol, refdate, asset_type, close_raw,
+      raw_ratio, raw_shock, adj_ratio, adj_shock)
+  ]
+  out[, band_label := label]
+  out
+}
+
+raw_cands <- rbindlist(lapply(names(audit_cfg$raw_ratio_bands), function(nm) {
+  make_raw_candidates(panel_ev, audit_cfg$raw_ratio_bands[[nm]], nm)
+}), use.names = TRUE, fill = TRUE)
+
+af2_log("AF2_AUDIT05C:", "RAW-gap candidates (any band): ",
+        nrow(raw_cands), " rows in total across bands.")
+
+# ----------------------------
+# 06) Coverage diagnostics (FIXED)
+# ----------------------------
+
+# Build a unique key of raw-gap symbol-date by band
+raw_cands_key <- unique(raw_cands[, .(symbol, refdate, band_label)])
+
+# Attach whether registry says that symbol-date is a split day
+raw_cands_key <- merge(
+  raw_cands_key,
+  panel_ev[, .(symbol, refdate, is_split_day_event)],
+  by = c("symbol","refdate"),
+  all.x = TRUE
+)
+
+raw_cands_key[is.na(is_split_day_event), is_split_day_event := FALSE]
+
+# Summarize coverage per band
+cov_by_band <- raw_cands_key[
+  , .(
+    n_rows = .N,
+    n_symbols = uniqueN(symbol),
+    n_rows_with_event = sum(is_split_day_event),
+    pct_rows_with_event = round(mean(is_split_day_event), 4)
+  ),
+  by = band_label
+][order(band_label)]
+
+af2_log("AF2_AUDIT05C:", "Coverage of RAW-gap candidates by registry splits:")
+print(cov_by_band)
+
+# ----------------------------
+# 07) Suspicion buckets
+# ----------------------------
+small_lo <- audit_cfg$small_move_band[1]
+small_hi <- audit_cfg$small_move_band[2]
+
+# A) "Bad split event" suspects:
+# Event says split, but raw barely moved
+bad_event <- panel_ev[
+  is_split_day_event == TRUE &
+    raw_ratio >= small_lo & raw_ratio <= small_hi,
+  .(symbol, refdate, asset_type,
+    split_factor,
+    raw_ratio, raw_shock,
+    adj_ratio, adj_shock,
+    close_raw, close_adj_final,
+    source_mask_event, has_manual_event)
+]
+
+# B) "Missing split" suspects:
+# Raw shows huge jump (use the middle band by default),
+# but no event split recorded
+band_mid <- "band1"
+miss_event <- raw_cands_key[
+  band_label == band_mid &
+    is_split_day_event == FALSE
+][
+  panel_ev, on = .(symbol, refdate), nomatch = 0L
+][
+  , .(symbol, refdate, asset_type,
+      raw_ratio, raw_shock,
+      adj_ratio, adj_shock,
+      close_raw, close_adj_final)
+]
+
+# C) "Harmful adjustment" suspects:
+# On event split days, adjusted shock worse than raw shock
+harm_event <- panel_ev[
+  is_split_day_event == TRUE &
+    is.finite(adj_shock) & is.finite(raw_shock) &
+    adj_shock > raw_shock,
+  .(symbol, refdate, asset_type,
+    split_factor,
+    raw_ratio, raw_shock,
+    adj_ratio, adj_shock,
+    close_raw, close_adj_final,
+    source_mask_event, has_manual_event)
+]
+
+# ----------------------------
+# 08) Summaries that are not just raw tables
+# ----------------------------
+af2_log("AF2_AUDIT05C:", "==================== SUMMARY ====================")
+
+# 08a) Counts by asset type
+af2_log("AF2_AUDIT05C:", "Split events by asset_type (event-driven):")
+print(ev_splits[panel_adj[, .(symbol, asset_type)], on = "symbol",
+               nomatch = 0L][
+  , .N, by = asset_type
+][order(-N)])
+
+# 08b) How often adjustment improves on event split days
+event_day_metrics <- panel_ev[
+  is_split_day_event == TRUE,
+  .(
+    n_split_days = .N,
+    mean_raw_shock = mean(raw_shock, na.rm = TRUE),
+    mean_adj_shock = mean(adj_shock, na.rm = TRUE),
+    pct_improved = mean(adj_shock < raw_shock, na.rm = TRUE)
+  ),
+  by = symbol
+][order(-mean_raw_shock)]
+
+af2_log("AF2_AUDIT05C:",
+        "Event split-day shock summary (expect mean_adj_shock << mean_raw_shock).")
+print(head(event_day_metrics, audit_cfg$top_n_print))
+
+# 08c) Bucket summaries
+af2_log("AF2_AUDIT05C:", "Potential BAD split events (event says split, raw small move).")
+af2_log("AF2_AUDIT05C:",
+        "Count rows=", nrow(bad_event),
+        " symbols=", uniqueN(bad_event$symbol))
+if (nrow(bad_event)) {
+  print(head(bad_event[order(-adj_shock)], audit_cfg$top_n_print))
+}
+
+af2_log("AF2_AUDIT05C:", "Potential MISSING splits (raw big move, no event) using band1.")
+af2_log("AF2_AUDIT05C:",
+        "Count rows=", nrow(miss_event),
+        " symbols=", uniqueN(miss_event$symbol))
+if (nrow(miss_event)) {
+  print(head(miss_event[order(-raw_shock)], audit_cfg$top_n_print))
+}
+
+af2_log("AF2_AUDIT05C:", "Potential HARMFUL split adjustments (adj_shock > raw_shock on event days).")
+af2_log("AF2_AUDIT05C:",
+        "Count rows=", nrow(harm_event),
+        " symbols=", uniqueN(harm_event$symbol))
+if (nrow(harm_event)) {
+  print(head(harm_event[order(-adj_shock)], audit_cfg$top_n_print))
+}
+
+# 08d) Global rates
+global_event_pairs <- uniqueN(panel_ev[is_split_day_event == TRUE, .(symbol, refdate)])
+global_harm_pairs  <- uniqueN(harm_event[, .(symbol, refdate)])
+
+af2_log("AF2_AUDIT05C:", "Global event split-day pairs=", global_event_pairs)
+af2_log("AF2_AUDIT05C:", "Global harmful event pairs=", global_harm_pairs)
+af2_log("AF2_AUDIT05C:",
+        "Harmful rate on event split days=",
+        if (global_event_pairs > 0) round(global_harm_pairs / global_event_pairs, 4) else NA_real_)
+
+# 08e) Cross-check: how many raw-gap candidates exist vs registry splits
+af2_log("AF2_AUDIT05C:", "RAW-gap band coverage recap:")
+print(cov_by_band)
+
+af2_log("AF2_AUDIT05C:", "================== END SUMMARY ==================")
+
+# ----------------------------
+# 09) Optional: feed adjusted panel into screener
+# ----------------------------
+source("v2/modules/05_screener/R/screener_config.R")
+source("v2/modules/05_screener/R/validate_screener_input.R")
+source("v2/modules/05_screener/R/liquidity_filter.R")
+source("v2/modules/05_screener/R/compute_metrics.R")
+source("v2/modules/05_screener/R/score_rank.R")
+source("v2/modules/05_screener/R/run_screener.R")
+
+af2_log("AF2_AUDIT05C:", "Running screener on full adjusted panel...")
+
+res <- af2_run_screener(
+  panel_ev, # includes raw/adj ratios + split flags, harmless
+  config = list(
+    lookback_days = 252L,
+    horizons_days = c(21L, 63L, 126L, 252L)
+  ),
+  allow_unresolved = NULL
+)
+
+af2_log("AF2_AUDIT05C:", "Top 20 overall:")
+print(utils::head(res$full, 20))
+
+af2_log("AF2_AUDIT05C:", "OK - hard selective split audit finished.")
+
+
+
+###############################################################################
+### FILE: scripts/05d_yahoo_vs_af2_crosscheck.R
+###############################################################################
+# v2/scripts/05d_yahoo_vs_af2_crosscheck.R
+# Robust cross-check AF2 adjusted prices vs Yahoo:
+#  - raw close from Yahoo
+#  - Yahoo's own Adjusted column (Ad)
+#  - adjustOHLC reconstruction (with symbol.name)
+
+# ----------------------------
+# 00) Core + config
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+cfg <- af2_get_config(list(
+  enable_selective_actions = TRUE,
+  ca_cache_mode = "by_symbol",
+  enable_split_plausibility_gate = FALSE,
+  # NEW:
+  enable_split_gap_validation = TRUE,
+  split_gap_tol_log = 0.35
+))
+af2_log_cfg(cfg)
+
+# ----------------------------
+# 01) Universe
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+# ----------------------------
+# 02) Corporate actions + Adjuster
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+source("v2/modules/03_corporate_actions/R/select_candidates.R")
+
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/build_panel_adj_selective.R")
+
+# ----------------------------
+# 03) Packages
+# ----------------------------
+suppressWarnings({
+  library(data.table)
+  library(quantmod)
+})
+
+# ----------------------------
+# 04) Suspects
+# ----------------------------
+sus <- c("AMER3","TIMS3","ALZR11","HAPV3","OIBR3",
+         "MGLU3","NFLX34","AVGO34","WALM34","AURA33")
+
+types_all <- c("equity","fii","etf","bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - 730
+
+af2_log("AF2_YX05D:", "Universe window ", start_date, " to ", end_date)
+
+univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+univ_sus <- univ[symbol %in% sus]
+
+res_adj <- tryCatch(
+  af2_build_panel_adj_selective(
+    universe_raw = univ_sus,
+    manual_events = NULL,
+    cfg = cfg,
+    from_ca = "2018-01-01",
+    to_ca   = Sys.Date(),
+    verbose = TRUE,
+    use_cache = TRUE,
+    force_refresh = FALSE,
+    n_workers = 1L,
+    force_symbols = sus
+  ),
+  error = function(err) {
+    af2_log("AF2_YX05D:", "ERROR building AF2 panel: ", conditionMessage(err))
+    stop(conditionMessage(err), call. = FALSE)
+  }
+)
+
+panel <- as.data.table(res_adj$panel_adj)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+as_dt_series <- function(vec_xts, symbol_clean, colname) {
+  if (is.null(vec_xts) || NROW(vec_xts) == 0) return(NULL)
+  dt <- data.table(
+    symbol  = symbol_clean,
+    refdate = as.Date(index(vec_xts))
+  )
+  dt[[colname]] <- as.numeric(vec_xts)
+  dt
+}
+
+safe_adjustOHLC <- function(x, ysym) {
+  # Most precise method: rebuild using getSplits/getDividends
+  # But MUST pass symbol.name when auto.assign=FALSE
+  tryCatch(
+    adjustOHLC(x, use.Adjusted = FALSE, symbol.name = ysym),
+    error = function(e) NULL
+  )
+}
+
+# ----------------------------
+# 05) Per-symbol cross-check
+# ----------------------------
+out_list <- list()
+
+for (s in sus) {
+  ysym <- paste0(s, ".SA")
+
+  af2_log("AF2_YX05D:", "--------------------------------------------")
+  af2_log("AF2_YX05D:", "Yahoo fetch for ", ysym)
+
+  x <- tryCatch(
+    getSymbols(ysym, src = "yahoo", from = start_date, to = end_date,
+               auto.assign = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(x) || NROW(x) == 0) {
+    af2_log("AF2_YX05D:", "WARNING: Yahoo OHLC missing for ", ysym)
+    next
+  }
+
+  # Direct presence checks
+  sp <- tryCatch(getSplits(ysym), error = function(e) NULL)
+  dv <- tryCatch(getDividends(ysym), error = function(e) NULL)
+
+  af2_log("AF2_YX05D:", "getSplits rows for ", s, ": ", if (is.null(sp)) 0 else NROW(sp))
+  af2_log("AF2_YX05D:", "getDividends rows for ", s, ": ", if (is.null(dv)) 0 else NROW(dv))
+
+  # 1) Yahoo raw close
+  dt_y_raw <- as_dt_series(Cl(x), s, "close_y_raw")
+
+  # 2) Yahoo Adjusted column close (if present)
+  dt_y_adjcol <- NULL
+  adj_vec <- tryCatch(Ad(x), error = function(e) NULL)
+  dt_y_adjcol <- as_dt_series(adj_vec, s, "close_y_adjcol")
+
+  # 3) adjustOHLC reconstructed adjusted close
+  x_adj <- safe_adjustOHLC(x, ysym)
+  dt_y_adjcalc <- as_dt_series(if (!is.null(x_adj)) Cl(x_adj) else NULL, s, "close_y_adjcalc")
+
+  # Start merge with raw
+  dt <- dt_y_raw
+
+  if (!is.null(dt_y_adjcol)) {
+    dt <- merge(dt, dt_y_adjcol, by = c("symbol","refdate"), all = TRUE)
+  }
+  if (!is.null(dt_y_adjcalc)) {
+    dt <- merge(dt, dt_y_adjcalc, by = c("symbol","refdate"), all = TRUE)
+  }
+
+  # AF2 data
+  # Pull TRUE raw straight from the universe window (Cotahist)
+  dt_b3 <- univ_sus[symbol == s, .(
+    symbol, refdate,
+    close_b3_raw = close
+  )]
+
+  # AF2 final from the adjusted panel
+  dt_af2 <- panel[symbol == s, .(
+    symbol, refdate,
+    close_af2_final = close_adj_final
+  )]
+
+  dt_af2 <- merge(dt_b3, dt_af2, by = c("symbol","refdate"), all = TRUE)
+  dt <- merge(dt, dt_af2, by = c("symbol","refdate"), all = TRUE)
+
+
+  # Log-diff diagnostics (guarded)
+  dt[, diff_af2_vs_y_adjcol := ifelse(
+    is.finite(close_af2_final) & is.finite(close_y_adjcol) & close_af2_final > 0 & close_y_adjcol > 0,
+    log(close_af2_final) - log(close_y_adjcol),
+    NA_real_
+  )]
+
+  dt[, diff_af2_vs_y_adjcalc := ifelse(
+    is.finite(close_af2_final) & is.finite(close_y_adjcalc) & close_af2_final > 0 & close_y_adjcalc > 0,
+    log(close_af2_final) - log(close_y_adjcalc),
+    NA_real_
+  )]
+
+  dt[, diff_b3raw_vs_yraw := ifelse(
+    is.finite(close_b3_raw) & is.finite(close_y_raw) & close_b3_raw > 0 & close_y_raw > 0,
+    log(close_b3_raw) - log(close_y_raw),
+    NA_real_
+  )]
+
+  # Summaries
+  sm1 <- dt[!is.na(diff_af2_vs_y_adjcol), .(
+    n = .N,
+    mean_abs_log_diff = mean(abs(diff_af2_vs_y_adjcol), na.rm = TRUE),
+    max_abs_log_diff  = max(abs(diff_af2_vs_y_adjcol), na.rm = TRUE)
+  )]
+  sm1[, method := "AF2 vs Yahoo Adjusted column"]
+
+  sm2 <- dt[!is.na(diff_af2_vs_y_adjcalc), .(
+    n = .N,
+    mean_abs_log_diff = mean(abs(diff_af2_vs_y_adjcalc), na.rm = TRUE),
+    max_abs_log_diff  = max(abs(diff_af2_vs_y_adjcalc), na.rm = TRUE)
+  )]
+  sm2[, method := "AF2 vs adjustOHLC(rebuilt)"]
+
+  sm3 <- dt[!is.na(diff_b3raw_vs_yraw), .(
+    n = .N,
+    mean_abs_log_diff = mean(abs(diff_b3raw_vs_yraw), na.rm = TRUE),
+    max_abs_log_diff  = max(abs(diff_b3raw_vs_yraw), na.rm = TRUE)
+  )]
+  sm3[, method := "B3 raw vs Yahoo raw"]
+
+  sm <- rbindlist(list(sm1, sm2, sm3), use.names = TRUE, fill = TRUE)
+  sm[, symbol := s]
+
+  af2_log("AF2_YX05D:", "Summary diagnostics for ", s)
+  print(sm)
+
+  # At this point, 'dt' already contains:
+  # - Yahoo raw
+  # - Yahoo Adjusted column
+  # - Yahoo adjustOHLC rebuild
+  # and we then merged AF2/B3 into it.
+  dt_final <- copy(dt)
+
+  out_list[[s]] <- dt_final
+}
+
+af2_log("AF2_YX05D:", "Done. Inspect out_list for per-symbol tables.")
 
 
 

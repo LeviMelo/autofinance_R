@@ -64,7 +64,11 @@ af2_config_default <- list(
   # -------------------------------
   enable_split_plausibility_gate = TRUE,
   split_gate_min = 0.05,  # conservative, allows 20:1
-  split_gate_max = 10.0   # conservative, allows 1:10 reverse
+  split_gate_max = 10.0,  # conservative, allows 1:10 reverse
+
+  # Split-gap validation against raw
+  enable_split_gap_validation = TRUE,
+  split_gap_tol_log = 0.35
 
 )
 
@@ -94,6 +98,9 @@ af2_get_config <- function(config = NULL) {
   cfg$ca_prefilter_top_n_overall <- as.integer(cfg$ca_prefilter_top_n_overall %||% 200L)
   cfg$ca_prefilter_top_n_by_type <- as.integer(cfg$ca_prefilter_top_n_by_type %||% 50L)
   cfg$ca_prefilter_max_candidates <- as.integer(cfg$ca_prefilter_max_candidates %||% 300L)
+
+  cfg$enable_split_gap_validation <- isTRUE(cfg$enable_split_gap_validation)
+  cfg$split_gap_tol_log <- as.numeric(cfg$split_gap_tol_log %||% 0.35)
 
   cfg
 }
