@@ -62,7 +62,7 @@ af2_config_default <- list(
   # Typical forward splits: 0.5, 0.333..., 0.2
   # Typical reverse splits: 2, 5, 10 (rare)
   # -------------------------------
-  enable_split_plausibility_gate = TRUE,
+  enable_split_plausibility_gate = FALSE,
   split_gate_min = 0.05,  # conservative, allows 20:1
   split_gate_max = 10.0,  # conservative, allows 1:10 reverse
 

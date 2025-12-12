@@ -2,200 +2,197 @@
 # High-level wrapper implementing the selective Yahoo "trick".
 
 # ------------------------------------------------------------
-# PATCH D2 helper:
-# Validate and auto-orient Yahoo split values using Cotahist raw.
-# Works even if getSplits() mixes conventions across symbols.
+# Split-gap validator + snapper for Yahoo splits
+# - snaps split refdate forward to next trading day (<= max_fwd_days)
+# - normalizes Yahoo split "value" orientation (ratio vs price-factor)
+# - rejects splits that do not match raw jump (within tol_log)
+# - returns BOTH: cleaned corp_actions + split_audit table
 # ------------------------------------------------------------
 af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
                                                universe_raw,
                                                cfg = NULL,
                                                verbose = TRUE) {
+
   cfg <- cfg %||% af2_get_config()
 
   ca <- data.table::as.data.table(corp_actions)
-  if (!nrow(ca)) {
-    return(list(corp_actions = ca, split_audit = data.table::data.table()))
-  }
-
   dt <- data.table::as.data.table(universe_raw)
+
+  if (!nrow(ca)) {
+    return(list(corp_actions = ca, split_audit = NULL))
+  }
   if (!nrow(dt)) {
-    return(list(corp_actions = ca, split_audit = data.table::data.table()))
+    return(list(corp_actions = ca, split_audit = NULL))
   }
 
-  # Required columns
   af2_assert_cols(ca, c("symbol","refdate","action_type","value","source"), name = "corp_actions")
   af2_assert_cols(dt, c("symbol","refdate","open","close"), name = "universe_raw")
 
-  # Normalize
+  # normalize
   ca[, symbol := toupper(trimws(as.character(symbol)))]
-  ca[, refdate := as.Date(refdate)]
   ca[, action_type := tolower(trimws(as.character(action_type)))]
   ca[, source := tolower(trimws(as.character(source)))]
+  ca[, refdate := as.Date(refdate)]
   ca[, value := as.numeric(value)]
 
   dt[, symbol := toupper(trimws(as.character(symbol)))]
   dt[, refdate := as.Date(refdate)]
+  dt[, open := as.numeric(open)]
+  dt[, close := as.numeric(close)]
 
-  # Only Yahoo splits with positive numeric values
-  ys <- ca[action_type == "split" & source == "yahoo" & is.finite(value) & value > 0,
-           .(symbol, vendor_refdate = refdate, yahoo_value = value)]
+  # Only Yahoo split rows are validated/snapped
+  ys <- ca[
+    action_type == "split" &
+      source == "yahoo" &
+      is.finite(value) & value > 0 &
+      !is.na(refdate)
+  ]
+
   if (!nrow(ys)) {
-    return(list(corp_actions = ca, split_audit = data.table::data.table()))
+    return(list(corp_actions = ca, split_audit = data.table::data.table()[0]))
   }
-  ys[, row_id := .I]
 
-  # Build raw trading-day table + neighbor prices
-  raw <- dt[, .(
-    symbol,
-    refdate,
-    open  = suppressWarnings(as.numeric(open)),
-    close = suppressWarnings(as.numeric(close))
-  )]
-  data.table::setorder(raw, symbol, refdate)
-  raw[, close_prev := data.table::shift(close, 1L), by = symbol]
-  raw[, refdate_prev := data.table::shift(refdate, 1L), by = symbol]
-  raw[, close_next := data.table::shift(close, -1L), by = symbol]
-
-  # Non-equi join: snap vendor_refdate to the first B3 trading day >= vendor_refdate
-  data.table::setkey(raw, symbol, refdate)
-  snapped <- raw[ys, on = .(symbol, refdate >= vendor_refdate), mult = "first", nomatch = NA]
-
-  # Config knobs
+  # knobs
   tol <- as.numeric(cfg$split_gap_tol_log %||% 0.35)
   if (!is.finite(tol) || tol <= 0) tol <- 0.35
 
-  max_fwd <- as.integer(cfg$split_gap_max_forward_days %||% 5L)
-  if (!is.finite(max_fwd) || max_fwd < 0L) max_fwd <- 5L
+  max_fwd <- as.integer(cfg$split_gap_max_forward_days %||% 0L)
+  if (!is.finite(max_fwd) || max_fwd < 0L) max_fwd <- 0L
 
-  use_open <- isTRUE(cfg$split_gap_use_open)
+  use_open <- isTRUE(cfg$split_gap_use_open %||% FALSE)
+
+  # prep raw grid (keyed) + prev close
+  data.table::setorder(dt, symbol, refdate)
+  data.table::setkey(dt, symbol, refdate)
+  dt[, close_prev := data.table::shift(close, 1L), by = symbol]
+
+  # create a per-row id so audit is stable
+  ys_key <- ys[, .(
+    row_id = .I,
+    symbol,
+    vendor_refdate = refdate,
+    yahoo_value = value,
+    yahoo_symbol = if ("yahoo_symbol" %in% names(ys)) as.character(yahoo_symbol) else NA_character_
+  )]
+  data.table::setkey(ys_key, symbol, vendor_refdate)
+
+  # snap vendor_refdate -> next trading refdate (<= max_fwd days)
+  # roll = -N rolls forward (next observation) up to N days
+  snapped <- dt[ys_key,
+    on      = .(symbol, refdate = vendor_refdate),
+    roll    = -max_fwd,
+    nomatch = NA,
+    .(
+      row_id         = i.row_id,
+      symbol         = i.symbol,
+      yahoo_symbol   = i.yahoo_symbol,
+      vendor_refdate = i.vendor_refdate,
+      eff_refdate    = refdate,
+      lag_days       = as.integer(refdate - i.vendor_refdate),
+      open           = open,
+      close          = close,
+      close_prev     = close_prev,
+      yahoo_value    = i.yahoo_value
+    )
+  ]
 
   safe_log <- function(x) ifelse(is.finite(x) & x > 0, log(x), NA_real_)
 
-  # Observed raw ratios around the snapped effective date
-  # We treat the observable as POST/PRE (a price-factor-like ratio):
-  # - split 2-for-1 -> ~0.5
-  # - reverse 1-for-10 -> ~10
-  snapped[, eff_refdate := refdate]
-  snapped[, lag_days := as.integer(eff_refdate - vendor_refdate)]
-
-  snapped[, ratio_close := ifelse(
-    is.finite(close_prev) & close_prev > 0 & is.finite(close) & close > 0,
-    close / close_prev, NA_real_
+  # observed raw ratios (post/pre)
+  snapped[, ratio_cc := data.table::fifelse(
+    is.finite(close) & is.finite(close_prev) & close_prev > 0,
+    close / close_prev,
+    NA_real_
   )]
 
-  snapped[, ratio_open := ifelse(
-    use_open &
-      is.finite(close_prev) & close_prev > 0 &
-      is.finite(open) & open > 0,
-    open / close_prev, NA_real_
-  )]
-
-  snapped[, ratio_next := ifelse(
-    is.finite(close) & close > 0 &
-      is.finite(close_next) & close_next > 0,
-    close_next / close, NA_real_
+  snapped[, ratio_oc := data.table::fifelse(
+    use_open & is.finite(open) & is.finite(close_prev) & close_prev > 0,
+    open / close_prev,
+    NA_real_
   )]
 
   snapped[, log_v   := safe_log(yahoo_value)]
   snapped[, log_inv := safe_log(1 / yahoo_value)]
+  snapped[, log_cc  := safe_log(ratio_cc)]
+  snapped[, log_oc  := safe_log(ratio_oc)]
 
-  # Hypothesis errors:
-  # H_val: Yahoo value already matches observed ratio
-  # H_inv: 1/Yahoo matches observed ratio
-  snapped[, e1v := abs(safe_log(ratio_open)  - log_v)]
-  snapped[, e2v := abs(safe_log(ratio_close) - log_v)]
-  snapped[, e3v := abs(safe_log(ratio_next)  - log_v)]
+  # errors for two hypotheses:
+  # Hval: yahoo_value already equals PRICE RATIO (price factor)
+  # Hinv: 1/yahoo_value equals PRICE RATIO (yahoo_value is split "ratio")
+  snapped[, err_val := abs(log_cc - log_v)]
+  if (use_open) snapped[, err_val := pmin(err_val, abs(log_oc - log_v), na.rm = TRUE)]
 
-  snapped[, e1i := abs(safe_log(ratio_open)  - log_inv)]
-  snapped[, e2i := abs(safe_log(ratio_close) - log_inv)]
-  snapped[, e3i := abs(safe_log(ratio_next)  - log_inv)]
+  snapped[, err_inv := abs(log_cc - log_inv)]
+  if (use_open) snapped[, err_inv := pmin(err_inv, abs(log_oc - log_inv), na.rm = TRUE)]
 
-  snapped[, err_val := pmin(e1v, e2v, e3v, na.rm = TRUE)]
-  snapped[!is.finite(err_val), err_val := NA_real_]
+  snapped[, chosen_value := data.table::fifelse(err_inv < err_val, 1 / yahoo_value, yahoo_value)]
+  snapped[, chosen_err   := pmin(err_val, err_inv, na.rm = TRUE)]
 
-  snapped[, err_inv := pmin(e1i, e2i, e3i, na.rm = TRUE)]
-  snapped[!is.finite(err_inv), err_inv := NA_real_]
+  # validity
+  snapped[, has_prices := is.finite(chosen_err) & !is.na(chosen_err)]
+  snapped[, is_snapped := !is.na(eff_refdate) & is.finite(lag_days) & lag_days >= 0 & lag_days <= max_fwd]
 
-  # Choose orientation -> ALWAYS normalize to "price factor" space
-  snapped[, chosen_as := data.table::fifelse(
-    !is.na(err_inv) & (is.na(err_val) | err_inv < err_val),
-    "inverse",
-    "as_is"
+  snapped[, status := data.table::fifelse(
+    !is_snapped | !has_prices, "unverified",
+    data.table::fifelse(chosen_err <= tol, "kept", "rejected")
   )]
 
-  snapped[, chosen_value := data.table::fifelse(
-    chosen_as == "inverse",
-    1 / yahoo_value,
-    yahoo_value
-  )]
-
-  snapped[, chosen_err := pmin(err_val, err_inv, na.rm = TRUE)]
-  snapped[!is.finite(chosen_err), chosen_err := NA_real_]
-
-  # Decide status:
-  # - unverified if we cannot safely compute a raw ratio in this universe_raw window
-  # - kept if it matches raw within tol
-  # - dropped if raw exists but contradicts
-  snapped[, status := "unverified_no_raw_window"]
-
-  can_check <- !is.na(eff_refdate) &
-    !is.na(refdate_prev) &
-    is.finite(close_prev) & close_prev > 0 &
-    !is.na(chosen_err) &
-    (is.na(lag_days) | lag_days <= max_fwd)
-
-  snapped[can_check == TRUE & chosen_err <= tol, status := "kept_oriented"]
-  snapped[can_check == TRUE & chosen_err >  tol, status := "dropped_conflict_raw_gap"]
-
-  # Audit table
-  audit <- snapped[, .(
-    symbol,
-    vendor_refdate,
-    eff_refdate,
-    pre_refdate = refdate_prev,
+  split_audit <- snapped[, .(
+    symbol, yahoo_symbol,
+    vendor_refdate, eff_refdate, lag_days,
     yahoo_value,
     chosen_value,
-    chosen_as,
     chosen_err,
-    tol_log = tol,
-    lag_days,
-    ratio_open,
-    ratio_close,
-    ratio_next,
     status
   )]
 
-  # Apply updates to corp_actions:
-  # - For kept: snap refdate -> eff_refdate (if present) and set value -> chosen_value
-  # - For dropped: remove the Yahoo split row
-  kept <- audit[status == "kept_oriented" & !is.na(eff_refdate),
-                .(symbol, refdate_old = vendor_refdate, refdate_new = eff_refdate, value_new = chosen_value)]
+  # apply changes:
+  # - kept: snap refdate -> eff_refdate, normalize value -> chosen_value
+  # - rejected: drop split row
+  # - unverified: keep as-is (do NOT drop; do NOT change)
+  kept <- snapped[status == "kept" & is_snapped == TRUE & has_prices == TRUE]
+  rej  <- snapped[status == "rejected"]
 
   if (nrow(kept)) {
-    ca[kept,
-       on = .(symbol, refdate = refdate_old, action_type = "split", source = "yahoo"),
-       `:=`(refdate = i.refdate_new, value = i.value_new)]
+    upd <- kept[, .(
+      symbol,
+      refdate_old = vendor_refdate,
+      refdate_new = eff_refdate,
+      value_new   = chosen_value,
+      action_type = "split",
+      source      = "yahoo"
+    )]
+
+    ca[upd,
+      on = .(symbol, refdate = refdate_old, action_type, source),
+      `:=`(refdate = i.refdate_new, value = i.value_new)
+    ]
   }
 
-  dropped <- audit[status == "dropped_conflict_raw_gap",
-                   .(symbol, refdate_old = vendor_refdate)]
-  if (nrow(dropped)) {
-    ca <- ca[!dropped, on = .(symbol, refdate = refdate_old, action_type = "split", source = "yahoo")]
+  if (nrow(rej)) {
+    bad <- unique(rej[, .(
+      symbol,
+      refdate = vendor_refdate,
+      action_type = "split",
+      source = "yahoo"
+    )])
+    ca <- ca[!bad, on = .(symbol, refdate, action_type, source)]
   }
 
   if (verbose) {
-    n_keep <- sum(audit$status == "kept_oriented", na.rm = TRUE)
-    n_drop <- sum(audit$status == "dropped_conflict_raw_gap", na.rm = TRUE)
-    n_unv  <- sum(audit$status == "unverified_no_raw_window", na.rm = TRUE)
-
-    af2_log("AF2_CA_PREF:",
-            "Split-gap validation: kept=", n_keep,
-            " dropped=", n_drop,
-            " unverified=", n_unv,
-            " (tol_log=", tol, ", max_fwd_days=", max_fwd, ", use_open=", use_open, ")")
+    af2_log(
+      "AF2_CA_PREF:",
+      "Split-gap validation: snapped= ", nrow(snapped),
+      "  kept= ", nrow(kept),
+      "  rejected= ", nrow(rej),
+      "  unverified= ", sum(split_audit$status == "unverified"),
+      "  (tol_log= ", tol,
+      " , max_fwd_days= ", max_fwd,
+      " , use_open= ", use_open, " )"
+    )
   }
 
-  list(corp_actions = ca, split_audit = audit)
+  list(corp_actions = ca, split_audit = split_audit)
 }
 
 af2_build_panel_adj_selective <- function(universe_raw,
@@ -266,19 +263,29 @@ af2_build_panel_adj_selective <- function(universe_raw,
   # against Cotahist raw gaps (auto-orient + drop)
   # -------------------------------
   split_audit <- NULL
-
+  
   if (!is.null(ca) && nrow(ca) &&
       isTRUE(cfg$enable_split_gap_validation)) {
-
-    tmp <- af2_ca_fix_yahoo_splits_by_raw_gap(
+  
+    fix <- af2_ca_fix_yahoo_splits_by_raw_gap(
       corp_actions = ca,
       universe_raw = dt,
       cfg = cfg,
       verbose = verbose
     )
-
-    ca <- tmp$corp_actions
-    split_audit <- tmp$split_audit
+  
+    ca <- fix$corp_actions
+    split_audit <- fix$split_audit
+  }
+  
+  # (optional but highly recommended sanity log)
+  if (verbose) {
+    if (is.null(ca) || !nrow(ca)) {
+      af2_log("AF2_CA_PREF:", "corp_actions AFTER validation is EMPTY -> panel will be unadjusted.")
+    } else {
+      af2_log("AF2_CA_PREF:", "corp_actions AFTER validation rows= ", nrow(ca))
+      print(ca[, .N, by = .(action_type, source)][order(-N)])
+    }
   }
 
   # 3) Run the normal adjuster builder
