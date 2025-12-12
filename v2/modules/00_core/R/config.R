@@ -68,7 +68,19 @@ af2_config_default <- list(
 
   # Split-gap validation against raw
   enable_split_gap_validation = TRUE,
-  split_gap_tol_log = 0.35
+  split_gap_tol_log = 0.35,
+
+  # Split-gap validation against raw (Cotahist)
+  enable_split_gap_validation = TRUE,
+  split_gap_tol_log = 0.35,
+
+  # NEW: how far forward we allow snapping Yahoo split dates
+  # to the next B3 trading day (for weekend/holiday/vendor-date mismatches)
+  split_gap_max_forward_days = 5L,
+
+  # NEW: prefer using post-day OPEN when available (splits are effective at market open);
+  # fallback to CLOSE if OPEN missing.
+  split_gap_use_open = TRUE
 
 )
 
@@ -101,6 +113,13 @@ af2_get_config <- function(config = NULL) {
 
   cfg$enable_split_gap_validation <- isTRUE(cfg$enable_split_gap_validation)
   cfg$split_gap_tol_log <- as.numeric(cfg$split_gap_tol_log %||% 0.35)
+
+  cfg$split_gap_max_forward_days <- as.integer(cfg$split_gap_max_forward_days %||% 5L)
+  if (!is.finite(cfg$split_gap_max_forward_days) || cfg$split_gap_max_forward_days < 0L) {
+    cfg$split_gap_max_forward_days <- 5L
+  }
+
+  cfg$split_gap_use_open <- isTRUE(cfg$split_gap_use_open)
 
   cfg
 }
