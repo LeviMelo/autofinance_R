@@ -70,10 +70,6 @@ af2_config_default <- list(
   enable_split_gap_validation = TRUE,
   split_gap_tol_log = 0.35,
 
-  # Split-gap validation against raw (Cotahist)
-  enable_split_gap_validation = TRUE,
-  split_gap_tol_log = 0.35,
-
   # NEW: how far forward we allow snapping Yahoo split dates
   # to the next B3 trading day (for weekend/holiday/vendor-date mismatches)
   split_gap_max_forward_days = 5L,

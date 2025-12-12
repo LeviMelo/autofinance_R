@@ -18,17 +18,19 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   ca <- data.table::as.data.table(corp_actions)
   dt <- data.table::as.data.table(universe_raw)
 
-  if (!nrow(ca)) {
-    return(list(corp_actions = ca, split_audit = NULL))
-  }
-  if (!nrow(dt)) {
-    return(list(corp_actions = ca, split_audit = NULL))
+  if (!nrow(ca) || !nrow(dt)) {
+    return(list(
+      corp_actions = ca,
+      split_audit = data.table::data.table()[0],
+      yahoo_splits_fixed = data.table::data.table()[0],
+      yahoo_splits_quarantine = data.table::data.table()[0]
+    ))
   }
 
   af2_assert_cols(ca, c("symbol","refdate","action_type","value","source"), name = "corp_actions")
   af2_assert_cols(dt, c("symbol","refdate","open","close"), name = "universe_raw")
 
-  # normalize
+  # Normalize
   ca[, symbol := toupper(trimws(as.character(symbol)))]
   ca[, action_type := tolower(trimws(as.character(action_type)))]
   ca[, source := tolower(trimws(as.character(source)))]
@@ -49,10 +51,15 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   ]
 
   if (!nrow(ys)) {
-    return(list(corp_actions = ca, split_audit = data.table::data.table()[0]))
+    return(list(
+      corp_actions = ca,
+      split_audit = data.table::data.table()[0],
+      yahoo_splits_fixed = data.table::data.table()[0],
+      yahoo_splits_quarantine = data.table::data.table()[0]
+    ))
   }
 
-  # knobs
+  # Knobs
   tol <- as.numeric(cfg$split_gap_tol_log %||% 0.35)
   if (!is.finite(tol) || tol <= 0) tol <- 0.35
 
@@ -61,12 +68,12 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
 
   use_open <- isTRUE(cfg$split_gap_use_open %||% FALSE)
 
-  # prep raw grid (keyed) + prev close
+  # Prep raw grid
   data.table::setorder(dt, symbol, refdate)
   data.table::setkey(dt, symbol, refdate)
   dt[, close_prev := data.table::shift(close, 1L), by = symbol]
 
-  # create a per-row id so audit is stable
+  # Stable row id for Yahoo split rows
   ys_key <- ys[, .(
     row_id = .I,
     symbol,
@@ -76,8 +83,7 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   )]
   data.table::setkey(ys_key, symbol, vendor_refdate)
 
-  # snap vendor_refdate -> next trading refdate (<= max_fwd days)
-  # roll = -N rolls forward (next observation) up to N days
+  # Snap vendor_refdate -> next trading day within <= max_fwd days
   snapped <- dt[ys_key,
     on      = .(symbol, refdate = vendor_refdate),
     roll    = -max_fwd,
@@ -98,7 +104,7 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
 
   safe_log <- function(x) ifelse(is.finite(x) & x > 0, log(x), NA_real_)
 
-  # observed raw ratios (post/pre)
+  # Observed raw ratios (post/pre)
   snapped[, ratio_cc := data.table::fifelse(
     is.finite(close) & is.finite(close_prev) & close_prev > 0,
     close / close_prev,
@@ -111,14 +117,14 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
     NA_real_
   )]
 
+  # Two hypotheses:
+  # - yahoo_value is already PRICE-FACTOR (e.g. 0.2)
+  # - 1/yahoo_value is PRICE-FACTOR (vendor gave ratio like 5)
   snapped[, log_v   := safe_log(yahoo_value)]
   snapped[, log_inv := safe_log(1 / yahoo_value)]
   snapped[, log_cc  := safe_log(ratio_cc)]
   snapped[, log_oc  := safe_log(ratio_oc)]
 
-  # errors for two hypotheses:
-  # Hval: yahoo_value already equals PRICE RATIO (price factor)
-  # Hinv: 1/yahoo_value equals PRICE RATIO (yahoo_value is split "ratio")
   snapped[, err_val := abs(log_cc - log_v)]
   if (use_open) snapped[, err_val := pmin(err_val, abs(log_oc - log_v), na.rm = TRUE)]
 
@@ -128,7 +134,6 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   snapped[, chosen_value := data.table::fifelse(err_inv < err_val, 1 / yahoo_value, yahoo_value)]
   snapped[, chosen_err   := pmin(err_val, err_inv, na.rm = TRUE)]
 
-  # validity
   snapped[, has_prices := is.finite(chosen_err) & !is.na(chosen_err)]
   snapped[, is_snapped := !is.na(eff_refdate) & is.finite(lag_days) & lag_days >= 0 & lag_days <= max_fwd]
 
@@ -138,6 +143,7 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   )]
 
   split_audit <- snapped[, .(
+    row_id,
     symbol, yahoo_symbol,
     vendor_refdate, eff_refdate, lag_days,
     yahoo_value,
@@ -146,27 +152,57 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
     status
   )]
 
-  # apply changes:
-  # - kept: snap refdate -> eff_refdate, normalize value -> chosen_value
-  # - rejected: drop split row
-  # - unverified: keep as-is (do NOT drop; do NOT change)
-  kept <- snapped[status == "kept" & is_snapped == TRUE & has_prices == TRUE]
-  rej  <- snapped[status == "rejected"]  # keep for audit/log only; NEVER delete vendor rows
+  # Build an APPLY table = only "kept" rows, with snapped refdate + oriented value
+  yahoo_splits_fixed <- split_audit[
+    status == "kept" & !is.na(eff_refdate) & is.finite(chosen_value) & chosen_value > 0,
+    .(
+      symbol = symbol,
+      yahoo_symbol = yahoo_symbol,
+      refdate = eff_refdate,
+      action_type = "split",
+      value = chosen_value,
+      source = "yahoo"
+    )
+  ]
+
+  # Quarantine = original vendor rows, annotated with audit fields
+  ys_orig <- ys[, .(
+    row_id = .I,
+    symbol,
+    yahoo_symbol = if ("yahoo_symbol" %in% names(ys)) as.character(yahoo_symbol) else NA_character_,
+    refdate,
+    action_type,
+    value,
+    source
+  )]
+
+  yahoo_splits_quarantine <- merge(
+    ys_orig,
+    split_audit[, .(row_id, status, eff_refdate, chosen_value, chosen_err, lag_days, vendor_refdate)],
+    by = "row_id",
+    all.x = TRUE
+  )
+  yahoo_splits_quarantine <- yahoo_splits_quarantine[status != "kept" | is.na(status)]
 
   if (verbose) {
     af2_log(
       "AF2_CA_PREF:",
-      "Split-gap validation: snapped= ", nrow(snapped),
-      "  kept= ", nrow(kept),
-      "  rejected= ", nrow(rej),
-      "  unverified= ", sum(split_audit$status == "unverified"),
-      "  (tol_log= ", tol,
-      " , max_fwd_days= ", max_fwd,
-      " , use_open= ", use_open, " )"
+      "Split-gap validation: total=", nrow(split_audit),
+      " kept=", sum(split_audit$status == "kept"),
+      " rejected=", sum(split_audit$status == "rejected"),
+      " unverified=", sum(split_audit$status == "unverified"),
+      " (tol_log=", tol,
+      ", max_fwd_days=", max_fwd,
+      ", use_open=", use_open, ")"
     )
   }
 
-  list(corp_actions = ca, split_audit = split_audit)
+  list(
+    corp_actions = ca,                    # vendor registry untouched (audit)
+    split_audit = split_audit,
+    yahoo_splits_fixed = yahoo_splits_fixed,
+    yahoo_splits_quarantine = yahoo_splits_quarantine
+  )
 }
 
 af2_build_panel_adj_selective <- function(universe_raw,
@@ -239,6 +275,8 @@ af2_build_panel_adj_selective <- function(universe_raw,
   # against Cotahist raw gaps (auto-orient + drop)
   # -------------------------------
   split_audit <- NULL
+  yahoo_splits_fixed <- NULL
+  yahoo_splits_quarantine <- NULL
   
   if (!is.null(ca) && nrow(ca) &&
       isTRUE(cfg$enable_split_gap_validation)) {
@@ -250,8 +288,13 @@ af2_build_panel_adj_selective <- function(universe_raw,
       verbose = verbose
     )
   
+    # Keep vendor registry intact for audit/logging
     ca <- fix$corp_actions
+  
+    # These are the important outputs
     split_audit <- fix$split_audit
+    yahoo_splits_fixed <- fix$yahoo_splits_fixed
+    yahoo_splits_quarantine <- fix$yahoo_splits_quarantine
   }
   
   # (optional but highly recommended sanity log)
@@ -265,41 +308,37 @@ af2_build_panel_adj_selective <- function(universe_raw,
   }
 
   # ------------------------------------------------------------
-  # POLICY: DO NOT auto-apply unverified/rejected Yahoo splits.
-  # We keep vendor registry (ca) intact, but pass only "kept"
-  # Yahoo split rows into the adjuster.
+  # APPLY POLICY:
+  # - remove all Yahoo split rows from the vendor registry
+  # - add back only the "fixed kept" Yahoo splits (snapped + oriented)
+  # - quarantine everything else for inspection
   # ------------------------------------------------------------
   ca_apply <- ca
   ca_quarantine <- NULL
-
-  if (!is.null(ca_apply) && nrow(ca_apply) &&
-      !is.null(split_audit) && nrow(split_audit)) {
-
-    kept_keys <- split_audit[
-      status == "kept" & !is.na(eff_refdate),
-      .(symbol, refdate = eff_refdate)
-    ]
-
-    ys_all <- ca_apply[action_type == "split" & source == "yahoo"]
-
-    ys_kept <- ys_all[kept_keys, on = .(symbol, refdate), nomatch = 0L]
-    ca_quarantine <- ys_all[!kept_keys, on = .(symbol, refdate)]
-
-    ca_apply <- data.table::rbindlist(
-      list(
-        ca_apply[!(action_type == "split" & source == "yahoo")],
-        ys_kept
-      ),
-      use.names = TRUE, fill = TRUE
-    )
-
+  
+  if (!is.null(ca_apply) && nrow(ca_apply)) {
+  
+    # Drop vendor Yahoo splits (we never apply them directly)
+    ca_apply <- ca_apply[!(action_type == "split" & source == "yahoo")]
+  
+    # Add back only validated+fixed Yahoo splits
+    if (!is.null(yahoo_splits_fixed) && nrow(yahoo_splits_fixed)) {
+      ca_apply <- data.table::rbindlist(
+        list(ca_apply, yahoo_splits_fixed),
+        use.names = TRUE, fill = TRUE
+      )
+    }
+  
     ca_apply <- unique(ca_apply)
-
+    ca_quarantine <- yahoo_splits_quarantine
+  
     if (verbose) {
       af2_log(
         "AF2_CA_PREF:",
-        "Yahoo split apply policy: kept=", nrow(ys_kept),
-        " quarantine=", if (is.null(ca_quarantine)) 0L else nrow(ca_quarantine)
+        "Yahoo split apply policy: fixed_kept=",
+        if (is.null(yahoo_splits_fixed)) 0L else nrow(yahoo_splits_fixed),
+        " quarantine=",
+        if (is.null(ca_quarantine)) 0L else nrow(ca_quarantine)
       )
     }
   }

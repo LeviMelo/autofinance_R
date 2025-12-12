@@ -75,6 +75,38 @@ af2_b3_build_universe_year <- function(year,
   # 5) Drop obvious junk rows
   dt_year <- dt_year[!is.na(symbol) & symbol != "" & !is.na(refdate) & is.finite(close)]
 
+  # 5b) Enforce unique (symbol, refdate) keys (upstream rb3 edge-case)
+  # Dedupe rule (contract):
+  # 1) max turnover, 2) max qty, 3) max close, 4) first deterministic row
+  data.table::setorder(dt_year, asset_type, symbol, refdate)
+  
+  dup <- dt_year[, .N, by = .(symbol, refdate)][N > 1L]
+  if (nrow(dup)) {
+    if (verbose) {
+      af2_log(
+        "AF2_B3:",
+        "WARNING: duplicated (symbol, refdate) detected in universe_raw year=", year,
+        ". Applying dedupe rule. Examples:"
+      )
+      print(utils::head(dup[order(-N)], 10))
+    }
+  
+    # Make ordering deterministic for tie-breaking
+    if (!("turnover" %in% names(dt_year))) dt_year[, turnover := NA_real_]
+    if (!("qty" %in% names(dt_year))) dt_year[, qty := NA_real_]
+  
+    dt_year <- dt_year[
+      order(
+        symbol, refdate,
+        -data.table::fifelse(is.finite(turnover), turnover, -Inf),
+        -data.table::fifelse(is.finite(qty), qty, -Inf),
+        -data.table::fifelse(is.finite(close), close, -Inf)
+      )
+    ][, .SD[1L], by = .(symbol, refdate)]
+  
+    data.table::setorder(dt_year, asset_type, symbol, refdate)
+  }
+
   if (verbose) {
     af2_log("AF2_B3:", "Year ", year, " rows = ", nrow(dt_year))
     af2_log("AF2_B3:", "Unique symbols = ", length(unique(dt_year$symbol)))
@@ -207,6 +239,36 @@ af2_b3_build_universe_window <- function(start_date, end_date,
 
   # 5) Drop obvious junk
   dt_win <- dt_win[!is.na(symbol) & symbol != "" & !is.na(refdate) & is.finite(close)]
+  
+  # 5b) Enforce unique (symbol, refdate) keys (upstream rb3 edge-case)
+  data.table::setorder(dt_win, asset_type, symbol, refdate)
+  
+  dup <- dt_win[, .N, by = .(symbol, refdate)][N > 1L]
+  if (nrow(dup)) {
+    if (verbose) {
+      af2_log(
+        "AF2_B3:",
+        "WARNING: duplicated (symbol, refdate) detected in universe_raw window ",
+        as.character(start_date), " to ", as.character(end_date),
+        ". Applying dedupe rule. Examples:"
+      )
+      print(utils::head(dup[order(-N)], 10))
+    }
+  
+    if (!("turnover" %in% names(dt_win))) dt_win[, turnover := NA_real_]
+    if (!("qty" %in% names(dt_win))) dt_win[, qty := NA_real_]
+  
+    dt_win <- dt_win[
+      order(
+        symbol, refdate,
+        -data.table::fifelse(is.finite(turnover), turnover, -Inf),
+        -data.table::fifelse(is.finite(qty), qty, -Inf),
+        -data.table::fifelse(is.finite(close), close, -Inf)
+      )
+    ][, .SD[1L], by = .(symbol, refdate)]
+  
+    data.table::setorder(dt_win, asset_type, symbol, refdate)
+  }
 
   if (verbose) {
     af2_log("AF2_B3:", "Window rows = ", nrow(dt_win))

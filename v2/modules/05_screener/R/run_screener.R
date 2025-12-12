@@ -1,10 +1,17 @@
 # v2/modules/05_screener/R/run_screener.R
 
+# Return modes:
+#   return="ranked"   -> current behavior (score + ranks)
+#   return="features" -> ONLY the feature table (per-symbol metrics), no scoring
+
 af2_run_screener <- function(panel_adj,
                              config = NULL,
-                             allow_unresolved = NULL) {
+                             allow_unresolved = NULL,
+                             return = c("ranked", "features")) {
 
   af2_require("data.table")
+  return <- match.arg(return)
+
   # If caller didn't specify, default to core config policy
   if (is.null(allow_unresolved)) {
     cfg_core <- af2_get_config()
@@ -44,12 +51,12 @@ af2_run_screener <- function(panel_adj,
 
     # Ensure we keep enough rows to compute the longest horizon return.
     need_n <- max(
-     as.integer(cfg$lookback_days),
-     as.integer(max(cfg$horizons_days)) + 1L
+      as.integer(cfg$lookback_days),
+      as.integer(max(cfg$horizons_days)) + 1L
     )
 
     if (nrow(sdt) > need_n) {
-     sdt <- sdt[(.N - need_n + 1):.N]
+      sdt <- sdt[(.N - need_n + 1):.N]
     }
 
     m <- af2_compute_symbol_metrics(sdt, cfg$horizons_days)
@@ -63,7 +70,16 @@ af2_run_screener <- function(panel_adj,
   metrics <- data.table::rbindlist(metrics_list, fill = TRUE)
   if (!nrow(metrics)) stop("af2_run_screener: metrics computation yielded zero rows.", call. = FALSE)
 
-  # 3) Score + rank
+  # If requested: return ONLY features (no scoring/ranking)
+  if (return == "features") {
+    return(list(
+      features = metrics[order(symbol)],
+      liquidity = liq[order(symbol)],
+      config = cfg
+    ))
+  }
+
+  # 3) Score + rank (default behavior)
   out <- af2_score_and_rank(metrics, cfg$score_weights)
 
   by_type <- split(out, out$asset_type)
@@ -71,7 +87,10 @@ af2_run_screener <- function(panel_adj,
 
   list(
     full = out[order(rank_overall)],
-    by_type = by_type
+    by_type = by_type,
+    features = metrics[order(symbol)],
+    liquidity = liq[order(symbol)],
+    config = cfg
   )
-
 }
+

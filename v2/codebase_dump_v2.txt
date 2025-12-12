@@ -45,6 +45,7 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   modules/05_screener/README.md
   README.md
   scripts/00_bootstrap_v2.R
+  scripts/00_load_module_05.R
   scripts/00_make_fixtures.R
   scripts/01a_smoke_b3_fetch_one_year.R
   scripts/01b_build_universe_small_window.R
@@ -56,6 +57,48 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   scripts/05b_hard_screener_full_selective.R
   scripts/05c_hard_selective_split_audit.R
   scripts/05d_yahoo_vs_af2_crosscheck.R
+
+
+
+###############################################################################
+### FILE: scripts/00_load_module_05.R
+###############################################################################
+# v2/scripts/00_load_module_05.R
+# Loads Module 05 (Screener) + the core dependencies it relies on.
+# Guarantees af2_compute_symbol_metrics exists.
+
+af2_src <- function(path) {
+  if (!file.exists(path)) stop("Missing file: ", path, call. = FALSE)
+  message("SOURCE: ", normalizePath(path, winslash = "/", mustWork = TRUE))
+  source(path, local = FALSE)
+}
+
+# Ensure we are at project root (the folder that contains /v2)
+if (!dir.exists("v2") && basename(getwd()) == "v2") setwd("..")
+stopifnot(dir.exists("v2"))
+
+# Core (required by screener functions)
+af2_src("v2/modules/00_core/R/utils.R")
+af2_src("v2/modules/00_core/R/logging.R")
+af2_src("v2/modules/00_core/R/config.R")
+
+# Module 05 (ORDER MATTERS: compute_metrics BEFORE run_screener)
+af2_src("v2/modules/05_screener/R/screener_config.R")
+af2_src("v2/modules/05_screener/R/validate_screener_input.R")
+af2_src("v2/modules/05_screener/R/liquidity_filter.R")
+af2_src("v2/modules/05_screener/R/score_rank.R")
+af2_src("v2/modules/05_screener/R/compute_metrics.R")
+af2_src("v2/modules/05_screener/R/run_screener.R")
+
+# Hard sanity check (this is what just failed for you)
+need <- c("af2_run_screener", "af2_compute_symbol_metrics", "af2_get_screener_config",
+          "af2_validate_screener_input", "af2_compute_liquidity_from_panel")
+miss <- need[!vapply(need, exists, logical(1), inherits = TRUE)]
+if (length(miss)) {
+  stop("Module 05 load FAILED. Missing functions: ", paste(miss, collapse = ", "), call. = FALSE)
+}
+
+message("OK: Module 05 loaded (including af2_compute_symbol_metrics).")
 
 
 
@@ -78,7 +121,46 @@ Principles:
 ###############################################################################
 # adjustments.md
 
-This is a placeholder. Fill with the explicit schema + guarantees.
+## Purpose
+`adjustments` is the per-symbol daily adjustment timeline produced by Module 04.
+It is an audit table: it explains *why* `panel_adj` differs from `universe_raw`.
+
+## Table contract (schema)
+
+### Keys
+- `(symbol, refdate)` unique within this table.
+
+### Required columns
+| column            | type      | required | semantics |
+|------------------|-----------|----------|----------|
+| symbol           | character | yes      | uppercase ticker |
+| refdate          | Date      | yes      | trading date |
+| split_value      | numeric   | yes      | same-day split price-factor (1 means none). Multiple splits on same day are multiplied. |
+| div_cash         | numeric   | yes      | same-day cash dividend amount (0 means none). Multiple dividends summed. |
+| split_factor_cum | numeric   | yes      | cumulative split factor applied to *this date* (exclusive: events with refdate > date) |
+| div_factor_event | numeric   | yes      | per-day dividend factor (normally 1; <1 on dividend date when computable) |
+| div_factor_cum   | numeric   | yes      | cumulative dividend factor applied to *this date* (exclusive) |
+| adj_factor_final | numeric   | yes      | `split_factor_cum * div_factor_cum` |
+| source_mask      | character | yes      | provenance summary (e.g., `yahoo`, `manual`, `yahoo+manual`) |
+| has_manual       | logical   | yes      | TRUE if any manual event contributed that day |
+| issue_div        | logical   | yes      | TRUE when dividend factor could not be computed safely |
+
+## Dividend issue policy (current v2 behavior)
+On a day where `div_cash > 0`, dividend factor uses:
+- `close_prev = lag(close_adj_split)`  
+- If `close_prev` is missing/non-finite, `close_prev <= 0`, or `div_cash >= close_prev`,
+  then the system sets:
+  - `issue_div = TRUE`
+  - `div_factor_event = 1` (no dividend adjustment applied for that event)
+
+This is intentionally conservative: it avoids exploding the factor chain.
+
+## Guarantees
+- `split_value > 0`
+- `div_cash >= 0`
+- `split_factor_cum > 0`
+- `div_factor_cum >= 0`
+- `adj_factor_final >= 0`
 
 
 
@@ -87,7 +169,58 @@ This is a placeholder. Fill with the explicit schema + guarantees.
 ###############################################################################
 # panel_adj.md
 
-This is a placeholder. Fill with the explicit schema + guarantees.
+## Purpose
+`panel_adj` is the adjusted daily panel produced by Module 04 (Adjuster).
+It contains raw OHLC, split-adjusted OHLC, and split+dividend adjusted OHLC.
+It is the only input accepted by the Screener (Module 05).
+
+## Table contract (schema)
+
+### Keys
+- **Primary key:** `(symbol, refdate)` must be **unique**.
+
+### Required columns (minimum)
+| column            | type      | required | semantics |
+|------------------|-----------|----------|----------|
+| symbol           | character | yes      | uppercase ticker |
+| refdate          | Date      | yes      | trading date |
+| asset_type       | character | yes      | `equity` / `fii` / `etf` / `bdr` |
+| close_adj_final  | numeric   | yes      | final adjusted close (splits + dividends) |
+| adjustment_state | character | yes      | see below |
+| turnover         | numeric   | yes*     | liquidity volume in BRL (or `vol_fin` alternative) |
+| qty              | numeric   | yes      | liquidity quantity proxy |
+
+\* Either `turnover` OR `vol_fin` must exist. Downstream modules may normalize `vol_fin -> turnover`.
+
+### Recommended columns (what v2 currently produces)
+Raw aliases:
+- `open_raw, high_raw, low_raw, close_raw`
+
+Split-adjusted:
+- `open_adj_split, high_adj_split, low_adj_split, close_adj_split`
+
+Final adjusted (split + dividend):
+- `open_adj_final, high_adj_final, low_adj_final, close_adj_final`
+
+### adjustment_state semantics (exact values)
+- `ok` : no split/dividend events in-range
+- `dividend_only` : dividend events applied, no splits
+- `split_only` : split events applied, no dividends
+- `split_dividend` : both applied
+- `manual_override` : at least one manual event present for the symbol (anywhere in-range)
+- `suspect_unresolved` : dividend adjustment had an unresolved computation issue (`issue_div_any == TRUE`)
+
+### Invariants / guarantees
+- `(symbol, refdate)` uniqueness guaranteed.
+- Adjustment factors are applied deterministically based on the `events` table.
+- If `adjustment_state == suspect_unresolved`, downstream consumers must either:
+  - stop (default policy), or
+  - explicitly allow unresolved symbols.
+
+## Relationship to other outputs
+Module 04 also outputs:
+- `events` (per symbol-date split_value/div_cash)
+- `adjustments` (timeline of factors per date)
 
 
 
@@ -96,7 +229,29 @@ This is a placeholder. Fill with the explicit schema + guarantees.
 ###############################################################################
 # screener_input.md
 
-This is a placeholder. Fill with the explicit schema + guarantees.
+## Purpose
+Defines what Module 05 (Screener / Feature builder) accepts.
+
+## Input: panel_adj (from Module 04)
+
+### Keys
+- `(symbol, refdate)` must be unique.
+
+### Required columns
+- `symbol` (character)
+- `refdate` (Date)
+- `asset_type` (character)
+- `close_adj_final` (numeric)
+- `adjustment_state` (character)
+- liquidity: either `turnover` or `vol_fin` must exist
+
+### Recommended columns (for OHLC-based features)
+- `open_adj_final`, `high_adj_final`, `low_adj_final`, `close_adj_final`
+
+## Policy: unresolved suspects
+If any rows have `adjustment_state == "suspect_unresolved"` then:
+- default behavior: **stop**
+- override: allow only if caller explicitly sets `allow_unresolved = TRUE`
 
 
 
@@ -105,16 +260,106 @@ This is a placeholder. Fill with the explicit schema + guarantees.
 ###############################################################################
 # screener_output.md
 
-This is a placeholder. Fill with the explicit schema + guarantees.
+## Purpose
+Module 05 outputs a **feature vector** per symbol.
+Ranking/scoring is optional and should be treated as a separate concern.
+
+## Output: features (primary)
+A table with **one row per symbol**.
+
+### Keys
+- `symbol` unique.
+
+### Required metadata columns
+| column      | type      | semantics |
+|------------|-----------|----------|
+| symbol     | character | uppercase ticker |
+| asset_type | character | `equity` / `fii` / `etf` / `bdr` |
+| end_date   | Date      | last date used for feature computation |
+| n_obs      | integer   | number of rows used (post-slicing) |
+| n_valid    | integer   | number of finite close observations |
+| coverage   | numeric   | `n_valid / n_obs` |
+
+### Baseline feature families (v2 minimum)
+- Multi-horizon returns from `close_adj_final`:
+  - `ret_21d`, `ret_63d`, `ret_126d`, `ret_252d` (configurable horizons)
+- Close-to-close realized volatility (annualized):
+  - `vol_cc_21d`, `vol_cc_63d`, ... (same horizons)
+- OHLC-based realized volatility (annualized, NA-safe):
+  - Parkinson range vol: `vol_pk_21d`, ...
+  - Garman–Klass vol: `vol_gk_21d`, ...
+- Drawdown/stress:
+  - `max_dd`, `ulcer_index`
+- Liquidity/microstructure proxies:
+  - `median_turnover`, `days_traded_ratio`, `amihud`
+
+### NA rules
+- If insufficient data for a horizon window, that feature is `NA_real_`.
+- Features must be present as columns even when NA (stable schema).
+
+## Optional output: ranking (secondary)
+If a scoring model is applied, Module 05 may also output:
+- `full` table: features + score + ranks
+- `by_type` list: same, split by `asset_type`
+
+But **features remain the primary contract**.
 
 
 
 ###############################################################################
 ### FILE: contracts/universe_raw.md
 ###############################################################################
-# universe_raw.md
-
-This is a placeholder. Fill with the explicit schema + guarantees.
+*** Begin Patch
+*** Update File: contracts/screener_output.md
+@@
+-# screener_output.md
+-
+-This is a placeholder. Fill with the explicit schema + guarantees.
++# screener_output.md
++
++## Purpose
++Defines the **feature vector** output produced by Module 05.
++This output is intended to be consumed by **separate ranking/scoring logic** later.
++
++## Output object
++`features` (data.table/data.frame), **one row per symbol**.
++
++## Required identifier/meta columns
++| column      | type | meaning |
++|------------|------|---------|
++| symbol     | chr  | ticker |
++| asset_type | chr  | equity/fii/etf/bdr |
++
++## Recommended coverage/meta columns
++| column        | type | meaning |
++|--------------|------|---------|
++| end_refdate  | Date | last date used for features |
++| n_obs        | int  | number of rows used in the feature window |
++| days_traded_ratio | dbl | fraction of non-NA `close_adj_final` in window |
++
++## Core price/return features (examples)
++For each horizon `h` in config (e.g., 21/63/126/252):
++- `ret_{h}d` (simple price return over horizon)
++- `vol_{h}d` (annualized close-to-close volatility over last h obs)
++
++## OHLC-based risk features (recommended)
+For each horizon `h` (when OHLC columns exist):
++- `parkinson_vol_{h}d` (annualized high/low-based volatility estimator)
++- `range_mean_{h}d` (mean daily range fraction: (high-low)/close)
++- `gap_vol_{h}d` (annualized volatility of open-to-prev-close returns)
++
++## Path-dependence / drawdown features
+- `max_dd`
+- `ulcer_index`
++
++## Liquidity features
+- `amihud` (|ret| / turnover proxy)
++
++## NA policy
+- Features may be NA if insufficient data exists for a symbol/horizon.
++- The table shape (column set) must remain stable across runs for the same config.
++
+*** End Patch
 
 
 
@@ -185,13 +430,25 @@ af2_config_default <- list(
   # Typical forward splits: 0.5, 0.333..., 0.2
   # Typical reverse splits: 2, 5, 10 (rare)
   # -------------------------------
-  enable_split_plausibility_gate = TRUE,
+  enable_split_plausibility_gate = FALSE,
   split_gate_min = 0.05,  # conservative, allows 20:1
   split_gate_max = 10.0,  # conservative, allows 1:10 reverse
 
   # Split-gap validation against raw
   enable_split_gap_validation = TRUE,
-  split_gap_tol_log = 0.35
+  split_gap_tol_log = 0.35,
+
+  # Split-gap validation against raw (Cotahist)
+  enable_split_gap_validation = TRUE,
+  split_gap_tol_log = 0.35,
+
+  # NEW: how far forward we allow snapping Yahoo split dates
+  # to the next B3 trading day (for weekend/holiday/vendor-date mismatches)
+  split_gap_max_forward_days = 5L,
+
+  # NEW: prefer using post-day OPEN when available (splits are effective at market open);
+  # fallback to CLOSE if OPEN missing.
+  split_gap_use_open = TRUE
 
 )
 
@@ -224,6 +481,13 @@ af2_get_config <- function(config = NULL) {
 
   cfg$enable_split_gap_validation <- isTRUE(cfg$enable_split_gap_validation)
   cfg$split_gap_tol_log <- as.numeric(cfg$split_gap_tol_log %||% 0.35)
+
+  cfg$split_gap_max_forward_days <- as.integer(cfg$split_gap_max_forward_days %||% 5L)
+  if (!is.finite(cfg$split_gap_max_forward_days) || cfg$split_gap_max_forward_days < 0L) {
+    cfg$split_gap_max_forward_days <- 5L
+  }
+
+  cfg$split_gap_use_open <- isTRUE(cfg$split_gap_use_open)
 
   cfg
 }
@@ -410,6 +674,38 @@ af2_b3_build_universe_year <- function(year,
   # 5) Drop obvious junk rows
   dt_year <- dt_year[!is.na(symbol) & symbol != "" & !is.na(refdate) & is.finite(close)]
 
+  # 5b) Enforce unique (symbol, refdate) keys (upstream rb3 edge-case)
+  # Dedupe rule (contract):
+  # 1) max turnover, 2) max qty, 3) max close, 4) first deterministic row
+  data.table::setorder(dt_year, asset_type, symbol, refdate)
+  
+  dup <- dt_year[, .N, by = .(symbol, refdate)][N > 1L]
+  if (nrow(dup)) {
+    if (verbose) {
+      af2_log(
+        "AF2_B3:",
+        "WARNING: duplicated (symbol, refdate) detected in universe_raw year=", year,
+        ". Applying dedupe rule. Examples:"
+      )
+      print(utils::head(dup[order(-N)], 10))
+    }
+  
+    # Make ordering deterministic for tie-breaking
+    if (!("turnover" %in% names(dt_year))) dt_year[, turnover := NA_real_]
+    if (!("qty" %in% names(dt_year))) dt_year[, qty := NA_real_]
+  
+    dt_year <- dt_year[
+      order(
+        symbol, refdate,
+        -data.table::fifelse(is.finite(turnover), turnover, -Inf),
+        -data.table::fifelse(is.finite(qty), qty, -Inf),
+        -data.table::fifelse(is.finite(close), close, -Inf)
+      )
+    ][, .SD[1L], by = .(symbol, refdate)]
+  
+    data.table::setorder(dt_year, asset_type, symbol, refdate)
+  }
+
   if (verbose) {
     af2_log("AF2_B3:", "Year ", year, " rows = ", nrow(dt_year))
     af2_log("AF2_B3:", "Unique symbols = ", length(unique(dt_year$symbol)))
@@ -542,6 +838,36 @@ af2_b3_build_universe_window <- function(start_date, end_date,
 
   # 5) Drop obvious junk
   dt_win <- dt_win[!is.na(symbol) & symbol != "" & !is.na(refdate) & is.finite(close)]
+  
+  # 5b) Enforce unique (symbol, refdate) keys (upstream rb3 edge-case)
+  data.table::setorder(dt_win, asset_type, symbol, refdate)
+  
+  dup <- dt_win[, .N, by = .(symbol, refdate)][N > 1L]
+  if (nrow(dup)) {
+    if (verbose) {
+      af2_log(
+        "AF2_B3:",
+        "WARNING: duplicated (symbol, refdate) detected in universe_raw window ",
+        as.character(start_date), " to ", as.character(end_date),
+        ". Applying dedupe rule. Examples:"
+      )
+      print(utils::head(dup[order(-N)], 10))
+    }
+  
+    if (!("turnover" %in% names(dt_win))) dt_win[, turnover := NA_real_]
+    if (!("qty" %in% names(dt_win))) dt_win[, qty := NA_real_]
+  
+    dt_win <- dt_win[
+      order(
+        symbol, refdate,
+        -data.table::fifelse(is.finite(turnover), turnover, -Inf),
+        -data.table::fifelse(is.finite(qty), qty, -Inf),
+        -data.table::fifelse(is.finite(close), close, -Inf)
+      )
+    ][, .SD[1L], by = .(symbol, refdate)]
+  
+    data.table::setorder(dt_win, asset_type, symbol, refdate)
+  }
 
   if (verbose) {
     af2_log("AF2_B3:", "Window rows = ", nrow(dt_win))
@@ -2562,122 +2888,171 @@ af2_build_panel_adj <- function(universe_raw,
 # High-level wrapper implementing the selective Yahoo "trick".
 
 # ------------------------------------------------------------
-# PATCH D2 helper:
-# Validate and auto-orient Yahoo split values using Cotahist raw.
-# Works even if getSplits() mixes conventions across symbols.
+# Split-gap validator + snapper for Yahoo splits
+# - snaps split refdate forward to next trading day (<= max_fwd_days)
+# - normalizes Yahoo split "value" orientation (ratio vs price-factor)
+# - rejects splits that do not match raw jump (within tol_log)
+# - returns BOTH: cleaned corp_actions + split_audit table
 # ------------------------------------------------------------
 af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
                                                universe_raw,
                                                cfg = NULL,
                                                verbose = TRUE) {
+
   cfg <- cfg %||% af2_get_config()
 
   ca <- data.table::as.data.table(corp_actions)
-  if (!nrow(ca)) return(ca)
-
   dt <- data.table::as.data.table(universe_raw)
-  if (!nrow(dt)) return(ca)
 
-  # Required columns
-  af2_assert_cols(ca, c("symbol","refdate","action_type","value","source"),
-                  name = "corp_actions")
-  af2_assert_cols(dt, c("symbol","refdate","close"),
-                  name = "universe_raw")
+  if (!nrow(ca)) {
+    return(list(corp_actions = ca, split_audit = NULL))
+  }
+  if (!nrow(dt)) {
+    return(list(corp_actions = ca, split_audit = NULL))
+  }
 
-  ca[, symbol := toupper(symbol)]
-  dt[, symbol := toupper(symbol)]
+  af2_assert_cols(ca, c("symbol","refdate","action_type","value","source"), name = "corp_actions")
+  af2_assert_cols(dt, c("symbol","refdate","open","close"), name = "universe_raw")
+
+  # normalize
+  ca[, symbol := toupper(trimws(as.character(symbol)))]
+  ca[, action_type := tolower(trimws(as.character(action_type)))]
+  ca[, source := tolower(trimws(as.character(source)))]
   ca[, refdate := as.Date(refdate)]
+  ca[, value := as.numeric(value)]
+
+  dt[, symbol := toupper(trimws(as.character(symbol)))]
   dt[, refdate := as.Date(refdate)]
+  dt[, open := as.numeric(open)]
+  dt[, close := as.numeric(close)]
 
-  # Only Yahoo splits
-  ys <- ca[action_type == "split" & source == "yahoo" &
-             is.finite(value) & value > 0]
-  if (!nrow(ys)) return(ca)
+  # Only Yahoo split rows are validated/snapped
+  ys <- ca[
+    action_type == "split" &
+      source == "yahoo" &
+      is.finite(value) & value > 0 &
+      !is.na(refdate)
+  ]
 
-  data.table::setorder(dt, symbol, refdate)
-  dt[, close_prev := data.table::shift(close, 1L), by = symbol]
-  dt[, close_next := data.table::shift(close, -1L), by = symbol]
+  if (!nrow(ys)) {
+    return(list(corp_actions = ca, split_audit = data.table::data.table()[0]))
+  }
 
-  ys2 <- merge(
-    ys,
-    dt[, .(symbol, refdate, close_prev, close, close_next)],
-    by = c("symbol","refdate"),
-    all.x = TRUE
-  )
-
-  # Raw ratios around event day
-  ys2[, ratio_prev := fifelse(is.finite(close_prev) & close_prev > 0,
-                              close / close_prev, NA_real_)]
-  ys2[, ratio_next := fifelse(is.finite(close) & close > 0,
-                              close_next / close, NA_real_)]
-
-  # Expected raw jump should match split RATIO
-  # But Yahoo value may be ratio OR factor depending on symbol.
-  # We test both hypotheses:
-  #   H1: expected = value
-  #   H2: expected = 1/value
+  # knobs
   tol <- as.numeric(cfg$split_gap_tol_log %||% 0.35)
   if (!is.finite(tol) || tol <= 0) tol <- 0.35
 
-  safe_log <- function(x) {
-    ifelse(is.finite(x) & x > 0, log(x), NA_real_)
-  }
+  max_fwd <- as.integer(cfg$split_gap_max_forward_days %||% 0L)
+  if (!is.finite(max_fwd) || max_fwd < 0L) max_fwd <- 0L
 
-  ys2[, log_rprev := safe_log(ratio_prev)]
-  ys2[, log_rnext := safe_log(ratio_next)]
-  ys2[, log_v    := safe_log(value)]
-  ys2[, log_inv  := safe_log(1 / value)]
+  use_open <- isTRUE(cfg$split_gap_use_open %||% FALSE)
 
-  # Compute best local error for each hypothesis
-  ys2[, err_val := pmin(abs(log_rprev - log_v),
-                        abs(log_rnext - log_v), na.rm = TRUE)]
-  ys2[, err_inv := pmin(abs(log_rprev - log_inv),
-                        abs(log_rnext - log_inv), na.rm = TRUE)]
+  # prep raw grid (keyed) + prev close
+  data.table::setorder(dt, symbol, refdate)
+  data.table::setkey(dt, symbol, refdate)
+  dt[, close_prev := data.table::shift(close, 1L), by = symbol]
 
-  # Choose orientation that fits raw better
-  ys2[, chosen_value := fifelse(err_inv < err_val, 1 / value, value)]
-  ys2[, chosen_err   := pmin(err_val, err_inv, na.rm = TRUE)]
-
-  # Mark rows that don't match raw at all
-  ys2[, ok := is.finite(chosen_err) & chosen_err <= tol]
-
-  bad  <- ys2[is.na(ok) | ok == FALSE]
-
-  if (verbose) {
-    af2_log("AF2_CA_PREF:",
-            "Split-gap auto-orient: ",
-            nrow(ys2) - nrow(bad), " Yahoo split rows kept/normalized; ",
-            nrow(bad), " dropped (no raw match).")
-  }
-
-  # Apply replacements for GOOD rows (ONLY Yahoo split rows)
-  good_keys <- ys2[ok == TRUE, .(
+  # create a per-row id so audit is stable
+  ys_key <- ys[, .(
+    row_id = .I,
     symbol,
-    refdate,
-    action_type = "split",
-    source = "yahoo",
-    value_new = chosen_value
+    vendor_refdate = refdate,
+    yahoo_value = value,
+    yahoo_symbol = if ("yahoo_symbol" %in% names(ys)) as.character(yahoo_symbol) else NA_character_
+  )]
+  data.table::setkey(ys_key, symbol, vendor_refdate)
+
+  # snap vendor_refdate -> next trading refdate (<= max_fwd days)
+  # roll = -N rolls forward (next observation) up to N days
+  snapped <- dt[ys_key,
+    on      = .(symbol, refdate = vendor_refdate),
+    roll    = -max_fwd,
+    nomatch = NA,
+    .(
+      row_id         = i.row_id,
+      symbol         = i.symbol,
+      yahoo_symbol   = i.yahoo_symbol,
+      vendor_refdate = i.vendor_refdate,
+      eff_refdate    = refdate,
+      lag_days       = as.integer(refdate - i.vendor_refdate),
+      open           = open,
+      close          = close,
+      close_prev     = close_prev,
+      yahoo_value    = i.yahoo_value
+    )
+  ]
+
+  safe_log <- function(x) ifelse(is.finite(x) & x > 0, log(x), NA_real_)
+
+  # observed raw ratios (post/pre)
+  snapped[, ratio_cc := data.table::fifelse(
+    is.finite(close) & is.finite(close_prev) & close_prev > 0,
+    close / close_prev,
+    NA_real_
   )]
 
-  if (nrow(good_keys)) {
-    ca[good_keys,
-       on = .(symbol, refdate, action_type, source),
-       value := i.value_new]
+  snapped[, ratio_oc := data.table::fifelse(
+    use_open & is.finite(open) & is.finite(close_prev) & close_prev > 0,
+    open / close_prev,
+    NA_real_
+  )]
+
+  snapped[, log_v   := safe_log(yahoo_value)]
+  snapped[, log_inv := safe_log(1 / yahoo_value)]
+  snapped[, log_cc  := safe_log(ratio_cc)]
+  snapped[, log_oc  := safe_log(ratio_oc)]
+
+  # errors for two hypotheses:
+  # Hval: yahoo_value already equals PRICE RATIO (price factor)
+  # Hinv: 1/yahoo_value equals PRICE RATIO (yahoo_value is split "ratio")
+  snapped[, err_val := abs(log_cc - log_v)]
+  if (use_open) snapped[, err_val := pmin(err_val, abs(log_oc - log_v), na.rm = TRUE)]
+
+  snapped[, err_inv := abs(log_cc - log_inv)]
+  if (use_open) snapped[, err_inv := pmin(err_inv, abs(log_oc - log_inv), na.rm = TRUE)]
+
+  snapped[, chosen_value := data.table::fifelse(err_inv < err_val, 1 / yahoo_value, yahoo_value)]
+  snapped[, chosen_err   := pmin(err_val, err_inv, na.rm = TRUE)]
+
+  # validity
+  snapped[, has_prices := is.finite(chosen_err) & !is.na(chosen_err)]
+  snapped[, is_snapped := !is.na(eff_refdate) & is.finite(lag_days) & lag_days >= 0 & lag_days <= max_fwd]
+
+  snapped[, status := data.table::fifelse(
+    !is_snapped | !has_prices, "unverified",
+    data.table::fifelse(chosen_err <= tol, "kept", "rejected")
+  )]
+
+  split_audit <- snapped[, .(
+    symbol, yahoo_symbol,
+    vendor_refdate, eff_refdate, lag_days,
+    yahoo_value,
+    chosen_value,
+    chosen_err,
+    status
+  )]
+
+  # apply changes:
+  # - kept: snap refdate -> eff_refdate, normalize value -> chosen_value
+  # - rejected: drop split row
+  # - unverified: keep as-is (do NOT drop; do NOT change)
+  kept <- snapped[status == "kept" & is_snapped == TRUE & has_prices == TRUE]
+  rej  <- snapped[status == "rejected"]  # keep for audit/log only; NEVER delete vendor rows
+
+  if (verbose) {
+    af2_log(
+      "AF2_CA_PREF:",
+      "Split-gap validation: snapped= ", nrow(snapped),
+      "  kept= ", nrow(kept),
+      "  rejected= ", nrow(rej),
+      "  unverified= ", sum(split_audit$status == "unverified"),
+      "  (tol_log= ", tol,
+      " , max_fwd_days= ", max_fwd,
+      " , use_open= ", use_open, " )"
+    )
   }
 
-  # Drop BAD rows (ONLY Yahoo split rows)
-  if (nrow(bad)) {
-    bad_keys <- unique(bad[, .(
-      symbol,
-      refdate,
-      action_type = "split",
-      source = "yahoo"
-    )])
-
-    ca <- ca[!bad_keys, on = .(symbol, refdate, action_type, source)]
-  }
-
-  ca
+  list(corp_actions = ca, split_audit = split_audit)
 }
 
 af2_build_panel_adj_selective <- function(universe_raw,
@@ -2743,29 +3118,92 @@ af2_build_panel_adj_selective <- function(universe_raw,
     )
   }
 
+  ca_vendor_raw <- if (!is.null(ca)) data.table::copy(ca) else ca
+
   # -------------------------------
   # PATCH D2: reconcile Yahoo split conventions
   # against Cotahist raw gaps (auto-orient + drop)
   # -------------------------------
+  split_audit <- NULL
+  
   if (!is.null(ca) && nrow(ca) &&
       isTRUE(cfg$enable_split_gap_validation)) {
-
-    ca <- af2_ca_fix_yahoo_splits_by_raw_gap(
+  
+    fix <- af2_ca_fix_yahoo_splits_by_raw_gap(
       corp_actions = ca,
       universe_raw = dt,
       cfg = cfg,
       verbose = verbose
     )
+  
+    ca <- fix$corp_actions
+    split_audit <- fix$split_audit
+  }
+  
+  # (optional but highly recommended sanity log)
+  if (verbose) {
+    if (is.null(ca) || !nrow(ca)) {
+      af2_log("AF2_CA_PREF:", "corp_actions AFTER validation is EMPTY -> panel will be unadjusted.")
+    } else {
+      af2_log("AF2_CA_PREF:", "corp_actions AFTER validation rows= ", nrow(ca))
+      print(ca[, .N, by = .(action_type, source)][order(-N)])
+    }
+  }
+
+  # ------------------------------------------------------------
+  # POLICY: DO NOT auto-apply unverified/rejected Yahoo splits.
+  # We keep vendor registry (ca) intact, but pass only "kept"
+  # Yahoo split rows into the adjuster.
+  # ------------------------------------------------------------
+  ca_apply <- ca
+  ca_quarantine <- NULL
+
+  if (!is.null(ca_apply) && nrow(ca_apply) &&
+      !is.null(split_audit) && nrow(split_audit)) {
+
+    kept_keys <- split_audit[
+      status == "kept" & !is.na(eff_refdate),
+      .(symbol, refdate = eff_refdate)
+    ]
+
+    ys_all <- ca_apply[action_type == "split" & source == "yahoo"]
+
+    ys_kept <- ys_all[kept_keys, on = .(symbol, refdate), nomatch = 0L]
+    ca_quarantine <- ys_all[!kept_keys, on = .(symbol, refdate)]
+
+    ca_apply <- data.table::rbindlist(
+      list(
+        ca_apply[!(action_type == "split" & source == "yahoo")],
+        ys_kept
+      ),
+      use.names = TRUE, fill = TRUE
+    )
+
+    ca_apply <- unique(ca_apply)
+
+    if (verbose) {
+      af2_log(
+        "AF2_CA_PREF:",
+        "Yahoo split apply policy: kept=", nrow(ys_kept),
+        " quarantine=", if (is.null(ca_quarantine)) 0L else nrow(ca_quarantine)
+      )
+    }
   }
 
   # 3) Run the normal adjuster builder
-  af2_build_panel_adj(
+  out <- af2_build_panel_adj(
     universe_raw = dt,
-    corp_actions = ca,
+    corp_actions = ca_apply,
     manual_events = manual_events,
     cfg = cfg,
     verbose = verbose
   )
+
+  # Attach audit + quarantine (can be NULL if validation disabled)
+  out$split_audit <- split_audit
+  out$corp_actions_apply <- ca_apply
+  out$corp_actions_quarantine <- ca_quarantine
+  out
 }
 
 
@@ -2863,78 +3301,203 @@ Purpose:
 ### FILE: modules/05_screener/R/compute_metrics.R
 ###############################################################################
 # v2/modules/05_screener/R/compute_metrics.R
+# Feature engineering for one symbol (feature-vector output).
+# Uses adjusted FINAL OHLC whenever available.
 
-af2_compute_symbol_metrics <- function(dt_sym, horizons_days) {
-  af2_require("data.table")
-  dt_sym <- data.table::as.data.table(dt_sym)
-  data.table::setorder(dt_sym, refdate)
+af2_compute_symbol_features <- function(dt_sym, horizons_days) {
+  af2_require(c("data.table"))
 
-  n <- nrow(dt_sym)
-  if (n < 30L) return(NULL)
+  dt <- data.table::as.data.table(dt_sym)
+  data.table::setorder(dt, refdate)
 
-  # Returns from adjusted final price
-  dt_sym[, close_lag := data.table::shift(close_adj_final, 1L), by = symbol]
-  dt_sym[, ret_simple := ifelse(
-    !is.na(close_lag) & close_lag != 0,
-    (close_adj_final / close_lag) - 1,
+  n_obs <- nrow(dt)
+  if (n_obs < 30L) return(NULL)
+
+  # Ensure required columns exist
+  af2_assert_cols(dt, c("symbol", "refdate", "close_adj_final"), name = "panel_adj(symbol)")
+
+  # Normalize liquidity column name
+  if (!"turnover" %in% names(dt) && "vol_fin" %in% names(dt)) {
+    dt[, turnover := vol_fin]
+  }
+  if (!"turnover" %in% names(dt)) dt[, turnover := NA_real_]
+
+  # Try to use OHLC adjusted final; fall back to close-only where needed
+  if (!"open_adj_final" %in% names(dt)) dt[, open_adj_final := NA_real_]
+  if (!"high_adj_final" %in% names(dt)) dt[, high_adj_final := NA_real_]
+  if (!"low_adj_final"  %in% names(dt)) dt[, low_adj_final  := NA_real_]
+
+  # Coverage
+  n_valid <- sum(is.finite(dt$close_adj_final) & !is.na(dt$close_adj_final))
+  coverage <- if (n_obs > 0) n_valid / n_obs else NA_real_
+
+  # Daily returns (close-close)
+  dt[, close_prev := data.table::shift(close_adj_final, 1L)]
+  dt[, ret_cc_log := data.table::fifelse(
+    is.finite(close_adj_final) & is.finite(close_prev) & close_adj_final > 0 & close_prev > 0,
+    log(close_adj_final / close_prev),
     NA_real_
   )]
-  dt_sym[, close_lag := NULL]
+  dt[, ret_cc_simple := data.table::fifelse(
+    is.finite(close_adj_final) & is.finite(close_prev) & close_prev != 0,
+    (close_adj_final / close_prev) - 1,
+    NA_real_
+  )]
 
-  last_idx <- n
-  out <- list(symbol = dt_sym$symbol[1])
+  # Open gap (open vs prev close)
+  dt[, gap_oc := data.table::fifelse(
+    is.finite(open_adj_final) & is.finite(close_prev) & open_adj_final > 0 & close_prev > 0,
+    (open_adj_final / close_prev) - 1,
+    NA_real_
+  )]
 
-  # Momentum + short/long vol
-  # PATCH 2025-12-08: robust horizon indexing + NA-safe return calc
+  # Intraday range (high-low)
+  dt[, range_hl_log := data.table::fifelse(
+    is.finite(high_adj_final) & is.finite(low_adj_final) &
+      high_adj_final > 0 & low_adj_final > 0 & high_adj_final >= low_adj_final,
+    log(high_adj_final / low_adj_final),
+    NA_real_
+  )]
+  dt[, range_hl_pct := data.table::fifelse(
+    is.finite(high_adj_final) & is.finite(low_adj_final) & is.finite(close_adj_final) &
+      close_adj_final > 0 & high_adj_final >= low_adj_final,
+    (high_adj_final - low_adj_final) / close_adj_final,
+    NA_real_
+  )]
+
+  # Candle body (|close-open| / open)
+  dt[, body_pct := data.table::fifelse(
+    is.finite(open_adj_final) & is.finite(close_adj_final) & open_adj_final > 0,
+    abs(close_adj_final - open_adj_final) / open_adj_final,
+    NA_real_
+  )]
+
+  # True range % (ATR-like)
+  dt[, tr := NA_real_]
+  dt[is.finite(high_adj_final) & is.finite(low_adj_final),
+     tr := high_adj_final - low_adj_final]
+  dt[is.finite(tr) & is.finite(close_prev),
+     tr := pmax(
+       tr,
+       abs(high_adj_final - close_prev),
+       abs(low_adj_final - close_prev),
+       na.rm = TRUE
+     )]
+  dt[, tr_pct := data.table::fifelse(
+    is.finite(tr) & is.finite(close_prev) & close_prev > 0,
+    tr / close_prev,
+    NA_real_
+  )]
+
+  out <- list(
+    symbol = dt$symbol[1],
+    end_date = dt$refdate[n_obs],
+    n_obs = as.integer(n_obs),
+    n_valid = as.integer(n_valid),
+    coverage = as.numeric(coverage)
+  )
+
+  # Helper: safe horizon return using row index (business-day count proxy)
   safe_price_ret <- function(p0, p1) {
-    if (is.na(p0) || is.na(p1)) return(NA_real_)
     if (!is.finite(p0) || !is.finite(p1)) return(NA_real_)
     if (p0 == 0) return(NA_real_)
     (p1 / p0) - 1
   }
 
+  # Multi-horizon features
+  last_idx <- n_obs
   for (h in horizons_days) {
     h <- as.integer(h)
 
-    # Need at least h+1 points to compute a price-to-price horizon
+    # Return over horizon (close->close)
     if (h > 1L && (last_idx - h) >= 1L) {
-
-      idx0 <- last_idx - h
-      p0 <- dt_sym$close_adj_final[idx0]
-      p1 <- dt_sym$close_adj_final[last_idx]
-
+      p0 <- dt$close_adj_final[last_idx - h]
+      p1 <- dt$close_adj_final[last_idx]
       out[[paste0("ret_", h, "d")]] <- safe_price_ret(p0, p1)
 
-      # Vol over last h observations of daily returns
+      # Close-close vol (annualized)
       idx_start <- max(1L, last_idx - h + 1L)
-      rwin <- dt_sym$ret_simple[idx_start:last_idx]
-      out[[paste0("vol_", h, "d")]] <- stats::sd(rwin, na.rm = TRUE) * sqrt(252)
+      rwin <- dt$ret_cc_log[idx_start:last_idx]
+      out[[paste0("vol_cc_", h, "d")]] <- stats::sd(rwin, na.rm = TRUE) * sqrt(252)
+
+      # Parkinson volatility from HL range (annualized)
+      x <- dt$range_hl_log[idx_start:last_idx]
+      if (sum(is.finite(x)) >= 5L) {
+        out[[paste0("vol_pk_", h, "d")]] <- sqrt(mean(x^2, na.rm = TRUE) / (4 * log(2))) * sqrt(252)
+      } else {
+        out[[paste0("vol_pk_", h, "d")]] <- NA_real_
+      }
+
+      # Garman–Klass volatility (annualized) - requires O,H,L,C
+      o <- dt$open_adj_final[idx_start:last_idx]
+      hi <- dt$high_adj_final[idx_start:last_idx]
+      lo <- dt$low_adj_final[idx_start:last_idx]
+      c <- dt$close_adj_final[idx_start:last_idx]
+      ok <- is.finite(o) & is.finite(hi) & is.finite(lo) & is.finite(c) &
+        o > 0 & hi > 0 & lo > 0 & c > 0 & hi >= lo
+      if (sum(ok) >= 5L) {
+        log_hl <- log(hi[ok] / lo[ok])
+        log_co <- log(c[ok] / o[ok])
+        sig2 <- mean(0.5 * (log_hl^2) - (2 * log(2) - 1) * (log_co^2), na.rm = TRUE)
+        out[[paste0("vol_gk_", h, "d")]] <- sqrt(pmax(sig2, 0)) * sqrt(252)
+      } else {
+        out[[paste0("vol_gk_", h, "d")]] <- NA_real_
+      }
+
+      # Intraday range stats
+      rp <- dt$range_hl_pct[idx_start:last_idx]
+      out[[paste0("range_mean_", h, "d")]] <- mean(rp, na.rm = TRUE)
+      out[[paste0("range_max_", h, "d")]]  <- suppressWarnings(max(rp, na.rm = TRUE))
+
+      # Gap stats
+      gp <- dt$gap_oc[idx_start:last_idx]
+      out[[paste0("gap_min_", h, "d")]] <- suppressWarnings(min(gp, na.rm = TRUE))
+      out[[paste0("gap_max_", h, "d")]] <- suppressWarnings(max(gp, na.rm = TRUE))
+      out[[paste0("gap_abs_med_", h, "d")]] <- stats::median(abs(gp), na.rm = TRUE)
+
+      # ATR-like stats
+      trp <- dt$tr_pct[idx_start:last_idx]
+      out[[paste0("tr_mean_", h, "d")]] <- mean(trp, na.rm = TRUE)
+
+      # Body stats
+      bp <- dt$body_pct[idx_start:last_idx]
+      out[[paste0("body_mean_", h, "d")]] <- mean(bp, na.rm = TRUE)
 
     } else {
-      # Explicitly populate missing horizons to avoid silent shape drift
+      # Populate missing horizons to keep schema stable
       out[[paste0("ret_", h, "d")]] <- NA_real_
-      out[[paste0("vol_", h, "d")]] <- NA_real_
+      out[[paste0("vol_cc_", h, "d")]] <- NA_real_
+      out[[paste0("vol_pk_", h, "d")]] <- NA_real_
+      out[[paste0("vol_gk_", h, "d")]] <- NA_real_
+      out[[paste0("range_mean_", h, "d")]] <- NA_real_
+      out[[paste0("range_max_", h, "d")]] <- NA_real_
+      out[[paste0("gap_min_", h, "d")]] <- NA_real_
+      out[[paste0("gap_max_", h, "d")]] <- NA_real_
+      out[[paste0("gap_abs_med_", h, "d")]] <- NA_real_
+      out[[paste0("tr_mean_", h, "d")]] <- NA_real_
+      out[[paste0("body_mean_", h, "d")]] <- NA_real_
     }
   }
 
-  # Drawdown + Ulcer (NA-robust)
-  prices <- dt_sym$close_adj_final
+  # Drawdown + ulcer (NA-robust)
+  prices <- dt$close_adj_final
   if (requireNamespace("zoo", quietly = TRUE)) {
     prices <- zoo::na.locf(prices, na.rm = FALSE)
   }
-
-  cummax_p <- cummax(prices)
-  dd <- prices / cummax_p - 1
+  cm <- cummax(prices)
+  dd <- prices / cm - 1
   out$max_dd <- suppressWarnings(min(dd, na.rm = TRUE))
   out$ulcer_index <- sqrt(mean((dd * 100)^2, na.rm = TRUE))
 
+  # Liquidity features
+  traded_flag <- is.finite(dt$close_adj_final) & !is.na(dt$close_adj_final)
+  out$median_turnover <- stats::median(dt$turnover, na.rm = TRUE)
+  out$days_traded_ratio <- mean(traded_flag, na.rm = TRUE)
+
   # Amihud-like illiquidity
-  if (!"turnover" %in% names(dt_sym) && "vol_fin" %in% names(dt_sym)) {
-    dt_sym[, turnover := vol_fin]
-  }
-  valid <- is.finite(dt_sym$ret_simple) & is.finite(dt_sym$turnover) & dt_sym$turnover > 0
+  valid <- is.finite(dt$ret_cc_simple) & is.finite(dt$turnover) & dt$turnover > 0
   out$amihud <- if (any(valid)) {
-    mean(abs(dt_sym$ret_simple[valid]) / dt_sym$turnover[valid], na.rm = TRUE)
+    mean(abs(dt$ret_cc_simple[valid]) / dt$turnover[valid], na.rm = TRUE)
   } else NA_real_
 
   data.table::as.data.table(out)
@@ -2981,11 +3544,18 @@ af2_compute_liquidity_from_panel <- function(panel_adj,
 ###############################################################################
 # v2/modules/05_screener/R/run_screener.R
 
+# Return modes:
+#   return="ranked"   -> current behavior (score + ranks)
+#   return="features" -> ONLY the feature table (per-symbol metrics), no scoring
+
 af2_run_screener <- function(panel_adj,
                              config = NULL,
-                             allow_unresolved = NULL) {
+                             allow_unresolved = NULL,
+                             return = c("ranked", "features")) {
 
   af2_require("data.table")
+  return <- match.arg(return)
+
   # If caller didn't specify, default to core config policy
   if (is.null(allow_unresolved)) {
     cfg_core <- af2_get_config()
@@ -3025,12 +3595,12 @@ af2_run_screener <- function(panel_adj,
 
     # Ensure we keep enough rows to compute the longest horizon return.
     need_n <- max(
-     as.integer(cfg$lookback_days),
-     as.integer(max(cfg$horizons_days)) + 1L
+      as.integer(cfg$lookback_days),
+      as.integer(max(cfg$horizons_days)) + 1L
     )
 
     if (nrow(sdt) > need_n) {
-     sdt <- sdt[(.N - need_n + 1):.N]
+      sdt <- sdt[(.N - need_n + 1):.N]
     }
 
     m <- af2_compute_symbol_metrics(sdt, cfg$horizons_days)
@@ -3044,7 +3614,16 @@ af2_run_screener <- function(panel_adj,
   metrics <- data.table::rbindlist(metrics_list, fill = TRUE)
   if (!nrow(metrics)) stop("af2_run_screener: metrics computation yielded zero rows.", call. = FALSE)
 
-  # 3) Score + rank
+  # If requested: return ONLY features (no scoring/ranking)
+  if (return == "features") {
+    return(list(
+      features = metrics[order(symbol)],
+      liquidity = liq[order(symbol)],
+      config = cfg
+    ))
+  }
+
+  # 3) Score + rank (default behavior)
   out <- af2_score_and_rank(metrics, cfg$score_weights)
 
   by_type <- split(out, out$asset_type)
@@ -3052,10 +3631,13 @@ af2_run_screener <- function(panel_adj,
 
   list(
     full = out[order(rank_overall)],
-    by_type = by_type
+    by_type = by_type,
+    features = metrics[order(symbol)],
+    liquidity = liq[order(symbol)],
+    config = cfg
   )
-
 }
+
 
 
 
@@ -3208,6 +3790,1784 @@ Purpose:
 - Define OUTPUT contract
 - List functions
 - List tests
+
+
+
+###############################################################################
+### FILE: scripts/00_bootstrap_v2.R
+###############################################################################
+# v2/scripts/00_bootstrap_v2.R
+# Creates the v2 directory structure + minimal placeholder READMEs.
+# Run from project root: source("v2/scripts/00_bootstrap_v2.R")
+
+af2_bootstrap_v2 <- function(root = "v2", verbose = TRUE) {
+  dirs <- c(
+    root,
+    file.path(root, "README.md"),
+    file.path(root, "contracts"),
+    file.path(root, "data", "raw"),
+    file.path(root, "data", "cache"),
+    file.path(root, "data", "fixtures"),
+    file.path(root, "data", "manual"),
+    file.path(root, "logs"),
+    file.path(root, "modules"),
+    file.path(root, "modules", "00_core", "R"),
+    file.path(root, "modules", "00_core", "tests"),
+    file.path(root, "modules", "01_b3_universe", "R"),
+    file.path(root, "modules", "01_b3_universe", "tests"),
+    file.path(root, "modules", "02_diagnostics", "R"),
+    file.path(root, "modules", "02_diagnostics", "tests"),
+    file.path(root, "modules", "03_corporate_actions", "R"),
+    file.path(root, "modules", "03_corporate_actions", "tests"),
+    file.path(root, "modules", "04_adjuster", "R"),
+    file.path(root, "modules", "04_adjuster", "tests"),
+    file.path(root, "modules", "05_screener", "R"),
+    file.path(root, "modules", "05_screener", "tests"),
+    file.path(root, "modules", "06_risk", "R"),
+    file.path(root, "modules", "06_risk", "tests"),
+    file.path(root, "modules", "07_portfolio", "R"),
+    file.path(root, "modules", "07_portfolio", "tests"),
+    file.path(root, "modules", "08_backtest", "R"),
+    file.path(root, "modules", "08_backtest", "tests"),
+    file.path(root, "scripts")
+  )
+
+  # Create directories (ignore .md entries)
+  dir_paths <- dirs[!grepl("\\.md$", dirs)]
+  for (d in dir_paths) {
+    if (!dir.exists(d)) {
+      dir.create(d, recursive = TRUE, showWarnings = FALSE)
+      if (verbose) message("Created: ", d)
+    }
+  }
+
+  # Minimal contracts placeholders
+  contract_files <- c(
+    "universe_raw.md",
+    "adjustments.md",
+    "panel_adj.md",
+    "screener_input.md",
+    "screener_output.md"
+  )
+  for (f in contract_files) {
+    p <- file.path(root, "contracts", f)
+    if (!file.exists(p)) {
+      writeLines(
+        c(
+          paste0("# ", f),
+          "",
+          "This is a placeholder. Fill with the explicit schema + guarantees."
+        ),
+        con = p
+      )
+      if (verbose) message("Seeded contract: ", p)
+    }
+  }
+
+  # Module READMEs
+  module_readmes <- c(
+    file.path(root, "modules", "00_core", "README.md"),
+    file.path(root, "modules", "01_b3_universe", "README.md"),
+    file.path(root, "modules", "02_diagnostics", "README.md"),
+    file.path(root, "modules", "03_corporate_actions", "README.md"),
+    file.path(root, "modules", "04_adjuster", "README.md"),
+    file.path(root, "modules", "05_screener", "README.md")
+  )
+  for (p in module_readmes) {
+    if (!file.exists(p)) {
+      writeLines(
+        c(
+          "# Module",
+          "",
+          "Purpose:",
+          "- Define INPUT contract",
+          "- Define OUTPUT contract",
+          "- List functions",
+          "- List tests"
+        ),
+        con = p
+      )
+      if (verbose) message("Seeded README: ", p)
+    }
+  }
+
+  # Root README
+  root_readme <- file.path(root, "README.md")
+  if (!file.exists(root_readme)) {
+    writeLines(
+      c(
+        "# autofinance_R v2",
+        "",
+        "Principles:",
+        "- In-memory first",
+        "- Contract-first",
+        "- Fixtures-first",
+        "- Screener cannot fetch or adjust data",
+        "- Adjuster is the single owner of history mutation"
+      ),
+      con = root_readme
+    )
+    if (verbose) message("Seeded: ", root_readme)
+  }
+
+  invisible(TRUE)
+}
+
+af2_bootstrap_v2()
+
+
+
+###############################################################################
+### FILE: scripts/00_make_fixtures.R
+###############################################################################
+# v2/scripts/00_make_fixtures.R
+# Generates deterministic mock panels for screener development.
+# Run from project root:
+#   source("v2/modules/00_core/R/utils.R")
+#   source("v2/modules/00_core/R/config.R")
+#   source("v2/scripts/00_make_fixtures.R")
+
+af2_make_price_path <- function(dates, start_price = 10,
+                                drift = 0.0003, vol = 0.01,
+                                seed = 1L) {
+  set.seed(seed)
+  n <- length(dates)
+  eps <- rnorm(n, mean = drift, sd = vol)
+  px <- start_price * cumprod(1 + eps)
+  pmax(px, 0.01)
+}
+
+af2_write_fixture <- function(dt, name, cfg) {
+  p <- file.path(cfg$fixtures_dir, paste0(name, ".rds"))
+  saveRDS(dt, p)
+  message("Wrote fixture: ", p)
+}
+
+af2_make_fixtures <- function(config = NULL) {
+  af2_require(c("data.table", "lubridate"))
+  cfg <- af2_get_config(config)
+
+  # ~260 business days ending today
+  end_date <- Sys.Date()
+  start_date <- end_date - 400
+  dates <- af2_make_bizdays_seq(start_date, end_date)
+  dates <- tail(dates, 260)
+
+  symbols <- c("AAA4", "BBB11", "CCC34", "DDD11")
+  asset_type_map <- c(
+    AAA4 = "equity",
+    BBB11 = "fii",
+    CCC34 = "bdr",
+    DDD11 = "etf"
+  )
+
+  # Construct 4 different behaviors
+  px_A <- af2_make_price_path(dates, 10, drift = 0.0008, vol = 0.007, seed = 11)  # strong uptrend
+  px_B <- af2_make_price_path(dates, 100, drift = 0.0001, vol = 0.003, seed = 22) # low vol/flat
+  px_C <- af2_make_price_path(dates, 30, drift = 0.0003, vol = 0.020, seed = 33)  # volatile
+  px_D <- af2_make_price_path(dates, 50, drift = -0.0002, vol = 0.010, seed = 44) # mild down
+
+  price_list <- list(AAA4 = px_A, BBB11 = px_B, CCC34 = px_C, DDD11 = px_D)
+
+  # Base liquidity
+  liq_level <- c(AAA4 = 2e6, BBB11 = 8e5, CCC34 = 1.5e6, DDD11 = 1.2e6)
+
+  rows <- list()
+  for (sym in symbols) {
+    px <- price_list[[sym]]
+    turnover <- liq_level[[sym]] * (1 + rnorm(length(px), 0, 0.1))
+    turnover <- pmax(turnover, 1e4)
+
+    dt <- data.table::data.table(
+      symbol = sym,
+      refdate = dates,
+      close_raw = px,
+      close_adj_split = px,
+      close_adj_final = px,
+      turnover = turnover,
+      qty = round(turnover / px),
+      asset_type = asset_type_map[[sym]],
+      adjustment_state = "ok"
+    )
+    rows[[sym]] <- dt
+  }
+
+  panel_mock_small <- data.table::rbindlist(rows)
+  data.table::setorder(panel_mock_small, symbol, refdate)
+
+  # Edge cases fixture
+  panel_mock_edge <- data.table::copy(panel_mock_small)
+
+  # Make one symbol illiquid
+  panel_mock_edge[symbol == "BBB11", turnover := 1e4]
+
+  # Insert missing block for CCC34
+  miss_idx <- panel_mock_edge[symbol == "CCC34", .I][50:70]
+  panel_mock_edge[miss_idx, close_adj_final := NA_real_]
+
+  # Mark DDD11 unresolved suspect
+  panel_mock_edge[symbol == "DDD11", adjustment_state := "suspect_unresolved"]
+
+  # "Split case" fixture (simulates pre-adjustment discontinuity,
+  # but we store final as already fixed for screener use)
+  panel_mock_split <- data.table::copy(panel_mock_small)
+  # create raw discontinuity for AAA4 around mid
+  mid <- panel_mock_split[symbol == "AAA4", .I][130]
+  panel_mock_split[mid:nrow(panel_mock_split)][symbol == "AAA4", close_raw := close_raw / 5]
+  # but keep adjusted final coherent
+  panel_mock_split[symbol == "AAA4", close_adj_split := close_adj_final]
+  panel_mock_split[symbol == "AAA4", adjustment_state := "split_only"]
+
+  # Save
+  af2_write_fixture(panel_mock_small, "panel_mock_small", cfg)
+  af2_write_fixture(panel_mock_edge, "panel_mock_edge_cases", cfg)
+  af2_write_fixture(panel_mock_split, "panel_mock_split_case", cfg)
+
+  invisible(TRUE)
+}
+
+af2_make_fixtures()
+
+
+
+###############################################################################
+### FILE: scripts/01a_smoke_b3_fetch_one_year.R
+###############################################################################
+# v2/scripts/01a_smoke_b3_fetch_one_year.R
+# Real-data smoke test:
+# - fetch 1 year
+# - include only 1-2 types
+# - confirm contract + speed + caching
+
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+cfg <- af2_get_config()
+af2_log("AF2_CFG:", "\n", paste(capture.output(str(cfg)), collapse = "\n"))
+
+year_test <- max(cfg$years)
+types_test <- c("equity", "etf")
+
+af2_log("AF2_B3:", "SMOKE: year=", year_test, " types=", paste(types_test, collapse = ","))
+
+t0 <- Sys.time()
+dt <- af2_b3_build_universe_year(
+  year = year_test,
+  include_types = types_test,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_download = FALSE,
+  reprocess = FALSE
+)
+t1 <- Sys.time()
+
+af2_log("AF2_B3:", "SMOKE elapsed seconds: ", round(as.numeric(difftime(t1, t0, units = "secs")), 2))
+
+af2_log("AF2_B3:", "Head:")
+print(utils::head(dt, 10))
+
+# Contract check
+req <- c("symbol","refdate","open","high","low","close","turnover","qty","asset_type")
+stopifnot(all(req %in% names(dt)))
+
+af2_log("AF2_B3:", "SMOKE OK.")
+
+
+
+###############################################################################
+### FILE: scripts/01b_build_universe_small_window.R
+###############################################################################
+# v2/scripts/01b_build_universe_small_window.R
+# Build a small 2-year universe for all 4 types
+# and save a narrow raw panel artifact.
+
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+cfg <- af2_get_config()
+
+# Choose mode here to avoid future screener regressions.
+# "yearly" = backfill-style artifact
+# "daily"  = screener-grade recent window
+mode <- "yearly"
+types_all <- c("equity","fii","etf","bdr")
+
+if (mode == "yearly") {
+
+  years_small <- sort(unique(c(max(cfg$years) - 1L, max(cfg$years))))
+
+  af2_log("AF2_B3:", "Building small-window universe (YEARLY): ",
+          paste(years_small, collapse = ", "),
+          " types=", paste(types_all, collapse = ","))
+
+  dt_all <- af2_b3_build_universe(
+    years = years_small,
+    include_types = types_all,
+    cfg = cfg,
+    verbose = TRUE,
+    use_cache = TRUE
+  )
+
+  artifact_file <- file.path(
+    file.path(cfg$raw_dir, "b3_universe"),
+    paste0("universe_raw_", min(years_small), "_", max(years_small), ".rds")
+  )
+
+} else {
+
+  # Recent ~2-year screener-style window
+  end_date <- Sys.Date() - 1
+  start_date <- end_date - 730
+
+  af2_log("AF2_B3:", "Building small-window universe (DAILY): ",
+          as.character(start_date), " to ", as.character(end_date),
+          " types=", paste(types_all, collapse = ","))
+
+  dt_all <- af2_b3_build_universe_window(
+    start_date = start_date,
+    end_date   = end_date,
+    include_types = types_all,
+    cfg = cfg,
+    verbose = TRUE,
+    use_cache = TRUE
+  )
+
+  artifact_file <- file.path(
+    file.path(cfg$raw_dir, "b3_universe"),
+    paste0("universe_raw_daily_",
+           format(as.Date(start_date), "%Y%m%d"), "_",
+           format(as.Date(end_date), "%Y%m%d"),
+           ".rds")
+  )
+}
+
+af2_log("AF2_B3:", "Universe rows total: ", nrow(dt_all))
+af2_log("AF2_B3:", "Symbols total: ", length(unique(dt_all$symbol)))
+
+artifact_dir <- file.path(cfg$raw_dir, "b3_universe")
+if (!dir.exists(artifact_dir)) dir.create(artifact_dir, recursive = TRUE)
+
+saveRDS(dt_all, artifact_file)
+af2_log("AF2_B3:", "Wrote artifact: ", artifact_file)
+
+RUN_DAILY_SMOKE <- FALSE
+
+if (mode == "yearly" && isTRUE(RUN_DAILY_SMOKE)) {
+  end_date <- Sys.Date() - 1
+  start_date <- end_date - 90  # ~3 months
+  dt_daily_lazy <- af2_b3_fetch_daily_lazy(
+    start_date, end_date,
+    cfg = cfg,
+    verbose = TRUE,
+    throttle = FALSE
+  )
+  # just force a tiny collect to prove it works
+  print(dt_daily_lazy |> dplyr::slice_head(n = 5) |> dplyr::collect())
+}
+
+
+
+###############################################################################
+### FILE: scripts/02a_smoke_corp_actions_quantmod.R
+###############################################################################
+# v2/scripts/02a_smoke_corp_actions_quantmod.R
+
+# Core
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# Universe (to get a recent symbol list)
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+# Corporate actions
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+
+cfg <- af2_get_config()
+
+# Use last config year, tiny types subset to keep smoke fast
+year_test <- max(cfg$years)
+types_test <- c("equity")
+
+af2_log("AF2_B3:", "SMOKE universe for corp-actions seed: year=", year_test)
+
+dt_univ <- af2_b3_build_universe_year(
+  year = year_test,
+  include_types = types_test,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+# Grab a small symbol slice
+syms <- unique(dt_univ$symbol)
+syms <- head(syms, 20)
+
+af2_log("AF2_CA:", "SMOKE fetching splits+dividends for 20 symbols...")
+
+dt_ca <- af2_ca_build_registry(
+  symbols = syms,
+  cfg = cfg,
+  from = as.Date(paste0(year_test - 3, "-01-01")),
+  to = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L
+)
+
+print(dt_ca)
+af2_log("AF2_CA:", "OK - corp-actions smoke finished.")
+
+
+
+###############################################################################
+### FILE: scripts/04_run_screener_mock_only.R
+###############################################################################
+# v2/scripts/04_run_screener_mock_only.R
+# Runs the v2 screener ONLY on fixtures.
+# This is your daily sanity anchor.
+
+# Core
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# Screener
+source("v2/modules/05_screener/R/screener_config.R")
+source("v2/modules/05_screener/R/validate_screener_input.R")
+source("v2/modules/05_screener/R/liquidity_filter.R")
+source("v2/modules/05_screener/R/compute_metrics.R")
+source("v2/modules/05_screener/R/score_rank.R")
+source("v2/modules/05_screener/R/run_screener.R")
+
+cfg <- af2_get_config()
+
+fixture_path <- file.path(cfg$fixtures_dir, "panel_mock_small.rds")
+if (!file.exists(fixture_path)) {
+  stop("Fixture not found: ", fixture_path,
+       "\nRun: source('v2/scripts/00_make_fixtures.R')", call. = FALSE)
+}
+
+panel <- readRDS(fixture_path)
+
+af2_log_cfg(cfg)
+af2_log("AF2_SCR:", "Running screener on mock_small...")
+
+res <- af2_run_screener(panel)
+
+stopifnot(is.list(res), "full" %in% names(res))
+stopifnot(nrow(res$full) == 4L)
+stopifnot(all(c("AAA4","BBB11","CCC34","DDD11") %in% res$full$symbol))
+
+# Rankings should be complete for this fixture
+stopifnot(all(!is.na(res$full$rank_overall)))
+
+print(utils::head(res$full, 10))
+
+af2_log("AF2_SCR:", "OK - mock-only screener passed.")
+
+
+
+###############################################################################
+### FILE: scripts/04a_smoke_adjuster_small_window.R
+###############################################################################
+# v2/scripts/04a_smoke_adjuster_small_window.R
+
+# Core
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# Module 01 (universe)
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+# Module 03 (corp actions)
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+
+# Module 04 (adjuster)
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+cfg <- af2_get_config()
+
+# 1) Build small recent universe window
+end_date <- Sys.Date() - 1
+start_date <- end_date - 365  # 1 year smoke
+
+types_all <- c("equity","fii","etf","bdr")
+
+af2_log("AF2_SMOKE04:", "Universe window ", start_date, " to ", end_date)
+
+univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+# take a small symbol subset for faster Yahoo calls
+set.seed(1)
+syms <- sort(unique(univ$symbol))
+syms_small <- head(sample(syms, min(20, length(syms))), 20)
+
+af2_log("AF2_SMOKE04:", "Corp actions for ", length(syms_small), " symbols")
+
+ca <- af2_ca_build_registry(
+  symbols = syms_small,
+  cfg = cfg,
+  from = "2018-01-01",
+  to = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L
+)
+
+# 2) Filter universe to same subset
+univ_small <- univ[symbol %in% syms_small]
+
+# 3) Build adjusted panel
+res <- af2_build_panel_adj(
+  universe_raw = univ_small,
+  corp_actions = ca,
+  manual_events = NULL,
+  cfg = cfg,
+  verbose = TRUE
+)
+
+panel_adj <- res$panel_adj
+
+# 4) Validate
+af2_validate_panel_adj(panel_adj)
+
+# 5) Show sample
+print(utils::head(panel_adj, 20))
+
+af2_log("AF2_SMOKE04:", "OK - adjuster smoke passed.")
+
+
+
+###############################################################################
+### FILE: scripts/04b_diagnose_suspects_selective.R
+###############################################################################
+# v2/scripts/04b_diagnose_suspects_selective.R
+# Focused diagnostic run for known bad actors.
+# Uses selective wrapper + force_symbols capability.
+
+# ----------------------------
+# 00) Core
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# ----------------------------
+# 01) Universe
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+# ----------------------------
+# 02) Corporate actions + selective prefilter
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+source("v2/modules/03_corporate_actions/R/select_candidates.R")
+
+# ----------------------------
+# 03) Adjuster
+# ----------------------------
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/build_panel_adj_selective.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+# ----------------------------
+# Step 0 — Config overrides for a clean diagnostic
+# ----------------------------
+cfg_dbg <- af2_get_config(list(
+  # First pass: disable selective so you see raw Yahoo behavior
+  # You can flip this to TRUE in a second run.
+  enable_selective_actions = FALSE,
+
+  # Good for incremental cache behavior
+  ca_cache_mode = "by_symbol",
+
+  # First pass: do NOT gate splits
+  enable_split_plausibility_gate = FALSE,
+
+  split_gate_min = 0.05,
+  split_gate_max = 20
+))
+
+af2_log_cfg(cfg_dbg)
+
+# ----------------------------
+# Step 1 — Your known bad actors
+# ----------------------------
+sus <- c("AMER3","MGLU3","OIBR3","TIMS3","HAPV3","AURA33",
+         "ALZR11","HFOF11","RBVA11","TEPP11",
+         "NFLX34","WALM34","AVGO34")
+
+# ----------------------------
+# 04) Build a small recent universe window
+# ----------------------------
+types_all <- c("equity","fii","etf","bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - 365
+
+af2_log("AF2_DIAG04B:", "Universe window ", start_date, " to ", end_date)
+
+univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg_dbg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+# Restrict universe to suspects to reduce workload noise
+univ_sus <- univ[symbol %in% sus]
+
+af2_log("AF2_DIAG04B:", "Suspect rows=", nrow(univ_sus),
+        " symbols=", length(unique(univ_sus$symbol)))
+
+# ----------------------------
+# 05) Build adjusted panel via selective wrapper
+# ----------------------------
+res <- af2_build_panel_adj_selective(
+  universe_raw = univ_sus,
+  manual_events = NULL,
+  cfg = cfg_dbg,
+  from_ca = "2018-01-01",
+  to_ca   = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L,
+
+  # This now works after Patch 1
+  force_symbols = sus
+)
+
+panel_adj <- res$panel_adj
+af2_validate_panel_adj(panel_adj)
+
+# ----------------------------
+# PATCH C — Split-day shock sanity check (collision-proof)
+# ----------------------------
+# Goal:
+# On dates where a split exists:
+#   - raw close should show a large 1-day mechanical jump
+#   - adjusted close should show a much smaller jump
+#
+# This version avoids merge name collisions with panel_adj.
+
+events <- data.table::as.data.table(res$events)
+
+# Keep only actual split events (price factors != 1)
+spl_ev <- events[
+  is.finite(split_value) & split_value != 1,
+  .(
+    symbol,
+    refdate,
+    split_value_event = split_value,
+    source_mask_event = source_mask,
+    has_manual_event  = has_manual
+  )
+]
+
+panel_chk <- data.table::as.data.table(panel_adj)
+data.table::setorder(panel_chk, symbol, refdate)
+
+# Attach event-side split info WITHOUT clobbering any existing split_value
+panel_chk <- merge(
+  panel_chk,
+  spl_ev,
+  by = c("symbol", "refdate"),
+  all.x = TRUE
+)
+
+# Choose a unified split factor column for diagnostics:
+# Prefer the event table value when present; fall back to panel's split_value if it exists.
+panel_chk[, split_factor := split_value_event]
+
+if ("split_value" %in% names(panel_chk)) {
+  panel_chk[is.na(split_factor) & is.finite(split_value) & split_value != 1,
+            split_factor := split_value]
+}
+
+# Safety: ensure expected price columns exist
+need_cols <- c("close_raw", "close_adj_final")
+missing_cols <- setdiff(need_cols, names(panel_chk))
+if (length(missing_cols)) {
+  stop("PATCH C error: missing columns in panel_adj: ",
+       paste(missing_cols, collapse = ", "))
+}
+
+# Day-to-day ratios
+panel_chk[, `:=`(
+  raw_ratio = close_raw / data.table::shift(close_raw),
+  adj_ratio = close_adj_final / data.table::shift(close_adj_final)
+), by = symbol]
+
+# Scale-free shock size
+panel_chk[, `:=`(
+  raw_shock = abs(log(raw_ratio)),
+  adj_shock = abs(log(adj_ratio))
+)]
+
+# Only true split days
+split_days <- panel_chk[
+  is.finite(split_factor) & split_factor != 1
+]
+
+if (nrow(split_days)) {
+
+  cat("\nAF2_DIAG04B: Split-day shock summary",
+      "(expect adj_shock << raw_shock)\n")
+
+  by_sym <- split_days[, .(
+    n_split_days   = .N,
+    mean_raw_shock = mean(raw_shock, na.rm = TRUE),
+    mean_adj_shock = mean(adj_shock, na.rm = TRUE),
+    pct_improved   = mean(adj_shock < raw_shock, na.rm = TRUE)
+  ), by = symbol][order(-n_split_days, -pct_improved)]
+
+  print(by_sym)
+
+  cat("\nAF2_DIAG04B: Worst raw split-day jumps (top 20)\n")
+  print(
+    split_days[
+      order(-raw_shock)
+    ][1:min(20L, .N),
+      .(
+        symbol, refdate,
+        split_factor,
+        close_raw, raw_ratio, raw_shock,
+        close_adj_final, adj_ratio, adj_shock,
+        source_mask_event, has_manual_event
+      )
+    ]
+  )
+
+} else {
+  cat("\nAF2_DIAG04B: No split days found in this window.\n")
+}
+
+af2_log("AF2_DIAG04B:", "panel_adj rows=", nrow(panel_adj),
+        " symbols=", length(unique(panel_adj$symbol)))
+
+print(panel_adj[, .N, by = adjustment_state][order(-N)])
+
+
+
+###############################################################################
+### FILE: scripts/05a_smoke_screener_real_small_window.R
+###############################################################################
+# v2/scripts/05a_smoke_screener_real_small_window.R
+# End-to-end real-data smoke:
+# Universe (rb3 daily) -> Corp actions (quantmod/Yahoo cached)
+# -> Adjuster -> Screener
+#
+# Goal:
+# - Prove the full v2 spine works on a small real window + sampled symbols
+# - Avoid Yahoo hammering via Module 03 cache
+# - Surface any contract mismatches early
+
+# ----------------------------
+# 00) Core
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+cfg <- af2_get_config()
+
+af2_log_cfg(cfg)
+
+# ----------------------------
+# 01) Universe (rb3)
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_yearly.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+types_all <- c("equity", "fii", "etf", "bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - 730  # ~2y for faster smoke
+
+af2_log("AF2_SMOKE05:", "Universe window ", as.character(start_date), " to ", as.character(end_date))
+
+dt_univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+af2_log("AF2_SMOKE05:", "Universe rows=", nrow(dt_univ),
+        " symbols=", length(unique(dt_univ$symbol)))
+
+# ----------------------------
+# 02) Sample symbols
+# ----------------------------
+set.seed(42)
+sample_n <- 50L
+
+all_syms <- unique(dt_univ$symbol)
+syms_smoke <- if (length(all_syms) > sample_n) sample(all_syms, sample_n) else all_syms
+
+dt_univ_smoke <- dt_univ[symbol %in% syms_smoke]
+
+af2_log("AF2_SMOKE05:", "Sampled symbols=", length(syms_smoke),
+        " sampled rows=", nrow(dt_univ_smoke))
+
+# ----------------------------
+# 03) Corporate actions (quantmod/Yahoo)
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+
+from_ca <- as.Date("2018-01-01")
+to_ca   <- Sys.Date()
+
+# keep conservative parallel for Windows; adjust if you want
+n_workers <- 2L
+
+af2_log("AF2_SMOKE05:", "Building corp-actions registry for ", length(syms_smoke), " symbols")
+
+registry <- af2_ca_build_registry(
+  symbols = syms_smoke,
+  cfg = cfg,
+  from = from_ca,
+  to = to_ca,
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = n_workers
+)
+
+af2_log("AF2_SMOKE05:", "Registry rows=", nrow(registry),
+        " symbols with actions=", length(unique(registry$symbol)))
+
+# ----------------------------
+# 04) Adjuster (Module 04)
+# ----------------------------
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+res_adj <- af2_build_panel_adj(
+  universe_raw = dt_univ_smoke,
+  corp_actions = registry,
+  manual_events = NULL,
+  cfg = cfg,
+  verbose = TRUE
+)
+
+panel_adj <- res_adj$panel_adj
+
+af2_validate_panel_adj(panel_adj)
+
+af2_log("AF2_SMOKE05:", "panel_adj rows=", nrow(panel_adj),
+        " symbols=", length(unique(panel_adj$symbol)))
+
+# ----------------------------
+# 05) Screener (real data)
+# ----------------------------
+source("v2/modules/05_screener/R/screener_config.R")
+source("v2/modules/05_screener/R/validate_screener_input.R")
+source("v2/modules/05_screener/R/liquidity_filter.R")
+source("v2/modules/05_screener/R/compute_metrics.R")
+source("v2/modules/05_screener/R/score_rank.R")
+source("v2/modules/05_screener/R/run_screener.R")
+
+af2_log("AF2_SMOKE05:", "Running real-data screener (allow_unresolved=TRUE for smoke).")
+
+res <- af2_run_screener(
+  panel_adj,
+  config = list(
+    lookback_days = 80L,
+    horizons_days = c(21L, 63L)
+  ),
+  allow_unresolved = TRUE
+)
+
+af2_log("AF2_SMOKE05:", "by_type integrity check:")
+print(lapply(res$by_type, function(x) unique(x$asset_type)))
+
+af2_log("AF2_SMOKE05:", "Top 10 overall:")
+print(utils::head(res$full, 10))
+
+af2_log("AF2_SMOKE05:", "Top 5 by type:")
+for (tp in names(res$by_type)) {
+  af2_log("AF2_SMOKE05:", "Type=", tp)
+  print(utils::head(res$by_type[[tp]], 5))
+}
+
+af2_log("AF2_SMOKE05:", "OK - real-data screener smoke passed.")
+
+
+
+###############################################################################
+### FILE: scripts/05b_hard_screener_full_selective.R
+###############################################################################
+# v2/scripts/05b_hard_screener_full_selective.R
+# Full-B3-ish hard test WITH the selective Yahoo "trick".
+# Expectation:
+# - Universe may have ~2000+ symbols
+# - Yahoo fetch should be a small fraction (candidates)
+# - Per-symbol caching can be enabled
+
+# ----------------------------
+# 00) Core
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+cfg <- af2_get_config(list(
+  # Turn on the real architecture knobs here
+  enable_selective_actions = TRUE,
+
+  # Strongly recommended for the hard run:
+  ca_cache_mode = "by_symbol",
+
+  # You can tighten/loosen these as you learn
+  ca_prefilter_top_n_overall = 200L,
+  ca_prefilter_top_n_by_type = 50L,
+  ca_prefilter_max_candidates = 300L
+))
+
+af2_log_cfg(cfg)
+
+# ----------------------------
+# 01) Universe (rb3)
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+types_all <- c("equity", "fii", "etf", "bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - 730
+
+af2_log("AF2_HARD05:", "Universe window ", as.character(start_date), " to ", as.character(end_date))
+
+dt_univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+af2_log("AF2_HARD05:", "Universe rows=", nrow(dt_univ),
+        " symbols=", length(unique(dt_univ$symbol)))
+
+# ----------------------------
+# 02) Corporate actions + Adjuster (selective wrapper)
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+source("v2/modules/03_corporate_actions/R/select_candidates.R")
+
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/build_panel_adj_selective.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+af2_log("AF2_HARD05:", "Building adjusted panel with selective Yahoo registry...")
+
+res_adj <- af2_build_panel_adj_selective(
+  universe_raw = dt_univ,
+  manual_events = NULL,
+  cfg = cfg,
+  from_ca = "2018-01-01",
+  to_ca   = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L
+)
+
+panel_adj <- res_adj$panel_adj
+af2_validate_panel_adj(panel_adj)
+
+af2_log("AF2_HARD05:", "panel_adj rows=", nrow(panel_adj),
+        " symbols=", length(unique(panel_adj$symbol)))
+
+# ----------------------------
+# 03) Screener
+# ----------------------------
+source("v2/modules/05_screener/R/screener_config.R")
+source("v2/modules/05_screener/R/validate_screener_input.R")
+source("v2/modules/05_screener/R/liquidity_filter.R")
+source("v2/modules/05_screener/R/compute_metrics.R")
+source("v2/modules/05_screener/R/score_rank.R")
+source("v2/modules/05_screener/R/run_screener.R")
+
+af2_log("AF2_HARD05:", "Running screener on full adjusted panel...")
+
+res <- af2_run_screener(
+  panel_adj,
+  config = list(
+    lookback_days = 252L,
+    horizons_days = c(21L, 63L, 126L, 252L)
+  ),
+  allow_unresolved = NULL
+)
+
+af2_log("AF2_HARD05:", "Top 20 overall:")
+print(utils::head(res$full, 20))
+
+af2_log("AF2_HARD05:", "OK - hard selective full run finished.")
+
+
+
+###############################################################################
+### FILE: scripts/05c_hard_selective_split_audit.R
+###############################################################################
+# v2/scripts/05c_hard_selective_split_audit.R
+# Full-universe HARD diagnostic:
+# - Uses the real selective CA architecture
+# - Builds a full adjusted panel
+# - Audits split consistency at scale
+#
+# Goal:
+# Identify whether split misinterpretation / duplication / missing data
+# is systemic beyond your 13-symbol suspect list.
+
+# ----------------------------
+# 00) Core
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+# data.table is assumed elsewhere, but load defensively
+suppressWarnings(suppressMessages({
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("data.table required for this script.")
+  }
+}))
+library(data.table)
+
+# ----------------------------
+# 00b) Audit knobs (edit here)
+# ----------------------------
+audit_cfg <- list(
+  # Universe length
+  lookback_days_universe = 730L,
+
+  # RAW-gap thresholds for "split-like" candidates
+  # We intentionally use multiple cutoffs to avoid a single presumptive band.
+  raw_ratio_bands = list(
+    band1 = c(0.20, 5.00),
+    band2 = c(0.10, 10.0),
+    band3 = c(0.05, 20.0)
+  ),
+
+  # What counts as "raw barely moved"
+  # Used to flag suspicious split events that don't match COTAHIST reality.
+  small_move_band = c(0.80, 1.25),
+
+  # How many rows to print for each suspicious bucket
+  top_n_print = 25L
+)
+
+# ----------------------------
+# 00c) Real architecture config (selective ON)
+# ----------------------------
+cfg <- af2_get_config(list(
+  enable_selective_actions = TRUE,
+  ca_cache_mode = "by_symbol",
+
+  # Keep prefilter limits realistic for full run
+  ca_prefilter_top_n_overall   = 200L,
+  ca_prefilter_top_n_by_type   = 50L,
+  ca_prefilter_max_candidates  = 300L,
+
+  # IMPORTANT:
+  # For this audit we want to SEE Yahoo behavior,
+  # not suppress it. So keep this OFF here.
+  enable_split_plausibility_gate = FALSE
+))
+
+af2_log_cfg(cfg)
+
+# ----------------------------
+# 01) Universe (rb3)
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+types_all <- c("equity", "fii", "etf", "bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - as.integer(audit_cfg$lookback_days_universe)
+
+af2_log("AF2_AUDIT05C:", "Universe window ", as.character(start_date),
+        " to ", as.character(end_date))
+
+dt_univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+af2_log("AF2_AUDIT05C:", "Universe rows=", nrow(dt_univ),
+        " symbols=", length(unique(dt_univ$symbol)))
+
+# ----------------------------
+# 02) Corporate actions + Adjuster (selective wrapper)
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+source("v2/modules/03_corporate_actions/R/select_candidates.R")
+
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/build_panel_adj_selective.R")
+source("v2/modules/04_adjuster/R/validate_panel_adj.R")
+
+af2_log("AF2_AUDIT05C:", "Building adjusted panel with selective Yahoo registry...")
+
+res_adj <- af2_build_panel_adj_selective(
+  universe_raw = dt_univ,
+  manual_events = NULL,
+  cfg = cfg,
+  from_ca = "2018-01-01",
+  to_ca   = Sys.Date(),
+  verbose = TRUE,
+  use_cache = TRUE,
+  force_refresh = FALSE,
+  n_workers = 1L
+)
+
+panel_adj <- as.data.table(res_adj$panel_adj)
+events    <- as.data.table(res_adj$events)
+
+af2_validate_panel_adj(panel_adj)
+
+af2_log("AF2_AUDIT05C:", "panel_adj rows=", nrow(panel_adj),
+        " symbols=", length(unique(panel_adj$symbol)))
+af2_log("AF2_AUDIT05C:", "events rows=", nrow(events),
+        " symbols=", length(unique(events$symbol)))
+
+# Defensive: ensure we have the expected columns
+needed_panel <- c("symbol","refdate","asset_type","close_raw","close_adj_final")
+missing_panel <- setdiff(needed_panel, names(panel_adj))
+if (length(missing_panel)) {
+  af2_log("AF2_AUDIT05C:", "ERROR: panel missing cols: ",
+          paste(missing_panel, collapse = ", "))
+  stop("panel_adj missing required columns for audit.")
+}
+
+needed_events <- c("symbol","refdate","split_value","source_mask","has_manual")
+missing_events <- setdiff(needed_events, names(events))
+if (length(missing_events)) {
+  af2_log("AF2_AUDIT05C:", "ERROR: events missing cols: ",
+          paste(missing_events, collapse = ", "))
+  stop("events missing required columns for audit.")
+}
+
+# ----------------------------
+# 03) Build RAW and ADJ shock series
+# ----------------------------
+setorder(panel_adj, symbol, refdate)
+
+panel_adj[, raw_ratio := close_raw / shift(close_raw, 1L), by = symbol]
+panel_adj[, adj_ratio := close_adj_final / shift(close_adj_final, 1L), by = symbol]
+
+panel_adj[, raw_shock := abs(log(raw_ratio))]
+panel_adj[, adj_shock := abs(log(adj_ratio))]
+
+# Clean impossible rows
+panel_adj <- panel_adj[
+  is.finite(raw_ratio) & raw_ratio > 0 &
+  is.finite(adj_ratio) & adj_ratio > 0
+]
+
+# ----------------------------
+# 04) Event-driven split days
+# ----------------------------
+ev_splits <- events[is.finite(split_value) & split_value != 1]
+
+# Join split info into panel on same date
+panel_ev <- merge(
+  panel_adj,
+  ev_splits[, .(symbol, refdate, split_factor = split_value,
+                source_mask_event = source_mask,
+                has_manual_event = has_manual)],
+  by = c("symbol","refdate"),
+  all.x = TRUE
+)
+
+panel_ev[, is_split_day_event := !is.na(split_factor)]
+
+af2_log("AF2_AUDIT05C:", "Event-driven split days detected: ",
+        uniqueN(panel_ev[is_split_day_event == TRUE, .(symbol, refdate)]),
+        " (symbol-date pairs)")
+
+# ----------------------------
+# 05) RAW-gap-driven split-like candidates
+# ----------------------------
+make_raw_candidates <- function(dt, band, label) {
+  lo <- band[1]; hi <- band[2]
+  out <- dt[
+    raw_ratio < lo | raw_ratio > hi,
+    .(symbol, refdate, asset_type, close_raw,
+      raw_ratio, raw_shock, adj_ratio, adj_shock)
+  ]
+  out[, band_label := label]
+  out
+}
+
+raw_cands <- rbindlist(lapply(names(audit_cfg$raw_ratio_bands), function(nm) {
+  make_raw_candidates(panel_ev, audit_cfg$raw_ratio_bands[[nm]], nm)
+}), use.names = TRUE, fill = TRUE)
+
+af2_log("AF2_AUDIT05C:", "RAW-gap candidates (any band): ",
+        nrow(raw_cands), " rows in total across bands.")
+
+# ----------------------------
+# 06) Coverage diagnostics (FIXED)
+# ----------------------------
+
+# Build a unique key of raw-gap symbol-date by band
+raw_cands_key <- unique(raw_cands[, .(symbol, refdate, band_label)])
+
+# Attach whether registry says that symbol-date is a split day
+raw_cands_key <- merge(
+  raw_cands_key,
+  panel_ev[, .(symbol, refdate, is_split_day_event)],
+  by = c("symbol","refdate"),
+  all.x = TRUE
+)
+
+raw_cands_key[is.na(is_split_day_event), is_split_day_event := FALSE]
+
+# Summarize coverage per band
+cov_by_band <- raw_cands_key[
+  , .(
+    n_rows = .N,
+    n_symbols = uniqueN(symbol),
+    n_rows_with_event = sum(is_split_day_event),
+    pct_rows_with_event = round(mean(is_split_day_event), 4)
+  ),
+  by = band_label
+][order(band_label)]
+
+af2_log("AF2_AUDIT05C:", "Coverage of RAW-gap candidates by registry splits:")
+print(cov_by_band)
+
+# ----------------------------
+# 07) Suspicion buckets
+# ----------------------------
+small_lo <- audit_cfg$small_move_band[1]
+small_hi <- audit_cfg$small_move_band[2]
+
+# A) "Bad split event" suspects:
+# Event says split, but raw barely moved
+bad_event <- panel_ev[
+  is_split_day_event == TRUE &
+    raw_ratio >= small_lo & raw_ratio <= small_hi,
+  .(symbol, refdate, asset_type,
+    split_factor,
+    raw_ratio, raw_shock,
+    adj_ratio, adj_shock,
+    close_raw, close_adj_final,
+    source_mask_event, has_manual_event)
+]
+
+# B) "Missing split" suspects:
+# Raw shows huge jump (use the middle band by default),
+# but no event split recorded
+band_mid <- "band1"
+miss_event <- raw_cands_key[
+  band_label == band_mid &
+    is_split_day_event == FALSE
+][
+  panel_ev, on = .(symbol, refdate), nomatch = 0L
+][
+  , .(symbol, refdate, asset_type,
+      raw_ratio, raw_shock,
+      adj_ratio, adj_shock,
+      close_raw, close_adj_final)
+]
+
+# C) "Harmful adjustment" suspects:
+# On event split days, adjusted shock worse than raw shock
+harm_event <- panel_ev[
+  is_split_day_event == TRUE &
+    is.finite(adj_shock) & is.finite(raw_shock) &
+    adj_shock > raw_shock,
+  .(symbol, refdate, asset_type,
+    split_factor,
+    raw_ratio, raw_shock,
+    adj_ratio, adj_shock,
+    close_raw, close_adj_final,
+    source_mask_event, has_manual_event)
+]
+
+# ----------------------------
+# 08) Summaries that are not just raw tables
+# ----------------------------
+af2_log("AF2_AUDIT05C:", "==================== SUMMARY ====================")
+
+# 08a) Counts by asset type
+af2_log("AF2_AUDIT05C:", "Split events by asset_type (event-driven):")
+print(ev_splits[panel_adj[, .(symbol, asset_type)], on = "symbol",
+               nomatch = 0L][
+  , .N, by = asset_type
+][order(-N)])
+
+# 08b) How often adjustment improves on event split days
+event_day_metrics <- panel_ev[
+  is_split_day_event == TRUE,
+  .(
+    n_split_days = .N,
+    mean_raw_shock = mean(raw_shock, na.rm = TRUE),
+    mean_adj_shock = mean(adj_shock, na.rm = TRUE),
+    pct_improved = mean(adj_shock < raw_shock, na.rm = TRUE)
+  ),
+  by = symbol
+][order(-mean_raw_shock)]
+
+af2_log("AF2_AUDIT05C:",
+        "Event split-day shock summary (expect mean_adj_shock << mean_raw_shock).")
+print(head(event_day_metrics, audit_cfg$top_n_print))
+
+# 08c) Bucket summaries
+af2_log("AF2_AUDIT05C:", "Potential BAD split events (event says split, raw small move).")
+af2_log("AF2_AUDIT05C:",
+        "Count rows=", nrow(bad_event),
+        " symbols=", uniqueN(bad_event$symbol))
+if (nrow(bad_event)) {
+  print(head(bad_event[order(-adj_shock)], audit_cfg$top_n_print))
+}
+
+af2_log("AF2_AUDIT05C:", "Potential MISSING splits (raw big move, no event) using band1.")
+af2_log("AF2_AUDIT05C:",
+        "Count rows=", nrow(miss_event),
+        " symbols=", uniqueN(miss_event$symbol))
+if (nrow(miss_event)) {
+  print(head(miss_event[order(-raw_shock)], audit_cfg$top_n_print))
+}
+
+af2_log("AF2_AUDIT05C:", "Potential HARMFUL split adjustments (adj_shock > raw_shock on event days).")
+af2_log("AF2_AUDIT05C:",
+        "Count rows=", nrow(harm_event),
+        " symbols=", uniqueN(harm_event$symbol))
+if (nrow(harm_event)) {
+  print(head(harm_event[order(-adj_shock)], audit_cfg$top_n_print))
+}
+
+# 08d) Global rates
+global_event_pairs <- uniqueN(panel_ev[is_split_day_event == TRUE, .(symbol, refdate)])
+global_harm_pairs  <- uniqueN(harm_event[, .(symbol, refdate)])
+
+af2_log("AF2_AUDIT05C:", "Global event split-day pairs=", global_event_pairs)
+af2_log("AF2_AUDIT05C:", "Global harmful event pairs=", global_harm_pairs)
+af2_log("AF2_AUDIT05C:",
+        "Harmful rate on event split days=",
+        if (global_event_pairs > 0) round(global_harm_pairs / global_event_pairs, 4) else NA_real_)
+
+# 08e) Cross-check: how many raw-gap candidates exist vs registry splits
+af2_log("AF2_AUDIT05C:", "RAW-gap band coverage recap:")
+print(cov_by_band)
+
+af2_log("AF2_AUDIT05C:", "================== END SUMMARY ==================")
+
+# ----------------------------
+# 09) Optional: feed adjusted panel into screener
+# ----------------------------
+source("v2/modules/05_screener/R/screener_config.R")
+source("v2/modules/05_screener/R/validate_screener_input.R")
+source("v2/modules/05_screener/R/liquidity_filter.R")
+source("v2/modules/05_screener/R/compute_metrics.R")
+source("v2/modules/05_screener/R/score_rank.R")
+source("v2/modules/05_screener/R/run_screener.R")
+
+af2_log("AF2_AUDIT05C:", "Running screener on full adjusted panel...")
+
+res <- af2_run_screener(
+  panel_ev, # includes raw/adj ratios + split flags, harmless
+  config = list(
+    lookback_days = 252L,
+    horizons_days = c(21L, 63L, 126L, 252L)
+  ),
+  allow_unresolved = NULL
+)
+
+af2_log("AF2_AUDIT05C:", "Top 20 overall:")
+print(utils::head(res$full, 20))
+
+af2_log("AF2_AUDIT05C:", "OK - hard selective split audit finished.")
+
+
+
+###############################################################################
+### FILE: scripts/05d_yahoo_vs_af2_crosscheck.R
+###############################################################################
+# v2/scripts/05d_yahoo_vs_af2_crosscheck.R
+# Robust cross-check AF2 adjusted prices vs Yahoo:
+#  - raw close from Yahoo
+#  - Yahoo's own Adjusted column (Ad)
+#  - adjustOHLC reconstruction (with symbol.name)
+
+# ----------------------------
+# 00) Core + config
+# ----------------------------
+source("v2/modules/00_core/R/utils.R")
+source("v2/modules/00_core/R/config.R")
+source("v2/modules/00_core/R/logging.R")
+
+cfg <- af2_get_config(list(
+  enable_selective_actions = TRUE,
+  ca_cache_mode = "by_symbol",
+  enable_split_plausibility_gate = FALSE,
+  # NEW:
+  enable_split_gap_validation = TRUE,
+  split_gap_tol_log = 0.35
+))
+af2_log_cfg(cfg)
+
+# ----------------------------
+# 01) Universe
+# ----------------------------
+source("v2/modules/01_b3_universe/R/zzz_depends.R")
+source("v2/modules/01_b3_universe/R/rb3_init.R")
+source("v2/modules/01_b3_universe/R/validate_types.R")
+source("v2/modules/01_b3_universe/R/select_min_cols.R")
+source("v2/modules/01_b3_universe/R/unify_liquidity.R")
+source("v2/modules/01_b3_universe/R/filter_by_type_rb3.R")
+source("v2/modules/01_b3_universe/R/fetch_daily.R")
+source("v2/modules/01_b3_universe/R/build_universe.R")
+
+# ----------------------------
+# 02) Corporate actions + Adjuster
+# ----------------------------
+source("v2/modules/03_corporate_actions/R/zzz_depends.R")
+source("v2/modules/03_corporate_actions/R/yahoo_symbol_map.R")
+source("v2/modules/03_corporate_actions/R/fetch_splits_quantmod.R")
+source("v2/modules/03_corporate_actions/R/fetch_dividends_quantmod.R")
+source("v2/modules/03_corporate_actions/R/build_registry.R")
+source("v2/modules/03_corporate_actions/R/select_candidates.R")
+
+source("v2/modules/04_adjuster/R/zzz_depends.R")
+source("v2/modules/04_adjuster/R/build_adjustments.R")
+source("v2/modules/04_adjuster/R/apply_adjustments.R")
+source("v2/modules/04_adjuster/R/build_panel_adj.R")
+source("v2/modules/04_adjuster/R/build_panel_adj_selective.R")
+
+# ----------------------------
+# 03) Packages
+# ----------------------------
+suppressWarnings({
+  library(data.table)
+  library(quantmod)
+})
+
+# ----------------------------
+# 04) Suspects
+# ----------------------------
+sus <- c("AMER3","TIMS3","ALZR11","HAPV3","OIBR3",
+         "MGLU3","NFLX34","AVGO34","WALM34","AURA33")
+
+types_all <- c("equity","fii","etf","bdr")
+
+end_date   <- Sys.Date() - 1
+start_date <- end_date - 730
+
+af2_log("AF2_YX05D:", "Universe window ", start_date, " to ", end_date)
+
+univ <- af2_b3_build_universe_window(
+  start_date = start_date,
+  end_date   = end_date,
+  include_types = types_all,
+  cfg = cfg,
+  verbose = TRUE,
+  use_cache = TRUE
+)
+
+univ_sus <- univ[symbol %in% sus]
+
+res_adj <- tryCatch(
+  af2_build_panel_adj_selective(
+    universe_raw = univ_sus,
+    manual_events = NULL,
+    cfg = cfg,
+    from_ca = "2018-01-01",
+    to_ca   = Sys.Date(),
+    verbose = TRUE,
+    use_cache = TRUE,
+    force_refresh = FALSE,
+    n_workers = 1L,
+    force_symbols = sus
+  ),
+  error = function(err) {
+    af2_log("AF2_YX05D:", "ERROR building AF2 panel: ", conditionMessage(err))
+    stop(conditionMessage(err), call. = FALSE)
+  }
+)
+
+panel <- as.data.table(res_adj$panel_adj)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+as_dt_series <- function(vec_xts, symbol_clean, colname) {
+  if (is.null(vec_xts) || NROW(vec_xts) == 0) return(NULL)
+  dt <- data.table(
+    symbol  = symbol_clean,
+    refdate = as.Date(index(vec_xts))
+  )
+  dt[[colname]] <- as.numeric(vec_xts)
+  dt
+}
+
+safe_adjustOHLC <- function(x, ysym) {
+  # Most precise method: rebuild using getSplits/getDividends
+  # But MUST pass symbol.name when auto.assign=FALSE
+  tryCatch(
+    adjustOHLC(x, use.Adjusted = FALSE, symbol.name = ysym),
+    error = function(e) NULL
+  )
+}
+
+# ----------------------------
+# 05) Per-symbol cross-check
+# ----------------------------
+out_list <- list()
+
+for (s in sus) {
+  ysym <- paste0(s, ".SA")
+
+  af2_log("AF2_YX05D:", "--------------------------------------------")
+  af2_log("AF2_YX05D:", "Yahoo fetch for ", ysym)
+
+  x <- tryCatch(
+    getSymbols(ysym, src = "yahoo", from = start_date, to = end_date,
+               auto.assign = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(x) || NROW(x) == 0) {
+    af2_log("AF2_YX05D:", "WARNING: Yahoo OHLC missing for ", ysym)
+    next
+  }
+
+  # Direct presence checks
+  sp <- tryCatch(getSplits(ysym), error = function(e) NULL)
+  dv <- tryCatch(getDividends(ysym), error = function(e) NULL)
+
+  af2_log("AF2_YX05D:", "getSplits rows for ", s, ": ", if (is.null(sp)) 0 else NROW(sp))
+  af2_log("AF2_YX05D:", "getDividends rows for ", s, ": ", if (is.null(dv)) 0 else NROW(dv))
+
+  # 1) Yahoo raw close
+  dt_y_raw <- as_dt_series(Cl(x), s, "close_y_raw")
+
+  # 2) Yahoo Adjusted column close (if present)
+  dt_y_adjcol <- NULL
+  adj_vec <- tryCatch(Ad(x), error = function(e) NULL)
+  dt_y_adjcol <- as_dt_series(adj_vec, s, "close_y_adjcol")
+
+  # 3) adjustOHLC reconstructed adjusted close
+  x_adj <- safe_adjustOHLC(x, ysym)
+  dt_y_adjcalc <- as_dt_series(if (!is.null(x_adj)) Cl(x_adj) else NULL, s, "close_y_adjcalc")
+
+  # Start merge with raw
+  dt <- dt_y_raw
+
+  if (!is.null(dt_y_adjcol)) {
+    dt <- merge(dt, dt_y_adjcol, by = c("symbol","refdate"), all = TRUE)
+  }
+  if (!is.null(dt_y_adjcalc)) {
+    dt <- merge(dt, dt_y_adjcalc, by = c("symbol","refdate"), all = TRUE)
+  }
+
+  # AF2 data
+  # Pull TRUE raw straight from the universe window (Cotahist)
+  dt_b3 <- univ_sus[symbol == s, .(
+    symbol, refdate,
+    close_b3_raw = close
+  )]
+
+  # AF2 final from the adjusted panel
+  dt_af2 <- panel[symbol == s, .(
+    symbol, refdate,
+    close_af2_final = close_adj_final
+  )]
+
+  dt_af2 <- merge(dt_b3, dt_af2, by = c("symbol","refdate"), all = TRUE)
+  dt <- merge(dt, dt_af2, by = c("symbol","refdate"), all = TRUE)
+
+
+  # Log-diff diagnostics (guarded)
+  dt[, diff_af2_vs_y_adjcol := ifelse(
+    is.finite(close_af2_final) & is.finite(close_y_adjcol) & close_af2_final > 0 & close_y_adjcol > 0,
+    log(close_af2_final) - log(close_y_adjcol),
+    NA_real_
+  )]
+
+  dt[, diff_af2_vs_y_adjcalc := ifelse(
+    is.finite(close_af2_final) & is.finite(close_y_adjcalc) & close_af2_final > 0 & close_y_adjcalc > 0,
+    log(close_af2_final) - log(close_y_adjcalc),
+    NA_real_
+  )]
+
+  dt[, diff_b3raw_vs_yraw := ifelse(
+    is.finite(close_b3_raw) & is.finite(close_y_raw) & close_b3_raw > 0 & close_y_raw > 0,
+    log(close_b3_raw) - log(close_y_raw),
+    NA_real_
+  )]
+
+  # Summaries
+  sm1 <- dt[!is.na(diff_af2_vs_y_adjcol), .(
+    n = .N,
+    mean_abs_log_diff = mean(abs(diff_af2_vs_y_adjcol), na.rm = TRUE),
+    max_abs_log_diff  = max(abs(diff_af2_vs_y_adjcol), na.rm = TRUE)
+  )]
+  sm1[, method := "AF2 vs Yahoo Adjusted column"]
+
+  sm2 <- dt[!is.na(diff_af2_vs_y_adjcalc), .(
+    n = .N,
+    mean_abs_log_diff = mean(abs(diff_af2_vs_y_adjcalc), na.rm = TRUE),
+    max_abs_log_diff  = max(abs(diff_af2_vs_y_adjcalc), na.rm = TRUE)
+  )]
+  sm2[, method := "AF2 vs adjustOHLC(rebuilt)"]
+
+  sm3 <- dt[!is.na(diff_b3raw_vs_yraw), .(
+    n = .N,
+    mean_abs_log_diff = mean(abs(diff_b3raw_vs_yraw), na.rm = TRUE),
+    max_abs_log_diff  = max(abs(diff_b3raw_vs_yraw), na.rm = TRUE)
+  )]
+  sm3[, method := "B3 raw vs Yahoo raw"]
+
+  sm <- rbindlist(list(sm1, sm2, sm3), use.names = TRUE, fill = TRUE)
+  sm[, symbol := s]
+
+  af2_log("AF2_YX05D:", "Summary diagnostics for ", s)
+  print(sm)
+
+  # At this point, 'dt' already contains:
+  # - Yahoo raw
+  # - Yahoo Adjusted column
+  # - Yahoo adjustOHLC rebuild
+  # and we then merged AF2/B3 into it.
+  dt_final <- copy(dt)
+
+  out_list[[s]] <- dt_final
+}
+
+af2_log("AF2_YX05D:", "Done. Inspect out_list for per-symbol tables.")
 
 
 
