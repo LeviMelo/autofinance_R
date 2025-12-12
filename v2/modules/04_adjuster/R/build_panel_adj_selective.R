@@ -151,33 +151,7 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   # - rejected: drop split row
   # - unverified: keep as-is (do NOT drop; do NOT change)
   kept <- snapped[status == "kept" & is_snapped == TRUE & has_prices == TRUE]
-  rej  <- snapped[status == "rejected"]
-
-  if (nrow(kept)) {
-    upd <- kept[, .(
-      symbol,
-      refdate_old = vendor_refdate,
-      refdate_new = eff_refdate,
-      value_new   = chosen_value,
-      action_type = "split",
-      source      = "yahoo"
-    )]
-
-    ca[upd,
-      on = .(symbol, refdate = refdate_old, action_type, source),
-      `:=`(refdate = i.refdate_new, value = i.value_new)
-    ]
-  }
-
-  if (nrow(rej)) {
-    bad <- unique(rej[, .(
-      symbol,
-      refdate = vendor_refdate,
-      action_type = "split",
-      source = "yahoo"
-    )])
-    ca <- ca[!bad, on = .(symbol, refdate, action_type, source)]
-  }
+  rej  <- snapped[status == "rejected"]  # keep for audit/log only; NEVER delete vendor rows
 
   if (verbose) {
     af2_log(
@@ -258,6 +232,8 @@ af2_build_panel_adj_selective <- function(universe_raw,
     )
   }
 
+  ca_vendor_raw <- if (!is.null(ca)) data.table::copy(ca) else ca
+
   # -------------------------------
   # PATCH D2: reconcile Yahoo split conventions
   # against Cotahist raw gaps (auto-orient + drop)
@@ -288,16 +264,58 @@ af2_build_panel_adj_selective <- function(universe_raw,
     }
   }
 
+  # ------------------------------------------------------------
+  # POLICY: DO NOT auto-apply unverified/rejected Yahoo splits.
+  # We keep vendor registry (ca) intact, but pass only "kept"
+  # Yahoo split rows into the adjuster.
+  # ------------------------------------------------------------
+  ca_apply <- ca
+  ca_quarantine <- NULL
+
+  if (!is.null(ca_apply) && nrow(ca_apply) &&
+      !is.null(split_audit) && nrow(split_audit)) {
+
+    kept_keys <- split_audit[
+      status == "kept" & !is.na(eff_refdate),
+      .(symbol, refdate = eff_refdate)
+    ]
+
+    ys_all <- ca_apply[action_type == "split" & source == "yahoo"]
+
+    ys_kept <- ys_all[kept_keys, on = .(symbol, refdate), nomatch = 0L]
+    ca_quarantine <- ys_all[!kept_keys, on = .(symbol, refdate)]
+
+    ca_apply <- data.table::rbindlist(
+      list(
+        ca_apply[!(action_type == "split" & source == "yahoo")],
+        ys_kept
+      ),
+      use.names = TRUE, fill = TRUE
+    )
+
+    ca_apply <- unique(ca_apply)
+
+    if (verbose) {
+      af2_log(
+        "AF2_CA_PREF:",
+        "Yahoo split apply policy: kept=", nrow(ys_kept),
+        " quarantine=", if (is.null(ca_quarantine)) 0L else nrow(ca_quarantine)
+      )
+    }
+  }
+
   # 3) Run the normal adjuster builder
   out <- af2_build_panel_adj(
     universe_raw = dt,
-    corp_actions = ca,
+    corp_actions = ca_apply,
     manual_events = manual_events,
     cfg = cfg,
     verbose = verbose
   )
 
-  # Attach audit (can be NULL if validation disabled)
+  # Attach audit + quarantine (can be NULL if validation disabled)
   out$split_audit <- split_audit
+  out$corp_actions_apply <- ca_apply
+  out$corp_actions_quarantine <- ca_quarantine
   out
 }
