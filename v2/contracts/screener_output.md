@@ -1,45 +1,41 @@
 # screener_output.md
 
 ## Purpose
-Module 05 outputs a **feature vector** per symbol.
-Ranking/scoring is optional and should be treated as a separate concern.
+Defines the **feature vector** output produced by Module 05.
+This output is intended to be consumed by **separate ranking/scoring logic** (or Alpha Model).
 
-## Output: features (primary)
-A table with **one row per symbol**.
+## Output object
+`features` (data.table), **one row per symbol**.
 
-### Keys
-- `symbol` unique.
+## Required identifier/meta columns
+| column            | type | meaning |
+|-------------------|------|---------|
+| symbol            | chr  | ticker |
+| asset_type        | chr  | equity/fii/etf/bdr |
+| end_refdate       | Date | last date used for features |
+| n_obs             | int  | number of rows used in the feature window |
+| days_traded_ratio | dbl  | fraction of non-NA `close_adj_final` in window |
 
-### Required metadata columns
-| column      | type      | semantics |
-|------------|-----------|----------|
-| symbol     | character | uppercase ticker |
-| asset_type | character | `equity` / `fii` / `etf` / `bdr` |
-| end_date   | Date      | last date used for feature computation |
-| n_obs      | integer   | number of rows used (post-slicing) |
-| n_valid    | integer   | number of finite close observations |
-| coverage   | numeric   | `n_valid / n_obs` |
+## Core price/return features (V2 Standard)
+For each horizon `h` in config (e.g., 21, 63, 126, 252):
+- `ret_{h}d` : Geometric return over horizon (`p_end / p_start - 1`)
+- `vol_{h}d` : Annualized close-to-close volatility (`sd(log_ret) * sqrt(252)`)
 
-### Baseline feature families (v2 minimum)
-- Multi-horizon returns from `close_adj_final`:
-  - `ret_21d`, `ret_63d`, `ret_126d`, `ret_252d` (configurable horizons)
-- Close-to-close realized volatility (annualized):
-  - `vol_cc_21d`, `vol_cc_63d`, ... (same horizons)
-- OHLC-based realized volatility (annualized, NA-safe):
-  - Parkinson range vol: `vol_pk_21d`, ...
-  - Garman–Klass vol: `vol_gk_21d`, ...
-- Drawdown/stress:
-  - `max_dd`, `ulcer_index`
-- Liquidity/microstructure proxies:
-  - `median_turnover`, `days_traded_ratio`, `amihud`
+## OHLC-based risk features (Optional/Recommended)
+For each horizon `h` (when OHLC columns exist):
+- `vol_pk_{h}d` : Parkinson volatility (High/Low)
+- `vol_gk_{h}d` : Garman-Klass volatility (OHLC)
+- `range_mean_{h}d` : Mean daily range fraction
+- `gap_vol_{h}d` : Volatility of overnight gaps
 
-### NA rules
-- If insufficient data for a horizon window, that feature is `NA_real_`.
-- Features must be present as columns even when NA (stable schema).
+## Path-dependence / drawdown features
+- `max_dd` : Maximum drawdown in the lookback window
+- `ulcer_index` : RMS drawdown metric
 
-## Optional output: ranking (secondary)
-If a scoring model is applied, Module 05 may also output:
-- `full` table: features + score + ranks
-- `by_type` list: same, split by `asset_type`
+## Liquidity features
+- `median_turnover` : Median daily financial volume
+- `amihud` : Illiquidity proxy (`mean(|ret| / volume)`)
 
-But **features remain the primary contract**.
+## NA policy
+- Features may be `NA` if insufficient data exists for a symbol/horizon.
+- The table shape (column set) must remain stable across runs for the same config.

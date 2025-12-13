@@ -2,7 +2,7 @@
 
 ## Purpose
 `adjustments` is the per-symbol daily adjustment timeline produced by Module 04.
-It is an audit table: it explains *why* `panel_adj` differs from `universe_raw`.
+It serves as the audit trail for *why* `panel_adj` differs from `universe_raw`.
 
 ## Table contract (schema)
 
@@ -10,7 +10,7 @@ It is an audit table: it explains *why* `panel_adj` differs from `universe_raw`.
 - `(symbol, refdate)` unique within this table.
 
 ### Required columns
-| column            | type      | required | semantics |
+| column           | type      | required | semantics |
 |------------------|-----------|----------|----------|
 | symbol           | character | yes      | uppercase ticker |
 | refdate          | Date      | yes      | trading date |
@@ -20,19 +20,18 @@ It is an audit table: it explains *why* `panel_adj` differs from `universe_raw`.
 | div_factor_event | numeric   | yes      | per-day dividend factor (normally 1; <1 on dividend date when computable) |
 | div_factor_cum   | numeric   | yes      | cumulative dividend factor applied to *this date* (exclusive) |
 | adj_factor_final | numeric   | yes      | `split_factor_cum * div_factor_cum` |
-| source_mask      | character | yes      | provenance summary (e.g., `yahoo`, `manual`, `yahoo+manual`) |
+| source_mask      | character | yes      | provenance summary (e.g., `yahoo`, `manual`, `chart`, `yahoo+manual`) |
 | has_manual       | logical   | yes      | TRUE if any manual event contributed that day |
-| issue_div        | logical   | yes      | TRUE when dividend factor could not be computed safely |
+| issue_div        | logical   | yes      | TRUE when dividend factor could not be computed safely (e.g. Div >= Price) |
 
-## Dividend issue policy (current v2 behavior)
-On a day where `div_cash > 0`, dividend factor uses:
-- `close_prev = lag(close_adj_split)`  
-- If `close_prev` is missing/non-finite, `close_prev <= 0`, or `div_cash >= close_prev`,
-  then the system sets:
+## Dividend issue policy (V2 behavior)
+On a day where `div_cash > 0`:
+- `div_factor_event = (close_prev - div_cash) / close_prev`
+- If `close_prev` is missing/non-finite, `close_prev <= 0`, or `div_cash >= close_prev`:
   - `issue_div = TRUE`
-  - `div_factor_event = 1` (no dividend adjustment applied for that event)
+  - `div_factor_event = 1` (adjustment skipped for safety)
 
-This is intentionally conservative: it avoids exploding the factor chain.
+This conservative policy prevents negative prices and exploding factors.
 
 ## Guarantees
 - `split_value > 0`
