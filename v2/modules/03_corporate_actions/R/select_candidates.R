@@ -101,20 +101,33 @@ af2_ca_select_candidates <- function(universe_raw, cfg = NULL, verbose = TRUE) {
   }
 
   # -------------------------------
-  # 3) Gap-flag detector (recent window)
+  # 3) Discontinuity detector (captures SPLITS + REVERSE SPLITS)
   # -------------------------------
-  dt_gap <- dt_recent[symbol %in% liq_ok_syms]
+  # IMPORTANT: do NOT restrict this to liq_ok_syms only.
+  # Otherwise you can miss suspicious discontinuities for symbols that still
+  # pass the screener liquidity later (window mismatch) or are just below liq_ok.
+  dt_gap <- dt_recent[symbol %in% active_syms]
   data.table::setorder(dt_gap, symbol, refdate)
 
   dt_gap[, close_lag := data.table::shift(close, 1L), by = symbol]
+
+  # Simple close/close return (kept for "normal split" / drop detection)
   dt_gap[, ret_1d := data.table::fifelse(
     is.finite(close) & is.finite(close_lag) & close_lag > 0,
     close / close_lag - 1,
     NA_real_
   )]
+
+  # Symmetric log return for reverse splits / huge jumps
+  dt_gap[, log_ret := data.table::fifelse(
+    is.finite(close) & is.finite(close_lag) & close_lag > 0 & close > 0,
+    log(close / close_lag),
+    NA_real_
+  )]
+
   dt_gap[, close_lag := NULL]
 
-  # Apply per-type thresholds
+  # ---- (A) Normal split-like drops: keep your per-type negative thresholds ----
   thr_map <- data.table::data.table(
     asset_type = c("equity", "fii", "etf", "bdr"),
     thr = c(
@@ -127,16 +140,32 @@ af2_ca_select_candidates <- function(universe_raw, cfg = NULL, verbose = TRUE) {
 
   dt_gap <- merge(dt_gap, thr_map, by = "asset_type", all.x = TRUE)
 
-  gap_flags <- dt_gap[
-    is.finite(ret_1d) & ret_1d <= thr,
-    .(has_gap = TRUE),
+  gap_neg <- dt_gap[
+    is.finite(ret_1d) & is.finite(thr) & ret_1d <= thr,
+    .(has_gap_neg = TRUE),
     by = .(symbol)
   ]
+  gap_neg_syms <- gap_neg$symbol
 
-  gap_syms <- gap_flags$symbol
+  # ---- (B) Reverse split-like jumps: symmetric threshold in log space ----
+  # Default 1.0 -> close/lag >= e^1 ≈ 2.718x jump (or bigger).
+  # This is intentionally high so we don't flag normal volatility as "needs CA fetch".
+  gap_thr_log <- as.numeric(cfg$ca_prefilter_jump_log_thr %||% 1.0)
+  if (!is.finite(gap_thr_log) || gap_thr_log < 0.5) gap_thr_log <- 1.0
+
+  jump_pos <- dt_gap[
+    is.finite(log_ret) & log_ret >= gap_thr_log,
+    .(has_jump_pos = TRUE),
+    by = .(symbol)
+  ]
+  jump_pos_syms <- jump_pos$symbol
+
+  gap_syms <- unique(c(gap_neg_syms, jump_pos_syms))
 
   if (verbose) {
-    af2_log("AF2_CA_PREF:", "Gap-flag symbols= ", length(unique(gap_syms)))
+    af2_log("AF2_CA_PREF:", "Gap-flag symbols (neg drops)= ", length(unique(gap_neg_syms)))
+    af2_log("AF2_CA_PREF:", "Gap-flag symbols (pos jumps)= ", length(unique(jump_pos_syms)))
+    af2_log("AF2_CA_PREF:", "Gap-flag symbols (union)= ", length(unique(gap_syms)))
   }
 
   # -------------------------------
@@ -159,29 +188,49 @@ af2_ca_select_candidates <- function(universe_raw, cfg = NULL, verbose = TRUE) {
   c2 <- liq_ok_dt[liq_rank_type <= top_by_type, unique(symbol)]
 
   # -------------------------------
-  # 5) Union + cap
+  # 5) Union + cap (Priority: GAPS/JUMPS must survive)
   # -------------------------------
-  cand_all <- unique(c(c1, c2, gap_syms))
+  # Priority order:
+  #   1) gap_syms (suspicious discontinuities, MUST be checked)
+  #   2) top overall liquidity (c1)
+  #   3) top by type liquidity (c2)
+  cand_all <- unique(c(gap_syms, c1, c2))
 
   # If still empty (edge-case data), fall back to liquidity-ok
   if (!length(cand_all)) cand_all <- unique(liq_ok_syms)
 
-  # Apply hard cap using priority order
-  if (length(cand_all) > max_cand && nrow(liq_ok_dt)) {
-    # Build a priority table for deterministic trimming
-    pri <- liq_ok_dt[, .(symbol, priority = liq_rank_overall)]
-    pri <- pri[order(priority)]
-    pri_syms <- pri$symbol
+  if (length(cand_all) > max_cand) {
 
-    # Keep candidate order: priority first, then anything else
-    ordered <- unique(c(intersect(pri_syms, cand_all), cand_all))
-    cand_all <- head(ordered, max_cand)
+    must_have <- unique(gap_syms)
+
+    # If too many "must_have", trim must_have by liquidity (best effort)
+    if (length(must_have) > max_cand) {
+      if (nrow(liq)) {
+        pri_gap <- liq[symbol %chin% must_have, .(symbol, median_turnover)]
+        data.table::setorder(pri_gap, -median_turnover)
+        must_have <- head(pri_gap$symbol, max_cand)
+      } else {
+        must_have <- head(must_have, max_cand)
+      }
+    }
+
+    slots_left <- max_cand - length(must_have)
+
+    if (slots_left > 0 && nrow(liq_ok_dt)) {
+      pri <- liq_ok_dt[, .(symbol, priority = liq_rank_overall)]
+      pri <- pri[order(priority)]
+      fillers <- pri[!symbol %chin% must_have, head(symbol, slots_left)]
+      cand_all <- unique(c(must_have, fillers))
+    } else {
+      cand_all <- unique(must_have)
+    }
+
+    # Final safety (should already be <= max_cand)
+    if (length(cand_all) > max_cand) cand_all <- head(cand_all, max_cand)
   }
 
   if (verbose) {
     af2_log("AF2_CA_PREF:", "Candidates final= ", length(cand_all))
-    #af2_log("AF2_CA_PREF:", "Selective actions enabled= ", isTRUE(cfg$enable_selective_actions))
-    #af2_log("AF2_CA_PREF:", "Yahoo candidate symbols= ", length(cand_all))
   }
 
   cand_all

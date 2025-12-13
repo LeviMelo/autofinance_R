@@ -70,6 +70,17 @@ af2_run_screener <- function(panel_adj,
   metrics <- data.table::rbindlist(metrics_list, fill = TRUE)
   if (!nrow(metrics)) stop("af2_run_screener: metrics computation yielded zero rows.", call. = FALSE)
 
+  # -------------------------------------------------------------------
+  # 2.95) Sanitize: replace Inf/-Inf/NaN with NA (score should handle NA)
+  # -------------------------------------------------------------------
+  for (j in names(metrics)) {
+    if (is.numeric(metrics[[j]])) {
+      bad <- !is.finite(metrics[[j]])
+      if (any(bad, na.rm = TRUE)) metrics[[j]][bad] <- NA_real_
+    }
+  }
+
+
   # If requested: return ONLY features (no scoring/ranking)
   if (return == "features") {
     return(list(
@@ -77,6 +88,31 @@ af2_run_screener <- function(panel_adj,
       liquidity = liq[order(symbol)],
       config = cfg
     ))
+  }
+
+  # -------------------------------------------------------------------
+  # 2.9) Guard: score_weights must match available feature columns
+  # -------------------------------------------------------------------
+  w <- cfg$score_weights
+  if (is.null(w) || !length(w)) {
+    stop("af2_run_screener: cfg$score_weights is empty.", call. = FALSE)
+  }
+  
+  w_names <- names(w)
+  if (is.null(w_names) || any(!nzchar(w_names))) {
+    stop("af2_run_screener: cfg$score_weights must be a *named* numeric vector/list.", call. = FALSE)
+  }
+  
+  missing_feat <- setdiff(w_names, names(metrics))
+  if (length(missing_feat)) {
+    stop(
+      paste0(
+        "af2_run_screener: score_weights reference missing feature columns:\n  - ",
+        paste(missing_feat, collapse = "\n  - "),
+        "\n\nFix: rename weights to match compute_metrics output, or add those features."
+      ),
+      call. = FALSE
+    )
   }
 
   # 3) Score + rank (default behavior)
