@@ -28,6 +28,10 @@ af2_config_default <- list(
   # Safety
   allow_unresolved_in_screener = FALSE,
 
+  # Adjuster residual jump safety net (log-return tolerance).
+  # 1.0 means any 1-day move >= e^1 (~2.718x) flags suspect_unresolved.
+  adj_residual_jump_tol_log = 1.0,
+
   # -------------------------------
   # Selective corporate-actions policy (the "trick")
   # -------------------------------
@@ -37,6 +41,15 @@ af2_config_default <- list(
   # - "batch" keeps current behavior (hash by symbol set)
   # - "by_symbol" enables incremental caching per ticker
   ca_cache_mode = "batch",
+
+  # Corporate actions fetch mode:
+  # - "chart"   = Yahoo chart endpoint (splits+dividends in one call)
+  # - "quantmod"= legacy quantmod calls (getSplits + getDividends)
+  ca_fetch_mode = "chart",
+
+  # Candidate prefilter: detect reverse-split-like jumps using abs(log(close/lag)).
+  # 1.0 ~ e^1 = 2.718x jump threshold.
+  ca_prefilter_jump_log_thr = 1.0,
 
   # Prefilter heuristics (B3-only)
   ca_prefilter_recent_days   = 252L,
@@ -73,6 +86,10 @@ af2_config_default <- list(
   # NEW: how far forward we allow snapping Yahoo split dates
   # to the next B3 trading day (for weekend/holiday/vendor-date mismatches)
   split_gap_max_forward_days = 5L,
+
+  # How far BACK we allow snapping Yahoo vendor split dates
+  # (vendor date can be 1-3 days off vs B3 effective trading day).
+  split_gap_max_back_days = 3L,
 
   # NEW: prefer using post-day OPEN when available (splits are effective at market open);
   # fallback to CLOSE if OPEN missing.
@@ -116,6 +133,29 @@ af2_get_config <- function(config = NULL) {
   }
 
   cfg$split_gap_use_open <- isTRUE(cfg$split_gap_use_open)
+
+  # -------------------------------
+  # Normalize newer knobs
+  # -------------------------------
+  cfg$ca_fetch_mode <- tolower(trimws(cfg$ca_fetch_mode %||% "chart"))
+  if (!cfg$ca_fetch_mode %in% c("chart", "quantmod")) {
+    cfg$ca_fetch_mode <- "chart"
+  }
+
+  cfg$ca_prefilter_jump_log_thr <- as.numeric(cfg$ca_prefilter_jump_log_thr %||% 1.0)
+  if (!is.finite(cfg$ca_prefilter_jump_log_thr) || cfg$ca_prefilter_jump_log_thr < 0.5) {
+    cfg$ca_prefilter_jump_log_thr <- 1.0
+  }
+
+  cfg$adj_residual_jump_tol_log <- as.numeric(cfg$adj_residual_jump_tol_log %||% 1.0)
+  if (!is.finite(cfg$adj_residual_jump_tol_log) || cfg$adj_residual_jump_tol_log <= 0) {
+    cfg$adj_residual_jump_tol_log <- 1.0
+  }
+
+  cfg$split_gap_max_back_days <- as.integer(cfg$split_gap_max_back_days %||% 3L)
+  if (!is.finite(cfg$split_gap_max_back_days) || cfg$split_gap_max_back_days < 0L) {
+    cfg$split_gap_max_back_days <- 3L
+  }
 
   cfg
 }

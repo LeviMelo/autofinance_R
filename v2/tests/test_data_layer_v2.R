@@ -13,22 +13,27 @@ Sys.setenv(TZ = "UTC")
 # =========================
 # 2) USER KNOBS
 # =========================
-WATCH <- c("SEQL3", "IFCM3", "GOLD11", "GOGL34", "PETR4", "VALE3", "ITUB4")
+# NOTE:
+# - This block is intentionally written so it NEVER errors if you refactor/reset.
+# - Edit the *defaults* here when you want to change behavior.
 
-# If TRUE: deletes batch corp_actions caches before running (forces new Yahoo calls)
-FORCE_REFRESH_CA_BATCH_CACHE <- FALSE
+WATCH <- get0(
+  "WATCH",
+  ifnotfound = c("SEQL3", "IFCM3", "GOLD11", "GOGL34", "PETR4", "VALE3", "ITUB4")
+)
+WATCH <- unique(toupper(trimws(as.character(WATCH))))
+WATCH <- WATCH[nzchar(WATCH)]
 
-# If TRUE: run a mini parallel registry test (n_workers=2) to ensure cluster nodes know chart fetcher + deps.
-RUN_PARALLEL_MINITEST <- TRUE
-
-# If TRUE: require dividends to exist in CA cache and events; if FALSE: only warn.
-HARD_FAIL_IF_NO_DIVIDENDS <- TRUE
+FORCE_REFRESH_CA_BATCH_CACHE <- isTRUE(get0("FORCE_REFRESH_CA_BATCH_CACHE", ifnotfound = FALSE))
+RUN_PARALLEL_MINITEST        <- isTRUE(get0("RUN_PARALLEL_MINITEST", ifnotfound = TRUE))
+HARD_FAIL_IF_NO_DIVIDENDS    <- isTRUE(get0("HARD_FAIL_IF_NO_DIVIDENDS", ifnotfound = TRUE))
 
 # Optional: override candidate cap for faster tests (set NULL to keep cfg)
-OVERRIDE_MAX_CANDIDATES <- NULL  # e.g. 80L
+OVERRIDE_MAX_CANDIDATES <- get0("OVERRIDE_MAX_CANDIDATES", ifnotfound = NULL)
 
 # If you already have universe_raw saved, set this path; otherwise script tries to build/load automatically.
-UNIVERSE_RAW_RDS <- NULL  # e.g. "v2/data/cache/universe_raw_latest.rds"
+UNIVERSE_RAW_RDS <- get0("UNIVERSE_RAW_RDS", ifnotfound = NULL)
+if (!is.null(UNIVERSE_RAW_RDS)) UNIVERSE_RAW_RDS <- as.character(UNIVERSE_RAW_RDS)
 
 # =========================
 # 3) ASSERT PROJECT ROOT
@@ -350,7 +355,14 @@ if (exists("af2_diag_symbol", mode = "function")) {
   .msg("\n--- af2_diag_symbol(WATCH) ---")
   for (s in WATCH) {
     if (s %in% unique(panel_adj_dt$symbol)) {
-      af2_diag_symbol(s)
+      af2_diag_symbol(
+        symbol = s,
+        panel_adj = panel_adj_dt,
+        events = events,
+        corp_actions_apply = ca_apply,
+        split_audit = audit,
+        show_plot = TRUE
+      )
     }
   }
 } else {

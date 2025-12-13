@@ -141,10 +141,10 @@ af2_adj_build_events <- function(corp_actions,
   ev[is.na(div_cash), div_cash := 0]
 
   # Compose source mask
-  ev[, source_mask := fifelse(
+  ev[, source_mask := data.table::fifelse(
     !is.na(source_mask) & !is.na(source_mask_div),
     paste0(source_mask, "+", source_mask_div),
-    fifelse(!is.na(source_mask), source_mask, source_mask_div)
+    data.table::fifelse(!is.na(source_mask), source_mask, source_mask_div)
   )]
   ev[is.na(source_mask), source_mask := "unknown"]
 
