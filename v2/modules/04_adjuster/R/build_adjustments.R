@@ -117,42 +117,6 @@ af2_adj_build_events <- function(corp_actions,
     ))
   }
 
-  # ------------------------------------------------------------
-  # Optional Yahoo split plausibility gate (quarantine, not edit)
-  # Applies ONLY to Yahoo-sourced split rows before aggregation.
-  # ------------------------------------------------------------
-  if (isTRUE(cfg$enable_split_plausibility_gate)) {
-
-    minv <- as.numeric(cfg$split_gate_min %||% 0.05)
-    maxv <- as.numeric(cfg$split_gate_max %||% 20)
-
-    if (!is.finite(minv) || minv <= 0) minv <- 0.05
-    if (!is.finite(maxv) || maxv <= 0) maxv <- 20
-
-    bad_splits <- dt_all[
-      action_type == "split" &
-        source == "yahoo" &
-        (value < minv | value > maxv)
-    ]
-
-    if (nrow(bad_splits) && verbose) {
-      af2_log("AF2_ADJ:",
-              "Split gate active. Quarantining ", nrow(bad_splits),
-              " Yahoo split rows outside [", minv, ", ", maxv, "].")
-      # Print a small sample for visibility
-      print(utils::head(bad_splits[order(symbol, refdate)], 10))
-    }
-
-    # Drop only the suspicious Yahoo split rows from factor construction
-    if (nrow(bad_splits)) {
-      dt_all <- dt_all[!(
-        action_type == "split" &
-          source == "yahoo" &
-          (value < minv | value > maxv)
-      )]
-    }
-  }
-
   # Aggregate same-day events:
   # - splits: multiply price factors
   # - dividends: sum cash amounts

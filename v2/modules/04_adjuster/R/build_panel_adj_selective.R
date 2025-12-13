@@ -8,200 +8,121 @@
 # - rejects splits that do not match raw jump (within tol_log)
 # - returns BOTH: cleaned corp_actions + split_audit table
 # ------------------------------------------------------------
-af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
-                                               universe_raw,
-                                               cfg = NULL,
-                                               verbose = TRUE) {
+af2_ca_fix_yahoo_splits_by_raw_gap <- function(dt_prices,
+                                              splits_dt,
+                                              cfg = NULL,
+                                              tol_log = NULL,
+                                              max_fwd_days = NULL,
+                                              max_back_days = NULL,
+                                              use_open = NULL) {
 
   cfg <- cfg %||% af2_get_config()
+  af2_require("data.table")
 
-  ca <- data.table::as.data.table(corp_actions)
-  dt <- data.table::as.data.table(universe_raw)
+  tol_log <- as.numeric(tol_log %||% cfg$split_gap_tol_log %||% 0.35)
+  if (!is.finite(tol_log) || tol_log <= 0) tol_log <- 0.35
 
-  if (!nrow(ca) || !nrow(dt)) {
-    return(list(
-      corp_actions = ca,
-      split_audit = data.table::data.table()[0],
-      yahoo_splits_fixed = data.table::data.table()[0],
-      yahoo_splits_quarantine = data.table::data.table()[0]
-    ))
+  max_fwd_days <- as.integer(max_fwd_days %||% cfg$split_gap_max_forward_days %||% 5L)
+  if (!is.finite(max_fwd_days) || max_fwd_days < 0L) max_fwd_days <- 5L
+
+  max_back_days <- as.integer(max_back_days %||% cfg$split_gap_max_back_days %||% 3L)
+  if (!is.finite(max_back_days) || max_back_days < 0L) max_back_days <- 3L
+
+  use_open <- isTRUE(use_open %||% cfg$split_gap_use_open %||% TRUE)
+
+  dt <- data.table::as.data.table(dt_prices)
+  sp <- data.table::as.data.table(splits_dt)
+
+  if (!nrow(sp)) {
+    return(list(fixed_kept = sp[0], quarantine = sp[0], audit = sp[0]))
   }
 
-  af2_assert_cols(ca, c("symbol","refdate","action_type","value","source"), name = "corp_actions")
-  af2_assert_cols(dt, c("symbol","refdate","open","close"), name = "universe_raw")
-
-  # Normalize
-  ca[, symbol := toupper(trimws(as.character(symbol)))]
-  ca[, action_type := tolower(trimws(as.character(action_type)))]
-  ca[, source := tolower(trimws(as.character(source)))]
-  ca[, refdate := as.Date(refdate)]
-  ca[, value := as.numeric(value)]
-
-  dt[, symbol := toupper(trimws(as.character(symbol)))]
-  dt[, refdate := as.Date(refdate)]
-  dt[, open := as.numeric(open)]
-  dt[, close := as.numeric(close)]
-
-  # Only Yahoo split rows are validated/snapped
-  ys <- ca[
-    action_type == "split" &
-      source == "yahoo" &
-      is.finite(value) & value > 0 &
-      !is.na(refdate)
-  ]
-
-  if (!nrow(ys)) {
-    return(list(
-      corp_actions = ca,
-      split_audit = data.table::data.table()[0],
-      yahoo_splits_fixed = data.table::data.table()[0],
-      yahoo_splits_quarantine = data.table::data.table()[0]
-    ))
-  }
-
-  # Knobs
-  tol <- as.numeric(cfg$split_gap_tol_log %||% 0.35)
-  if (!is.finite(tol) || tol <= 0) tol <- 0.35
-
-  max_fwd <- as.integer(cfg$split_gap_max_forward_days %||% 0L)
-  if (!is.finite(max_fwd) || max_fwd < 0L) max_fwd <- 0L
-
-  use_open <- isTRUE(cfg$split_gap_use_open %||% FALSE)
-
-  # Prep raw grid
+  # Expect dt has symbol, refdate, close, and optionally open
   data.table::setorder(dt, symbol, refdate)
-  data.table::setkey(dt, symbol, refdate)
-  dt[, close_prev := data.table::shift(close, 1L), by = symbol]
+  dt[, close_lag := data.table::shift(close, 1L), by = symbol]
 
-  # Stable row id for Yahoo split rows
-  ys_key <- ys[, .(
-    row_id = .I,
-    symbol,
-    vendor_refdate = refdate,
-    yahoo_value = value,
-    yahoo_symbol = if ("yahoo_symbol" %in% names(ys)) as.character(yahoo_symbol) else NA_character_
-  )]
-  data.table::setkey(ys_key, symbol, vendor_refdate)
+  # Add row_id to preserve identity
+  sp <- data.table::copy(sp)
+  if (!"row_id" %in% names(sp)) sp[, row_id := .I]
 
-  # Snap vendor_refdate -> next trading day within <= max_fwd days
-  snapped <- dt[ys_key,
-    on      = .(symbol, refdate = vendor_refdate),
-    roll    = -max_fwd,
-    nomatch = NA,
-    .(
-      row_id         = i.row_id,
-      symbol         = i.symbol,
-      yahoo_symbol   = i.yahoo_symbol,
-      vendor_refdate = i.vendor_refdate,
-      eff_refdate    = refdate,
-      lag_days       = as.integer(refdate - i.vendor_refdate),
-      open           = open,
-      close          = close,
-      close_prev     = close_prev,
-      yahoo_value    = i.yahoo_value
-    )
-  ]
+  sp[, vendor_refdate := as.Date(refdate)]
+  sp[, value := as.numeric(value)]
+  sp <- sp[is.finite(value) & value > 0]
 
-  safe_log <- function(x) ifelse(is.finite(x) & x > 0, log(x), NA_real_)
+  # Candidate offsets: back..forward
+  offs <- seq.int(-max_back_days, max_fwd_days)
 
-  # Observed raw ratios (post/pre)
-  snapped[, ratio_cc := data.table::fifelse(
-    is.finite(close) & is.finite(close_prev) & close_prev > 0,
-    close / close_prev,
-    NA_real_
-  )]
+  # For each split row, evaluate candidate effective dates + both orientations
+  eval_one <- function(sym, vdate, vval) {
+    best <- list(err = Inf, eff = as.Date(NA), chosen = NA_real_)
+    for (o in offs) {
+      d <- vdate + o
+      row <- dt[symbol == sym & refdate == d]
+      if (!nrow(row)) next
 
-  snapped[, ratio_oc := data.table::fifelse(
-    use_open & is.finite(open) & is.finite(close_prev) & close_prev > 0,
-    open / close_prev,
-    NA_real_
-  )]
+      # observed ratio at effective day
+      if (use_open && "open" %in% names(row) && is.finite(row$open) && is.finite(row$close_lag) && row$open > 0 && row$close_lag > 0) {
+        obs <- row$open / row$close_lag
+      } else if (is.finite(row$close) && is.finite(row$close_lag) && row$close > 0 && row$close_lag > 0) {
+        obs <- row$close / row$close_lag
+      } else {
+        next
+      }
 
-  # Two hypotheses:
-  # - yahoo_value is already PRICE-FACTOR (e.g. 0.2)
-  # - 1/yahoo_value is PRICE-FACTOR (vendor gave ratio like 5)
-  snapped[, log_v   := safe_log(yahoo_value)]
-  snapped[, log_inv := safe_log(1 / yahoo_value)]
-  snapped[, log_cc  := safe_log(ratio_cc)]
-  snapped[, log_oc  := safe_log(ratio_oc)]
-
-  snapped[, err_val := abs(log_cc - log_v)]
-  if (use_open) snapped[, err_val := pmin(err_val, abs(log_oc - log_v), na.rm = TRUE)]
-
-  snapped[, err_inv := abs(log_cc - log_inv)]
-  if (use_open) snapped[, err_inv := pmin(err_inv, abs(log_oc - log_inv), na.rm = TRUE)]
-
-  snapped[, chosen_value := data.table::fifelse(err_inv < err_val, 1 / yahoo_value, yahoo_value)]
-  snapped[, chosen_err   := pmin(err_val, err_inv, na.rm = TRUE)]
-
-  snapped[, has_prices := is.finite(chosen_err) & !is.na(chosen_err)]
-  snapped[, is_snapped := !is.na(eff_refdate) & is.finite(lag_days) & lag_days >= 0 & lag_days <= max_fwd]
-
-  snapped[, status := data.table::fifelse(
-    !is_snapped | !has_prices, "unverified",
-    data.table::fifelse(chosen_err <= tol, "kept", "rejected")
-  )]
-
-  split_audit <- snapped[, .(
-    row_id,
-    symbol, yahoo_symbol,
-    vendor_refdate, eff_refdate, lag_days,
-    yahoo_value,
-    chosen_value,
-    chosen_err,
-    status
-  )]
-
-  # Build an APPLY table = only "kept" rows, with snapped refdate + oriented value
-  yahoo_splits_fixed <- split_audit[
-    status == "kept" & !is.na(eff_refdate) & is.finite(chosen_value) & chosen_value > 0,
-    .(
-      symbol = symbol,
-      yahoo_symbol = yahoo_symbol,
-      refdate = eff_refdate,
-      action_type = "split",
-      value = chosen_value,
-      source = "yahoo"
-    )
-  ]
-
-  # Quarantine = original vendor rows, annotated with audit fields
-  ys_orig <- ys[, .(
-    row_id = .I,
-    symbol,
-    yahoo_symbol = if ("yahoo_symbol" %in% names(ys)) as.character(yahoo_symbol) else NA_character_,
-    refdate,
-    action_type,
-    value,
-    source
-  )]
-
-  yahoo_splits_quarantine <- merge(
-    ys_orig,
-    split_audit[, .(row_id, status, eff_refdate, chosen_value, chosen_err, lag_days, vendor_refdate)],
-    by = "row_id",
-    all.x = TRUE
-  )
-  yahoo_splits_quarantine <- yahoo_splits_quarantine[status != "kept" | is.na(status)]
-
-  if (verbose) {
-    af2_log(
-      "AF2_CA_PREF:",
-      "Split-gap validation: total=", nrow(split_audit),
-      " kept=", sum(split_audit$status == "kept"),
-      " rejected=", sum(split_audit$status == "rejected"),
-      " unverified=", sum(split_audit$status == "unverified"),
-      " (tol_log=", tol,
-      ", max_fwd_days=", max_fwd,
-      ", use_open=", use_open, ")"
-    )
+      # test value and inverse(value)
+      cand_vals <- c(vval, 1 / vval)
+      for (cv in cand_vals) {
+        if (!is.finite(cv) || cv <= 0) next
+        e <- abs(log(obs) - log(cv))
+        if (is.finite(e) && e < best$err) {
+          best$err <- e
+          best$eff <- d
+          best$chosen <- cv
+        }
+      }
+    }
+    best
   }
+
+  out <- sp[, {
+    b <- eval_one(symbol, vendor_refdate, value)
+    lag_days <- as.integer(b$eff - vendor_refdate)
+    status <- if (!is.finite(b$err) || is.infinite(b$err) || is.na(b$eff)) "unverified" else if (b$err <= tol_log) "kept" else "rejected"
+    .(
+      eff_refdate = as.Date(b$eff),
+      chosen_value = as.numeric(b$chosen),
+      chosen_err = as.numeric(b$err),
+      lag_days = as.integer(ifelse(is.na(lag_days), NA_integer_, lag_days)),
+      status = status
+    )
+  }, by = .(row_id, symbol, yahoo_symbol, vendor_refdate, refdate, action_type, value, source)]
+
+  # Dedup: if multiple rows collapse to same (symbol, eff_refdate, chosen_value), keep best err
+  data.table::setorder(out, symbol, eff_refdate, chosen_value, chosen_err)
+  out[, dup_rank := seq_len(.N), by = .(symbol, eff_refdate, chosen_value)]
+  dup <- out[dup_rank > 1L & status == "kept"]
+  if (nrow(dup)) {
+    out[dup_rank > 1L & status == "kept", status := "dup"]
+  }
+  out[, dup_rank := NULL]
+
+  fixed_kept <- out[status == "kept",
+                    .(yahoo_symbol, refdate = eff_refdate, action_type, value = chosen_value, source, symbol)]
+
+  quarantine <- out[status != "kept",
+                    .(row_id, symbol, yahoo_symbol, refdate = vendor_refdate, action_type, value, source,
+                      status, eff_refdate, chosen_value, chosen_err, lag_days, vendor_refdate)]
+
+  audit <- out[, .(row_id, symbol, yahoo_symbol,
+                   vendor_refdate, eff_refdate, lag_days,
+                   yahoo_value = value,
+                   chosen_value, chosen_err,
+                   status)]
 
   list(
-    corp_actions = ca,                    # vendor registry untouched (audit)
-    split_audit = split_audit,
-    yahoo_splits_fixed = yahoo_splits_fixed,
-    yahoo_splits_quarantine = yahoo_splits_quarantine
+    fixed_kept = fixed_kept,
+    quarantine = quarantine,
+    audit = audit
   )
 }
 

@@ -129,6 +129,39 @@ af2_build_panel_adj <- function(universe_raw,
     )
   )]
 
+  # ------------------------------------------------------------
+  # 4b) Residual jump safety net (post-adjustment sanity)
+  # If close_adj_final still has split-sized discontinuities,
+  # force adjustment_state = "suspect_unresolved".
+  # ------------------------------------------------------------
+  jump_tol <- as.numeric(cfg$adj_residual_jump_tol_log %||% 1.0)
+  if (!is.finite(jump_tol) || jump_tol <= 0) jump_tol <- 1.0
+
+  jump_audit <- panel[
+    is.finite(close_adj_final) & close_adj_final > 0,
+    {
+      v <- abs(diff(log(close_adj_final)))
+      if (!length(v) || all(!is.finite(v))) {
+        .(residual_max_abs_logret = 0, residual_jump_date = as.Date(NA))
+      } else {
+        k <- which.max(v)
+        .(
+          residual_max_abs_logret = as.numeric(v[k]),
+          residual_jump_date = refdate[k + 1L]
+        )
+      }
+    },
+    by = symbol
+  ]
+
+  jump_audit[, residual_jump_flag := is.finite(residual_max_abs_logret) & residual_max_abs_logret >= jump_tol]
+
+  # Merge into state_dt and override adjustment_state
+  state_dt <- merge(state_dt, jump_audit[, .(symbol, residual_max_abs_logret, residual_jump_date, residual_jump_flag)],
+                    by = "symbol", all = TRUE)
+
+  state_dt[isTRUE(residual_jump_flag), adjustment_state := "suspect_unresolved"]
+
   panel[state_dt, on = "symbol", adjustment_state := i.adjustment_state]
 
   # 5) Final column cleanup ordering
@@ -159,4 +192,6 @@ af2_build_panel_adj <- function(universe_raw,
     adjustments = adj_tl,
     events = events
   )
+
+  residual_jump_audit = jump_audit
 }

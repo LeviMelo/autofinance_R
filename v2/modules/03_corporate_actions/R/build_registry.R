@@ -1,4 +1,5 @@
 # v2/modules/03_corporate_actions/R/build_registry.R
+source("v2/modules/03_corporate_actions/R/fetch_events_yahoo_chart.R")
 
 af2_ca_cache_file <- function(cfg, tag = "splits_dividends") {
   cache_dir <- file.path(cfg$cache_dir, "corp_actions")
@@ -103,15 +104,23 @@ af2_ca_build_registry <- function(symbols,
     sym <- map_dt$symbol[i]
     ysym <- map_dt$yahoo_symbol[i]
 
-    dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
-    dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE)
+    mode <- tolower(cfg$ca_fetch_mode %||% "chart")
 
-    out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
-    if (!nrow(out)) return(NULL)
+    out <- NULL
+    if (mode == "chart") {
+      out <- af2_ca_fetch_events_yahoo_chart_one(ysym, from = from, to = to, verbose = FALSE)
+    } else {
+      # fallback legacy (2 calls)
+      dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
+      dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE, split.adjust = FALSE)
+      out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
+      if (!nrow(out)) out <- NULL
+    }
+
+    if (is.null(out) || !nrow(out)) return(NULL)
 
     out[, symbol := sym]
     out[, yahoo_symbol := ysym]
-
     out
   }
 
@@ -134,8 +143,10 @@ af2_ca_build_registry <- function(symbols,
         "from", "to",
         "af2_ca_fetch_splits_one",
         "af2_ca_fetch_dividends_one",
+        "af2_ca_fetch_events_yahoo_chart_one", # <--- ADD THIS
         "af2_ca_with_retry",
         "af2_ca_is_rate_limit_error",
+        "af2_ca_require", # <--- ADD THIS (needed inside the new function)
         "af2_log"
       ),
       envir = environment()
@@ -145,6 +156,9 @@ af2_ca_build_registry <- function(symbols,
       library(quantmod)
       library(xts)
       library(zoo)
+      # Add these for the new chart fetcher:
+      if (requireNamespace("jsonlite", quietly=TRUE)) library(jsonlite) 
+      if (requireNamespace("curl", quietly=TRUE)) library(curl)
     })
 
     idx <- seq_len(nrow(map_dt))
