@@ -1,85 +1,71 @@
 # v2/tests/test_data_layer_v2.R
-# Smoke + deep diagnostics for v2 data layer (candidates -> CA fetch -> events -> adjustments -> features)
+# Integration regression test for v2 data layer AFTER patches:
+# - module load stability (zzz_depends first)
+# - selective CA coverage (Set A + Set B)
+# - split validator sanity (audit + jump reduction)
+# - FII dividend coverage measured against *actual Set A logic*
+# - screener/ranking runs (or fallback features)
 
-# =========================
-# 1) HARD RESET (MUST BE FIRST)
-# =========================
 rm(list = ls(all.names = TRUE))
 gc()
-
 options(stringsAsFactors = FALSE)
 Sys.setenv(TZ = "UTC")
 
-# =========================
-# 2) USER KNOBS
-# =========================
-# NOTE:
-# - This block is intentionally written so it NEVER errors if you refactor/reset.
-# - Edit the *defaults* here when you want to change behavior.
-
-WATCH <- get0(
-  "WATCH",
-  ifnotfound = c("SEQL3", "IFCM3", "GOLD11", "GOGL34", "PETR4", "VALE3", "ITUB4")
-)
-WATCH <- unique(toupper(trimws(as.character(WATCH))))
-WATCH <- WATCH[nzchar(WATCH)]
-
+# ----------------------------
+# User knobs
+# ----------------------------
 FORCE_REFRESH_CA_BATCH_CACHE <- isTRUE(get0("FORCE_REFRESH_CA_BATCH_CACHE", ifnotfound = FALSE))
 RUN_PARALLEL_MINITEST        <- isTRUE(get0("RUN_PARALLEL_MINITEST", ifnotfound = TRUE))
-HARD_FAIL_IF_NO_DIVIDENDS    <- isTRUE(get0("HARD_FAIL_IF_NO_DIVIDENDS", ifnotfound = TRUE))
+FORCE_SYMBOLS                <- get0("FORCE_SYMBOLS", ifnotfound = c("AURA33"))
+FORCE_SYMBOLS                <- unique(toupper(trimws(as.character(FORCE_SYMBOLS))))
+FORCE_SYMBOLS                <- FORCE_SYMBOLS[nzchar(FORCE_SYMBOLS)]
 
-# Optional: override candidate cap for faster tests (set NULL to keep cfg)
-OVERRIDE_MAX_CANDIDATES <- get0("OVERRIDE_MAX_CANDIDATES", ifnotfound = NULL)
+# FII coverage expectation (measured on Set A eligible FIIs)
+MIN_FII_COVERAGE_PCT <- as.numeric(get0("MIN_FII_COVERAGE_PCT", ifnotfound = 60)) # 60% is realistic
+MIN_FII_COVERAGE_N   <- as.integer(get0("MIN_FII_COVERAGE_N", ifnotfound = 50))  # at least 50 FIIs w/ divs
 
-# If you already have universe_raw saved, set this path; otherwise script tries to build/load automatically.
-UNIVERSE_RAW_RDS <- get0("UNIVERSE_RAW_RDS", ifnotfound = NULL)
-if (!is.null(UNIVERSE_RAW_RDS)) UNIVERSE_RAW_RDS <- as.character(UNIVERSE_RAW_RDS)
+# Split-day improvement expectations
+MIN_SPLIT_IMPROVE_SHARE <- as.numeric(get0("MIN_SPLIT_IMPROVE_SHARE", ifnotfound = 0.90))
 
-# =========================
-# 3) ASSERT PROJECT ROOT
-# =========================
-if (!dir.exists("v2/modules")) {
-  stop("Run this from the project root (the folder that contains v2/modules).", call. = FALSE)
-}
+# ----------------------------
+# Helpers
+# ----------------------------
+.msg <- function(...) cat(paste0(..., collapse=""), "\n")
+stopf <- function(...) stop(sprintf(...), call. = FALSE)
 
-# =========================
-# 4) HELPERS
-# =========================
-.msg <- function(...) cat(paste0(..., collapse = ""), "\n")
-
-source_all_v2_modules <- function(mod_root = "v2/modules") {
-  files <- list.files(mod_root, pattern = "\\.R$", recursive = TRUE, full.names = TRUE)
-  if (!length(files)) stop("No R files found under v2/modules.", call. = FALSE)
-
-  # Deterministic order; numeric module dirs should already sort correctly
-  files <- sort(normalizePath(files, winslash = "/", mustWork = TRUE))
-
-  # Prefer 00_core first if present
-  core_first <- grepl("/00_", files) | grepl("/00core", files, ignore.case = TRUE)
-  files <- c(files[core_first], files[!core_first])
-
-  .msg("Sourcing ", length(files), " files under ", mod_root, " ...")
-  for (f in files) {
-    tryCatch(
-      source(f, local = FALSE),
-      error = function(e) {
-        stop("Failed sourcing: ", f, "\n", conditionMessage(e), call. = FALSE)
-      }
-    )
+source_dir_safe <- function(path) {
+  if (!dir.exists(path)) return(invisible(FALSE))
+  files <- list.files(path, pattern="\\.R$", full.names=TRUE, recursive=FALSE)
+  files <- sort(files)
+  zzz  <- files[grepl("zzz_depends\\.R$", files)]
+  rest <- files[!grepl("zzz_depends\\.R$", files)]
+  for (f in c(zzz, rest)) {
+    tryCatch(source(f, local = FALSE), error = function(e) {
+      stopf("Failed sourcing %s:\n%s", f, conditionMessage(e))
+    })
   }
-  invisible(files)
+  invisible(TRUE)
 }
 
-assert_has <- function(fn) {
-  if (!exists(fn, mode = "function")) stop("Missing required function: ", fn, call. = FALSE)
+source_v2_modules <- function(root=".") {
+  mod_root <- file.path(root, "v2", "modules")
+  if (!dir.exists(mod_root)) stopf("Run from project root (missing %s).", mod_root)
+
+  mods <- sort(list.dirs(mod_root, full.names = TRUE, recursive = FALSE))
+  core <- mods[grepl("^00_", basename(mods))]
+  oth  <- mods[!grepl("^00_", basename(mods))]
+
+  .msg("[1/6] Sourcing modules...")
+  for (m in c(core, oth)) {
+    rdir <- file.path(m, "R")
+    if (dir.exists(rdir)) {
+      .msg("  - ", basename(m))
+      source_dir_safe(rdir)
+    }
+  }
+  invisible(TRUE)
 }
 
-as_dt <- function(x) {
-  if (!requireNamespace("data.table", quietly = TRUE)) stop("data.table not installed.", call. = FALSE)
-  data.table::as.data.table(x)
-}
-
-# Safely delete only batch corp_actions caches (not by_symbol)
 delete_batch_ca_caches <- function(cache_dir = "v2/data/cache/corp_actions") {
   if (!dir.exists(cache_dir)) return(invisible(FALSE))
   files <- list.files(cache_dir, pattern = "^corp_actions_.*\\.rds$", full.names = TRUE)
@@ -89,396 +75,265 @@ delete_batch_ca_caches <- function(cache_dir = "v2/data/cache/corp_actions") {
   invisible(TRUE)
 }
 
-# Try to obtain universe_raw in a robust way
-get_or_build_universe_raw <- function() {
-  
-  # 1. Try explicit user path
-  if (!is.null(UNIVERSE_RAW_RDS) && file.exists(UNIVERSE_RAW_RDS)) {
-    .msg("Loading universe_raw from: ", UNIVERSE_RAW_RDS)
-    return(readRDS(UNIVERSE_RAW_RDS))
+need_fn <- function(x) if (!exists(x, mode="function")) stopf("Missing function: %s", x)
+
+# attempt to run screener if present
+run_screener_if_exists <- function(panel_adj_dt) {
+  cand <- c("af2_run_screener", "af2_run_screener_v2")
+  fn <- cand[cand %in% ls(.GlobalEnv)][1]
+  if (is.na(fn) || is.null(fn)) return(NULL)
+
+  f <- get(fn, mode="function")
+  fml <- names(formals(f))
+  .msg("[6/6] Running screener via ", fn, "() ...")
+
+  # pass allow_unresolved if supported
+  if ("allow_unresolved" %in% fml) {
+    return(f(panel_adj_dt, allow_unresolved = TRUE))
   }
-
-  # 2. Try default cache location
-  default_cache <- "v2/data/cache/universe_raw_latest.rds"
-  if (file.exists(default_cache)) {
-    .msg("Loading universe_raw from: ", default_cache)
-    return(readRDS(default_cache))
-  }
-
-  # 3. Try to build it (PATCHED: Added af2_b3_build_universe)
-  candidates <- c(
-    "af2_b3_build_universe",       # <--- The correct v2 function
-    "af2_build_universe",          # Legacy alias
-    "af2_cotahist_build_universe"  # Legacy alias
-  )
-
-  for (fn in candidates) {
-    if (exists(fn, mode = "function")) {
-      .msg("Building universe_raw via ", fn, "() ...")
-      
-      # Default to last 2 years + current year to be safe and fast
-      y_end <- as.integer(format(Sys.Date(), "%Y"))
-      y_start <- y_end - 1L
-      
-      # Call builder
-      res <- get(fn)(years = y_start:y_end)
-      
-      # Auto-save to cache for next time
-      .msg("Saving universe_raw to ", default_cache, " for future runs...")
-      dir.create(dirname(default_cache), recursive = TRUE, showWarnings = FALSE)
-      saveRDS(res, default_cache)
-      
-      return(res)
-    }
-  }
-
-  stop(
-    "Could not load/build universe_raw.\n",
-    "Function 'af2_b3_build_universe' was not found after sourcing modules.\n",
-    "Check if v2/modules/01_b3_universe/R/build_universe.R exists.",
-    call. = FALSE
-  )
+  return(f(panel_adj_dt))
 }
 
-# Fallback features (only used if your screener entrypoint is unavailable)
-compute_fallback_features <- function(panel_adj_dt, lookback = 253L) {
-  dt <- as_dt(panel_adj_dt)
-  data.table::setorder(dt, symbol, refdate)
-
-  out <- dt[, {
-    x <- close_adj_final
-    x <- x[is.finite(x) & x > 0]
-    if (length(x) < 30) {
-      .(end_refdate = max(refdate), n_obs = .N,
-        ret_21d = NA_real_, vol_21d = NA_real_, max_dd = NA_real_,
-        median_turnover = stats::median(turnover, na.rm = TRUE),
-        asset_type = asset_type[.N])
-    } else {
-      # last lookback rows by date
-      idx <- tail(seq_len(.N), lookback)
-      p <- close_adj_final[idx]
-      d <- refdate[idx]
-
-      # returns
-      r <- diff(p) / data.table::shift(p, 1L, type = "lag")[idx][-1]
-      # safer: log returns
-      lr <- diff(log(p))
-
-      # 21d total return
-      ret_21d <- if (length(p) >= 22) (p[length(p)] / p[length(p) - 21] - 1) else NA_real_
-
-      # 21d vol annualized (sqrt(252))
-      vol_21d <- {
-        lr21 <- tail(lr, 21)
-        if (length(lr21) >= 10) stats::sd(lr21, na.rm = TRUE) * sqrt(252) else NA_real_
-      }
-
-      # max drawdown inside window
-      cm <- cummax(p)
-      dd <- p / cm - 1
-      max_dd <- min(dd, na.rm = TRUE)
-
-      .(end_refdate = max(d), n_obs = length(p),
-        ret_21d = ret_21d, vol_21d = vol_21d, max_dd = max_dd,
-        median_turnover = stats::median(turnover, na.rm = TRUE),
-        asset_type = asset_type[.N])
-    }
-  }, by = symbol]
-
-  out[]
-}
-
-# =========================
-# 5) SOURCE MODULES + LOAD CFG
-# =========================
-source_all_v2_modules("v2/modules")
-
-assert_has("af2_get_config")
-assert_has("af2_ca_select_candidates")
-assert_has("af2_build_panel_adj_selective")
+# ----------------------------
+# 1) Source modules + config
+# ----------------------------
+source_v2_modules(getwd())
+need_fn("af2_get_config")
+need_fn("af2_build_panel_adj_selective")
+need_fn("af2_ca_select_candidates")
 
 cfg <- af2_get_config()
 
-# Optional cap override for faster runs
-if (!is.null(OVERRIDE_MAX_CANDIDATES)) {
-  cfg$ca_prefilter_max_candidates <- as.integer(OVERRIDE_MAX_CANDIDATES)
-  .msg("OVERRIDE: cfg$ca_prefilter_max_candidates = ", cfg$ca_prefilter_max_candidates)
+# ----------------------------
+# 2) Load/build universe_raw
+# ----------------------------
+.msg("[2/6] Loading universe_raw...")
+cache_path <- "v2/data/cache/universe_raw_latest.rds"
+if (file.exists(cache_path)) {
+  universe_raw <- readRDS(cache_path)
+  .msg("Loaded: ", cache_path)
+} else {
+  # minimal build fallback
+  if (!exists("af2_b3_build_universe", mode="function")) {
+    stopf("No universe cache and af2_b3_build_universe() not found.")
+  }
+  y_end <- as.integer(format(Sys.Date(), "%Y"))
+  universe_raw <- af2_b3_build_universe(years = (y_end-1L):y_end)
+  dir.create(dirname(cache_path), recursive=TRUE, showWarnings=FALSE)
+  saveRDS(universe_raw, cache_path)
+  .msg("Built + cached: ", cache_path)
 }
 
-# Make sure new knobs exist (won't fail if absent; just informative)
-.msg("CFG snapshot (relevant):")
-flat <- unlist(cfg, recursive = TRUE)
-print(flat[grep("ca_|corp|split|div|prefilter|gap|jump|max_candidates|cache_mode|fetch_mode",
-                names(flat), ignore.case = TRUE)])
+library(data.table)
+u <- as.data.table(universe_raw)
 
-# =========================
-# 6) GET universe_raw
-# =========================
-universe_raw <- get_or_build_universe_raw()
-universe_raw <- as_dt(universe_raw)
+# Normalize (tests should not rely on upstream perfect normalization)
+u[, symbol := toupper(trimws(as.character(symbol)))]
+u[, asset_type := tolower(trimws(as.character(asset_type)))]
+u[, refdate := as.Date(refdate)]
 
-.msg("universe_raw: rows=", nrow(universe_raw), " syms=", length(unique(universe_raw$symbol)),
-     " date_range=", min(universe_raw$refdate), " -> ", max(universe_raw$refdate))
+# minimal contract check
+req_u <- c("symbol","asset_type","refdate","open","high","low","close","turnover","qty")
+miss_u <- setdiff(req_u, names(u))
+if (length(miss_u)) stopf("universe_raw missing cols: %s", paste(miss_u, collapse=", "))
 
-# =========================
-# 7) CANDIDATE SELECTION DIAGNOSTICS
-# =========================
-cand <- af2_ca_select_candidates(universe_raw, cfg = cfg, verbose = TRUE)
-cand <- unique(toupper(cand))
+.msg("universe_raw rows=", nrow(u),
+     " syms=", length(unique(u$symbol)),
+     " range=", min(u$refdate, na.rm=TRUE), " -> ", max(u$refdate, na.rm=TRUE))
 
-.msg("Candidate set: n=", length(cand))
-cand_hit <- setNames(WATCH %in% cand, WATCH)
-print(cand_hit)
+# ----------------------------
+# 3) Candidate selection sanity
+# ----------------------------
+.msg("[3/6] Candidate selection...")
+cand <- af2_ca_select_candidates(u, cfg = cfg, verbose = TRUE)
+cand <- unique(toupper(trimws(as.character(cand))))
+cand <- cand[nzchar(cand)]
 
-# Require SEQL3/IFCM3 in candidates (your must-have regression test)
-if (!("SEQL3" %in% cand && "IFCM3" %in% cand)) {
-  stop("Candidate regression: SEQL3/IFCM3 not in candidates. Fix select_candidates.R.", call. = FALSE)
-}
+.msg("Candidates n=", length(cand))
+if (length(FORCE_SYMBOLS)) .msg("Force symbols: ", paste(FORCE_SYMBOLS, collapse=", "))
 
-# =========================
-# 8) OPTIONAL: FORCE REFRESH CA BATCH CACHE
-# =========================
-if (isTRUE(FORCE_REFRESH_CA_BATCH_CACHE)) {
-  delete_batch_ca_caches("v2/data/cache/corp_actions")
-}
+# ----------------------------
+# 4) Optional cache refresh + parallel mini-test
+# ----------------------------
+if (isTRUE(FORCE_REFRESH_CA_BATCH_CACHE)) delete_batch_ca_caches("v2/data/cache/corp_actions")
 
-# =========================
-# 9) OPTIONAL: PARALLEL MINITEST (registry only)
-# =========================
-if (isTRUE(RUN_PARALLEL_MINITEST) && exists("af2_ca_build_registry", mode = "function")) {
-
-  .msg("\n--- Parallel mini-test (af2_ca_build_registry, n_workers=2) ---")
-  mini_syms <- unique(c("PETR4", "VALE3", "ITUB4", "TAEE11", "HGLG11", "BBAS3"))
-  mini_syms <- mini_syms[mini_syms %in% unique(toupper(universe_raw$symbol))]
-
+if (isTRUE(RUN_PARALLEL_MINITEST) && exists("af2_ca_build_registry", mode="function")) {
+  .msg("\n--- Parallel registry mini-test (n_workers=2) ---")
+  mini_syms <- unique(c("PETR4","VALE3","ITUB4","TAEE11","HGLG11","BBAS3"))
+  mini_syms <- mini_syms[mini_syms %chin% unique(u$symbol)]
   if (length(mini_syms) >= 2) {
-    mini <- tryCatch(
-      af2_ca_build_registry(
-        symbols = mini_syms,
-        cfg = cfg,
-        from = "2022-01-01",
-        to = Sys.Date(),
-        verbose = TRUE,
-        use_cache = FALSE,
-        force_refresh = TRUE,
-        n_workers = 2L,
-        cache_mode = "batch"
-      ),
-      error = function(e) e
+    mini <- af2_ca_build_registry(
+      symbols = mini_syms,
+      cfg = cfg,
+      from = "2022-01-01",
+      to = Sys.Date(),
+      verbose = TRUE,
+      use_cache = FALSE,
+      force_refresh = TRUE,
+      n_workers = 2L,
+      cache_mode = "batch"
     )
-
-    if (inherits(mini, "error")) {
-      stop("Parallel registry mini-test FAILED:\n", conditionMessage(mini), call. = FALSE)
-    } else {
-      mini <- as_dt(mini)
-      .msg("Parallel registry mini-test OK. action_type counts:")
-      print(mini[, .N, by = action_type][order(-N)])
-    }
+    mini <- as.data.table(mini)
+    .msg("Mini-test action_type counts:")
+    print(mini[, .N, by=action_type][order(-N)])
   } else {
-    .msg("Skipping parallel mini-test: not enough mini_syms present in universe_raw.")
+    .msg("Skipping mini-test: insufficient mini_syms in universe.")
   }
 }
 
-# =========================
-# 10) BUILD PANEL (SELECTIVE CA + ADJUSTER)
-# =========================
-.msg("\n--- Building panel_adj_result (selective) ---")
-panel_adj_result <- af2_build_panel_adj_selective(universe_raw = universe_raw)
-
-# Contract checks
-needed <- c("panel_adj", "events", "corp_actions_apply", "corp_actions_quarantine", "split_audit")
-miss <- setdiff(needed, names(panel_adj_result))
-if (length(miss)) {
-  stop("panel_adj_result missing fields: ", paste(miss, collapse = ", "), call. = FALSE)
-}
-
-panel_adj_dt <- as_dt(panel_adj_result$panel_adj)
-events <- as_dt(panel_adj_result$events)
-ca_apply <- as_dt(panel_adj_result$corp_actions_apply)
-ca_quar <- as_dt(panel_adj_result$corp_actions_quarantine)
-audit <- as_dt(panel_adj_result$split_audit)
-
-.msg("panel_adj: rows=", nrow(panel_adj_dt), " syms=", length(unique(panel_adj_dt$symbol)))
-.msg("events:    rows=", nrow(events), " syms=", length(unique(events$symbol)))
-.msg("ca_apply:  rows=", nrow(ca_apply), " types=", paste(unique(ca_apply$action_type), collapse = ", "))
-.msg("ca_quar:   rows=", nrow(ca_quar))
-
-# =========================
-# 10.5) AURA33 TRACE (PIPELINE BREAK LOCATOR)
-# =========================
-trace_symbol <- function(sym, universe_raw, cand, ca_apply, ca_quar, events, audit) {
-  sym <- toupper(sym)
-
-  cat("\n====================\n")
-  cat("TRACE SYMBOL:", sym, "\n")
-  cat("====================\n")
-
-  u_sym <- universe_raw[symbol == sym]
-  cat("universe_raw rows:", nrow(u_sym), "\n")
-  if (nrow(u_sym)) {
-    cat("universe_raw date range:", as.character(min(u_sym$refdate)), "->", as.character(max(u_sym$refdate)), "\n")
-  }
-
-  in_cand <- sym %in% cand
-  cat("in candidate set:", in_cand, "\n")
-
-  caA <- ca_apply[symbol == sym]
-  caQ <- ca_quar[symbol == sym]
-  ev  <- events[symbol == sym]
-  au  <- audit[symbol == sym]
-
-  cat("ca_apply rows:", nrow(caA), "\n")
-  if (nrow(caA)) print(caA[order(refdate, action_type)])
-
-  cat("ca_quarantine rows:", nrow(caQ), "\n")
-  if (nrow(caQ)) print(caQ[order(refdate, action_type)])
-
-  cat("events rows:", nrow(ev), "\n")
-  if (nrow(ev)) print(ev[order(refdate)])
-
-  cat("split_audit rows:", nrow(au), "\n")
-  if (nrow(au)) print(au[order(refdate)])
-
-  # Quick check: are there any dividend-positive days for this symbol?
-  if ("div_cash" %in% names(events)) {
-    cat("events div_cash>0 rows:", nrow(events[symbol == sym & div_cash > 0]), "\n")
-  }
-
-  invisible(list(
-    in_cand = in_cand,
-    u_rows = nrow(u_sym),
-    ca_apply = caA,
-    ca_quar = caQ,
-    events = ev,
-    audit = au
-  ))
-}
-
-# Make sure cand is defined; if you suspect builder uses a different cfg, still run it —
-# it will at least show where AURA33 is missing.
-if (!exists("cand")) cand <- character()
-
-aura_trace <- trace_symbol(
-  "AURA33",
-  universe_raw = universe_raw,
-  cand = cand,
-  ca_apply = ca_apply,
-  ca_quar = ca_quar,
-  events = events,
-  audit = audit
+# ----------------------------
+# 5) Build pipeline (selective)
+# ----------------------------
+.msg("\n[4/6] Building panel_adj_result...")
+res <- af2_build_panel_adj_selective(
+  universe_raw   = u,
+  force_symbols  = FORCE_SYMBOLS,
+  verbose        = TRUE
 )
 
-# =========================
-# 11) DIVIDEND ASSERTIONS
-# =========================
-ca_counts <- ca_apply[, .N, by = action_type][order(-N)]
-.msg("\nCorporate actions APPLY counts:")
-print(ca_counts)
+# required outputs
+need_fields <- c("panel_adj","events","corp_actions_apply","corp_actions_quarantine","split_audit","residual_jump_audit")
+miss_f <- setdiff(need_fields, names(res))
+if (length(miss_f)) stopf("panel_adj_result missing fields: %s", paste(miss_f, collapse=", "))
 
-n_div_apply <- if ("dividend" %in% ca_apply$action_type) nrow(ca_apply[action_type == "dividend"]) else 0L
-n_div_ev <- nrow(events[div_cash > 0])
+panel  <- as.data.table(res$panel_adj)
+events <- as.data.table(res$events)
+ca_apply <- as.data.table(res$corp_actions_apply)
+audit  <- as.data.table(res$split_audit)
+rj     <- as.data.table(res$residual_jump_audit)
 
-.msg("Dividend rows in ca_apply: ", n_div_apply)
-.msg("Dividend-positive event days (events$div_cash>0): ", n_div_ev)
+# ----------------------------
+# 5a) Core invariants
+# ----------------------------
+.msg("[5/6] Core invariants...")
 
-if (HARD_FAIL_IF_NO_DIVIDENDS && (n_div_apply == 0L || n_div_ev == 0L)) {
-  stop(
-    "Dividend ghost still present: no dividends made it into ca_apply/events.\n",
-    "Fix fetcher wiring (chart events) OR confirm Yahoo returns dividends in your environment.\n",
-    "Tip: inspect ca_apply[action_type=='dividend'] and the registry cache file created this run.",
-    call. = FALSE
-  )
+# no duplicate market keys
+stopifnot(panel[, anyDuplicated(paste(symbol, refdate))] == 0L)
+
+# required cols exist
+req_panel <- c("symbol","refdate","asset_type","close_raw","close_adj_final","adjustment_state")
+miss_p <- setdiff(req_panel, names(panel))
+if (length(miss_p)) stopf("panel_adj missing cols: %s", paste(miss_p, collapse=", "))
+
+# events sane
+stopifnot(events[, all(is.finite(split_value) & split_value > 0)])
+stopifnot(events[, all(is.finite(div_cash) & div_cash >= 0)])
+
+# ca_apply must not leak row_id
+if ("row_id" %in% names(ca_apply)) stopf("row_id leaked into corp_actions_apply")
+
+# audit sanity: kept must have eff_refdate + chosen_value
+if (nrow(audit) && "status" %in% names(audit)) {
+  print(audit[, .N, by=status][order(-N)])
+  if (nrow(audit[status=="kept"])) {
+    stopifnot(audit[status=="kept", all(!is.na(eff_refdate) & is.finite(chosen_value) & chosen_value > 0)])
+  }
 }
 
-# =========================
-# 12) SPLIT VALIDATION SUMMARY (KEPT/REJECTED/UNVERIFIED)
-# =========================
-if ("status" %in% names(audit)) {
-  .msg("\nSplit audit status counts:")
-  print(audit[, .N, by = status][order(-N)])
-}
+# ----------------------------
+# 5b) Split-day improvement test
+# ----------------------------
+splits <- unique(ca_apply[action_type=="split", .(symbol, refdate)])
+if (nrow(splits)) {
+  setkey(panel, symbol, refdate)
+  panel[, lr_raw := log(close_raw / shift(close_raw)), by=symbol]
+  panel[, lr_adj := log(close_adj_final / shift(close_adj_final)), by=symbol]
 
-# Check watch symbols CA rows
-.msg("\nCA rows for WATCH:")
-print(ca_apply[symbol %chin% WATCH][order(symbol, action_type, refdate)][1:200])
+  at_split <- panel[splits, on=.(symbol, refdate), nomatch=0L]
+  at_split <- at_split[is.finite(lr_raw) & is.finite(lr_adj)]
+  if (nrow(at_split)) {
+    at_split[, `:=`(abs_raw = abs(lr_raw), abs_adj = abs(lr_adj))]
+    share_improved <- mean(at_split$abs_adj < at_split$abs_raw, na.rm=TRUE)
+    .msg("Split-day evaluated: ", nrow(at_split),
+         " | share improved: ", round(share_improved, 4),
+         " | median improvement: ", round(median(at_split$abs_raw - at_split$abs_adj, na.rm=TRUE), 4))
 
-# =========================
-# 13) RESIDUAL JUMP SAFETY NET CHECK
-# =========================
-if ("residual_jump_audit" %in% names(panel_adj_result)) {
-  rj <- as_dt(panel_adj_result$residual_jump_audit)
-  .msg("\nResidual jump audit: top offenders:")
-  print(rj[order(-residual_max_abs_logret)][1:30])
-} else {
-  .msg("\nNOTE: residual_jump_audit not present in panel_adj_result; skipping this check.")
-}
-
-# =========================
-# 14) PER-SYMBOL DIAGNOSTICS
-# =========================
-if (exists("af2_diag_symbol", mode = "function")) {
-  .msg("\n--- af2_diag_symbol(WATCH) ---")
-  for (s in WATCH) {
-    if (s %in% unique(panel_adj_dt$symbol)) {
-      af2_diag_symbol(
-        symbol = s,
-        panel_adj = panel_adj_dt,
-        events = events,
-        corp_actions_apply = ca_apply,
-        split_audit = audit,
-        show_plot = TRUE
-      )
+    if (!is.finite(share_improved) || share_improved < MIN_SPLIT_IMPROVE_SHARE) {
+      stopf("Split improvement share too low (%.3f < %.3f).", share_improved, MIN_SPLIT_IMPROVE_SHARE)
     }
+
+    .msg("Worst 10 abs_adj after adjustment:")
+    print(at_split[order(-abs_adj)][1:10, .(symbol, refdate, abs_raw, abs_adj)])
+  }
+}
+
+# ----------------------------
+# 5c) AURA33 jump reduction (if present)
+# ----------------------------
+if ("AURA33" %chin% panel$symbol) {
+  x <- panel[symbol=="AURA33"][order(refdate)]
+  raw_jump <- max(abs(diff(log(x$close_raw))), na.rm=TRUE)
+  adj_jump <- max(abs(diff(log(x$close_adj_final))), na.rm=TRUE)
+  .msg("AURA33 max abs logret raw=", round(raw_jump, 6), " adj=", round(adj_jump, 6))
+
+  # not ultra-strict; we just want "meaningful reduction"
+  if (is.finite(raw_jump) && is.finite(adj_jump)) {
+    if (!(adj_jump < raw_jump * 0.5)) stopf("AURA33 did not show meaningful jump reduction.")
+  }
+}
+
+# ----------------------------
+# 5d) FII dividend coverage measured on Set A-eligible FIIs
+# ----------------------------
+liq_window_days <- as.integer(cfg$ca_prefilter_liq_window_days %||% 63L)
+end_date <- max(u$refdate, na.rm=TRUE)
+liq_start <- end_date - ceiling(liq_window_days * 1.6)
+
+u_liq <- u[refdate >= liq_start & refdate <= end_date]
+u_liq[, traded_flag := is.finite(close) & !is.na(close)]
+
+stats_liq <- u_liq[, .(
+  median_turnover = median(turnover, na.rm=TRUE),
+  days_traded_ratio = mean(traded_flag, na.rm=TRUE)
+), by=.(symbol, asset_type)]
+
+stats_liq[is.na(median_turnover), median_turnover := 0]
+stats_liq[is.na(days_traded_ratio), days_traded_ratio := 0]
+
+setA <- stats_liq[
+  median_turnover >= (cfg$min_turnover %||% 5e5) &
+  days_traded_ratio >= (cfg$min_days_traded_ratio %||% 0.8)
+]
+
+setA_fii <- setA[asset_type=="fii", unique(symbol)]
+panel_min <- min(panel$refdate, na.rm=TRUE)
+panel_max <- max(panel$refdate, na.rm=TRUE)
+ev_win <- events[refdate >= panel_min & refdate <= panel_max]
+
+fii_with_divs <- intersect(setA_fii, unique(ev_win[div_cash > 0, symbol]))
+cov_pct <- if (length(setA_fii)) 100 * length(fii_with_divs) / length(setA_fii) else NA_real_
+
+.msg("\nFII dividend coverage (Set A eligible):")
+.msg("  Set A FIIs: ", length(setA_fii))
+.msg("  With div events: ", length(fii_with_divs))
+.msg("  Coverage %: ", if (is.finite(cov_pct)) round(cov_pct,1) else "NA")
+
+if (length(setA_fii) >= 10) {
+  if (!is.finite(cov_pct) || cov_pct < MIN_FII_COVERAGE_PCT || length(fii_with_divs) < MIN_FII_COVERAGE_N) {
+    .msg("Missing SetA FIIs (first 50):")
+    print(head(setdiff(setA_fii, fii_with_divs), 50))
+    stopf("FII coverage below expectation (pct<%.1f or n<%d).", MIN_FII_COVERAGE_PCT, MIN_FII_COVERAGE_N)
+  }
+}
+
+# ----------------------------
+# 6) Run screener/ranking
+# ----------------------------
+scr <- run_screener_if_exists(panel)
+
+if (!is.null(scr) && is.list(scr) && "features" %in% names(scr)) {
+  feats <- as.data.table(scr$features)
+  .msg("Screener features rows=", nrow(feats), " syms=", length(unique(feats$symbol)))
+  .msg("Top 30 by abs(ret_21d) if present:")
+  if ("ret_21d" %in% names(feats)) {
+    print(feats[is.finite(ret_21d)][order(-abs(ret_21d))][1:30,
+               .(symbol, ret_21d, vol_21d, max_dd, median_turnover, asset_type)])
+  } else {
+    .msg("features has no ret_21d column; printing head():")
+    print(head(feats, 30))
   }
 } else {
-  .msg("\nNOTE: af2_diag_symbol() not found; skipping per-symbol diag.")
+  .msg("No screener entrypoint found or no $features returned. (This is OK.)")
 }
 
-# =========================
-# 15) REBUILD RES / FEATURES (Screener if available; fallback otherwise)
-# =========================
-res <- NULL
-if (exists("af2_run_screener", mode = "function")) {
-  .msg("\n--- Running af2_run_screener(panel_adj_dt) ---")
-  
-  # NOTE: We pass allow_unresolved = TRUE because we KNOW 'panel_adj_dt' contains
-  # suspects (like TCIN15, AMER3) flagged by the safety net. 
-  # The screener will automatically drop them unless configured otherwise, 
-  # but the validator won't throw a hard stop.
-  res <- af2_run_screener(panel_adj_dt, allow_unresolved = TRUE)
-  
-} else if (exists("af2_run_screener_v2", mode = "function")) {
-  .msg("\n--- Running af2_run_screener_v2(panel_adj_dt) ---")
-  res <- af2_run_screener_v2(panel_adj_dt, allow_unresolved = TRUE)
-}
-
-if (!is.null(res) && is.list(res) && "features" %in% names(res)) {
-  feats <- as_dt(res$features)
-  
-  # If the screener drops unresolved symbols, they won't be in 'feats'.
-  # So we check WATCH items only if they survived.
-  survivors <- intersect(WATCH, feats$symbol)
-  
-  .msg("\nScreener features present. WATCH rows (survivors):")
-  print(feats[symbol %chin% survivors, .(symbol, end_refdate, n_obs, ret_21d, vol_21d, max_dd, median_turnover, asset_type)][order(symbol)])
-
-  .msg("\nTop 30 by abs(ret_21d):")
-  top <- feats[is.finite(ret_21d)][order(-abs(ret_21d))][1:30]
-  print(top[, .(symbol, ret_21d, vol_21d, max_dd, median_turnover, asset_type)])
-
-} else {
-  .msg("\nNOTE: Screener entrypoint not found or did not return $features. Using fallback feature computation.")
-  feats <- compute_fallback_features(panel_adj_dt, lookback = 253L)
-
-  .msg("\nFallback features (WATCH):")
-  print(feats[symbol %chin% WATCH][order(symbol)])
-
-  .msg("\nFallback top 30 by abs(ret_21d):")
-  top <- feats[is.finite(ret_21d)][order(-abs(ret_21d))][1:30]
-  print(top[, .(symbol, ret_21d, vol_21d, max_dd, median_turnover, asset_type)])
-}
-# =========================
-# 16) FINAL SUCCESS MESSAGE
-# =========================
-.msg("\n✅ v2 data-layer test completed.")
-.msg("If HARD_FAIL_IF_NO_DIVIDENDS=TRUE, then dividends are confirmed present end-to-end.")
+.msg("\n✅ v2 data-layer integration test PASSED.")

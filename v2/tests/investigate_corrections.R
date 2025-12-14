@@ -17,7 +17,7 @@ jump   <- panel_adj_result$residual_jump_audit
 # ==============================================================================
 # 1. DEEP DIVE: Why is ITUB4 "suspect_unresolved"?
 # ==============================================================================
-target <- "ITUB4"
+target <- "VALE3"
 message("\n=== INVESTIGATION: ", target, " ===")
 
 # A) Check Dividend Safety Logic (issue_div)
