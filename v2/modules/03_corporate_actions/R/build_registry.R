@@ -139,6 +139,7 @@ af2_ca_build_registry <- function(symbols,
     parallel::clusterExport(
       cl,
       varlist = c(
+        "cfg",  # <--- ADDED THIS
         "map_dt",
         "from", "to",
         "af2_ca_fetch_splits_one",
@@ -262,12 +263,30 @@ af2_ca_build_registry_by_symbol <- function(symbols,
       next
     }
 
-    dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
-    dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE)
+    # --- LOGIC UPDATE START ---
+    mode <- tolower(cfg$ca_fetch_mode %||% "chart")
 
-    out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
+    # Fallback if chart deps missing
+    if (mode == "chart" &&
+        (!requireNamespace("jsonlite", quietly = TRUE) ||
+         !requireNamespace("curl", quietly = TRUE))) {
+      if (verbose) af2_log("AF2_CA:", "chart mode requested but jsonlite/curl missing; falling back to quantmod for ", sym)
+      mode <- "quantmod"
+    }
 
-    if (!nrow(out)) {
+    out <- NULL
+    if (mode == "chart") {
+      out <- af2_ca_fetch_events_yahoo_chart_one(ysym, from = from, to = to, verbose = FALSE)
+    } else {
+      # Legacy quantmod calls
+      dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
+      dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE)
+      out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
+      if (!nrow(out)) out <- NULL
+    }
+    # --- LOGIC UPDATE END ---
+
+    if (is.null(out) || !nrow(out)) {
       out <- data.table::data.table(
         symbol = character(),
         yahoo_symbol = character(),

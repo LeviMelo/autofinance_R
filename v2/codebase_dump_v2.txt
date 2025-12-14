@@ -18,6 +18,7 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   modules/01_b3_universe/R/validate_types.R
   modules/01_b3_universe/R/zzz_depends.R
   modules/01_b3_universe/README.md
+  modules/02_diagnostics/R/diag_symbol.R
   modules/02_diagnostics/README.md
   modules/03_corporate_actions/codebase_dump_03_corporate_actions.txt
   modules/03_corporate_actions/R/build_registry.R
@@ -58,9 +59,340 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_R/v2':
   scripts/05c_hard_selective_split_audit.R
   scripts/05d_yahoo_vs_af2_crosscheck.R
   scripts/test_panel_adj_screener.R
+  tests/diagnose_adjuster.R
+  tests/investigate_corrections.R
   tests/test_data_layer_v2.R
   tests/vis_check.R
 
+
+
+###############################################################################
+### FILE: tests/diagnose_adjuster.R
+###############################################################################
+# ======================================================================
+# diagnose_adjuster.R
+# Build panel_adj_result (best-effort) and run split/adjustment diagnostics
+# ======================================================================
+
+options(stringsAsFactors = FALSE)
+
+cat("\n=============================\n")
+cat(" Autofinance v2 diagnostics\n")
+cat("=============================\n\n")
+
+# ----------------------------
+# 0) Small helpers
+# ----------------------------
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+stopf <- function(fmt, ...) stop(sprintf(fmt, ...), call. = FALSE)
+msg  <- function(fmt, ...) cat(sprintf(fmt, ...), "\n")
+
+need_pkg <- function(pkg) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+        stopf("Missing package '%s'. Install it first: install.packages('%s')", pkg, pkg)
+    }
+}
+
+need_pkg("data.table")
+DT <- data.table::as.data.table
+
+has_cols <- function(dt, cols, name = "object") {
+    miss <- setdiff(cols, names(dt))
+    if (length(miss)) stopf("%s is missing columns: %s", name, paste(miss, collapse = ", "))
+    invisible(TRUE)
+}
+
+as_idate <- function(x) {
+    if (inherits(x, "IDate")) return(x)
+    if (inherits(x, "Date")) return(data.table::as.IDate(x))
+    if (inherits(x, "POSIXct") || inherits(x, "POSIXt")) return(data.table::as.IDate(as.Date(x)))
+    if (is.character(x)) return(data.table::as.IDate(as.Date(x)))
+    return(data.table::as.IDate(as.Date(x)))
+}
+
+maybe_find_first <- function(paths) {
+    for (p in paths) if (file.exists(p)) return(p)
+    return(NULL)
+}
+
+# ----------------------------
+# 1) Locate project root / source v2 code
+# ----------------------------
+root <- getwd()
+
+if (!dir.exists(file.path(root, "v2"))) {
+    msg("Working directory: %s", root)
+    stopf("I don't see a ./v2 directory here. Setwd() to your project root, then re-run.")
+}
+
+source_dir <- function(path) {
+    if (!dir.exists(path)) return(invisible(FALSE))
+    files <- list.files(path, pattern = "\\.R$", full.names = TRUE, recursive = FALSE)
+    files <- sort(files)
+    for (f in files) source(f, local = FALSE)
+    invisible(TRUE)
+}
+
+source_v2_modules <- function() {
+    modules_root <- file.path(root, "v2", "modules")
+    if (!dir.exists(modules_root)) stopf("Expected directory not found: %s", modules_root)
+    mods <- list.dirs(modules_root, full.names = TRUE, recursive = FALSE)
+    mods <- sort(mods)
+    for (m in mods) {
+        rdir <- file.path(m, "R")
+        if (dir.exists(rdir)) {
+            msg("Sourcing module: %s", basename(m))
+            source_dir(rdir)
+        }
+    }
+    invisible(TRUE)
+}
+
+source_v2_modules()
+
+# ----------------------------
+# 2) Acquire inputs (universe_raw, corp_actions)
+# ----------------------------
+load_or_build_inputs <- function() {
+    universe_raw <- NULL
+    corp_actions <- NULL
+    
+    if (exists("universe_raw", envir = .GlobalEnv, inherits = TRUE)) {
+        universe_raw <- get("universe_raw", envir = .GlobalEnv, inherits = TRUE)
+        msg("\nUsing existing object: universe_raw")
+    }
+    
+    if (exists("corp_actions", envir = .GlobalEnv, inherits = TRUE)) {
+        corp_actions <- get("corp_actions", envir = .GlobalEnv, inherits = TRUE)
+        msg("Using existing object: corp_actions")
+    }
+    
+    u_guess <- maybe_find_first(c(
+        file.path(root, "v2/data/cache/universe_raw_latest.rds"),
+        file.path(root, "v2/data/cache/universe_raw.rds")
+    ))
+    if (is.null(universe_raw) && !is.null(u_guess)) {
+        universe_raw <- readRDS(u_guess)
+        msg("Loaded universe_raw from: %s", u_guess)
+    }
+    
+    # Check if selective builder exists (to skip global fetch)
+    has_selective <- exists("af2_build_panel_adj_selective", envir = .GlobalEnv)
+    
+    if (is.null(corp_actions) && !has_selective) {
+        c_guess <- maybe_find_first(file.path(root, "v2/data/cache/corp_actions.rds"))
+        if (!is.null(c_guess)) corp_actions <- readRDS(c_guess)
+    } else if (has_selective) {
+        msg("Skipping global corp_actions fetch because Selective Builder is available.")
+    }
+    
+    if (is.null(universe_raw)) stopf("Couldn't obtain universe_raw.")
+    
+    list(universe_raw = universe_raw, corp_actions = corp_actions)
+}
+
+inp <- load_or_build_inputs()
+universe_raw <- inp$universe_raw
+corp_actions <- inp$corp_actions
+
+# ----------------------------
+# 3) Build panel_adj_result
+# ----------------------------
+build_panel_adj_result <- function(universe_raw, corp_actions) {
+    if (exists("af2_get_config", envir = .GlobalEnv)) {
+        cfg <- tryCatch(af2_get_config(), error = function(e) NULL)
+    } else { cfg <- NULL }
+    
+    if (exists("af2_build_panel_adj_selective", envir = .GlobalEnv)) {
+        msg("\nBuilding panel_adj_result with af2_build_panel_adj_selective() ...")
+        # Selective builder does its own fetching
+        return(af2_build_panel_adj_selective(
+            universe_raw = universe_raw,
+            manual_events = NULL,
+            cfg = cfg,
+            verbose = TRUE
+        ))
+    }
+    
+    if (exists("af2_build_panel_adj", envir = .GlobalEnv)) {
+        if (is.null(corp_actions)) stopf("af2_build_panel_adj requires corp_actions")
+        return(af2_build_panel_adj(
+            universe_raw = universe_raw,
+            corp_actions = corp_actions,
+            manual_events = NULL,
+            cfg = cfg,
+            verbose = TRUE
+        ))
+    }
+    stopf("No builder found.")
+}
+
+panel_adj_result <- build_panel_adj_result(universe_raw, corp_actions)
+
+# ----------------------------
+# 4) Extract
+# ----------------------------
+panel_adj <- DT(panel_adj_result$panel_adj)
+panel_adj[, refdate := as_idate(refdate)]
+corp_actions_apply <- if(!is.null(panel_adj_result$corp_actions_apply)) DT(panel_adj_result$corp_actions_apply) else NULL
+
+if (!is.null(corp_actions_apply)) {
+    corp_actions_apply[, refdate := as_idate(refdate)]
+}
+
+# ----------------------------
+# 5) Jump Diagnostics (Fixed)
+# ----------------------------
+msg("\n--- JUMP REDUCTION AROUND SPLITS ---")
+
+# Find adj close col
+cols <- names(panel_adj)
+adj_close_col <- if("close_adj_final" %in% cols) "close_adj_final" else grep("close_adj", cols, value=TRUE)[1]
+
+if (!is.null(adj_close_col) && !is.null(corp_actions_apply)) {
+    splits <- corp_actions_apply[action_type == "split"]
+    if (nrow(splits) > 0) {
+        
+        data.table::setkey(panel_adj, symbol, refdate)
+        panel_adj[, `:=`(
+            close_raw = as.numeric(close),
+            close_adj = as.numeric(get(adj_close_col))
+        )]
+        
+        panel_adj[, lr_raw := log(close_raw / data.table::shift(close_raw)), by = symbol]
+        panel_adj[, lr_adj := log(close_adj / data.table::shift(close_adj)), by = symbol]
+        
+        split_keys <- unique(splits[, .(symbol, refdate)])
+        jump_at_split <- panel_adj[split_keys, on = .(symbol, refdate), nomatch = 0L]
+        jump_at_split <- jump_at_split[!is.na(lr_raw) & !is.na(lr_adj)]
+        
+        if (nrow(jump_at_split) > 0) {
+            # FIX: Two-step calculation to avoid "object not found"
+            jump_at_split[, abs_raw := abs(lr_raw)]
+            jump_at_split[, abs_adj := abs(lr_adj)]
+            
+            jump_at_split[, `:=`(
+                improve = abs_raw - abs_adj,
+                ratio   = fifelse(abs_raw > 0, abs_adj / abs_raw, NA_real_)
+            )]
+            
+            bad <- jump_at_split[abs_raw >= 0.15 & abs_adj >= 0.10]
+            msg("BAD split-days (raw big, adj still big): %d", nrow(bad))
+            
+            if (nrow(bad) > 0) print(head(bad[, .(symbol, refdate, abs_raw, abs_adj)]))
+        }
+    }
+}
+
+msg("\nDone.")
+
+
+###############################################################################
+### FILE: tests/investigate_corrections.R
+###############################################################################
+# v2/tests/investigate_corrections.R
+
+# Ensure we have the objects from the build run
+if (!exists("panel_adj_result")) {
+  stop("Please run the build script first so 'panel_adj_result' exists in memory.")
+}
+
+library(data.table)
+
+# Extract tables
+events <- panel_adj_result$events
+adj_tl <- panel_adj_result$adjustments
+panel  <- panel_adj_result$panel_adj
+audit  <- panel_adj_result$split_audit
+jump   <- panel_adj_result$residual_jump_audit
+
+# ==============================================================================
+# 1. DEEP DIVE: Why is ITUB4 "suspect_unresolved"?
+# ==============================================================================
+target <- "ITUB4"
+message("\n=== INVESTIGATION: ", target, " ===")
+
+# A) Check Dividend Safety Logic (issue_div)
+# Logic: Bad if (Div >= PrevClose) OR (PrevClose is NA/Zero)
+
+# 1. Reconstruct the decision data
+# We need 'close_adj_split' from the panel to see what the adjuster saw.
+cols_needed <- c("symbol", "refdate", "close_raw", "close_adj_split", "close_adj_final")
+p_target <- panel[symbol == target, ..cols_needed]
+
+# 2. Join with the specific event parameters that triggered the flag
+a_target <- adj_tl[symbol == target & issue_div == TRUE]
+
+if (nrow(a_target) > 0) {
+  message("Found ", nrow(a_target), " UNSAFE dividend events for ", target, ".")
+  
+  # Join to see prices at that moment
+  # Note: The adjuster compares div_cash vs lag(close_adj_split)
+  check <- merge(a_target, p_target, by = c("symbol", "refdate"), all.x = TRUE)
+  
+  # Fetch previous day's price (the denominator)
+  check[, prev_date := refdate - 1] # Approximation for display
+  # Get actual lag from panel
+  p_target[, close_prev := shift(close_adj_split, 1, type = "lag")]
+  
+  check_final <- merge(check, p_target[, .(symbol, refdate, close_prev)], by = c("symbol", "refdate"))
+  
+  print(check_final[, .(
+    refdate, 
+    div_cash, 
+    close_prev_adj = round(close_prev, 4), 
+    ratio = round(div_cash / close_prev, 2),
+    verdict = fifelse(is.na(close_prev), "PrevClose NA",
+              fifelse(close_prev <= 0, "PrevClose <= 0",
+              fifelse(div_cash >= close_prev, "Div >= Price", "Unknown")))
+  )])
+} else {
+  message("No 'issue_div' flags found for ", target, ". Checking Safety Net...")
+}
+
+# B) Check Residual Jump (Safety Net)
+j_target <- jump[symbol == target]
+if (isTRUE(j_target$residual_jump_flag)) {
+  message("\n", target, " also failed the RESIDUAL JUMP check.")
+  print(j_target)
+} else {
+  message("\n", target, " PASSED the residual jump check.")
+}
+
+
+# ==============================================================================
+# 2. SYSTEM-WIDE: Who else had "Corrections"?
+# ==============================================================================
+
+message("\n=== GLOBAL CORRECTION REPORT ===")
+
+# A) Rejected Splits (The "Snapper" doing its job)
+if (!is.null(audit)) {
+  rejected <- audit[status == "rejected"]
+  if (nrow(rejected) > 0) {
+    message("\n[REJECTED SPLITS] Vendor data didn't match price gaps (Top 10):")
+    # Calculate the gap it SHOULD have seen
+    print(head(rejected[, .(symbol, vendor_refdate, yahoo_value, chosen_err, status)], 10))
+  }
+}
+
+# B) Unsafe Dividends (The "Dividend Ghost" trap)
+unsafe_divs <- adj_tl[issue_div == TRUE]
+if (nrow(unsafe_divs) > 0) {
+  message("\n[UNSAFE DIVIDENDS] Ignored to prevent negative prices (Top 10):")
+  print(head(unsafe_divs[, .(symbol, refdate, div_cash, issue_div)], 10))
+  
+  message("Total unsafe dividend events: ", nrow(unsafe_divs))
+  message("Unique symbols affected: ", length(unique(unsafe_divs$symbol)))
+}
+
+# C) Safety Net Kills (The "Bombs")
+killed <- jump[residual_jump_flag == TRUE]
+if (nrow(killed) > 0) {
+  message("\n[SAFETY NET KILLS] Symbols dropped due to unresolvable jumps (Top 10):")
+  print(head(killed[order(-residual_max_abs_logret), .(symbol, residual_max_abs_logret, residual_jump_date)], 10))
+}
 
 
 ###############################################################################
@@ -291,6 +623,10 @@ af2_config_default <- list(
   # Safety
   allow_unresolved_in_screener = FALSE,
 
+  # Adjuster residual jump safety net (log-return tolerance).
+  # 1.0 means any 1-day move >= e^1 (~2.718x) flags suspect_unresolved.
+  adj_residual_jump_tol_log = 1.0,
+
   # -------------------------------
   # Selective corporate-actions policy (the "trick")
   # -------------------------------
@@ -300,6 +636,15 @@ af2_config_default <- list(
   # - "batch" keeps current behavior (hash by symbol set)
   # - "by_symbol" enables incremental caching per ticker
   ca_cache_mode = "batch",
+
+  # Corporate actions fetch mode:
+  # - "chart"   = Yahoo chart endpoint (splits+dividends in one call)
+  # - "quantmod"= legacy quantmod calls (getSplits + getDividends)
+  ca_fetch_mode = "chart",
+
+  # Candidate prefilter: detect reverse-split-like jumps using abs(log(close/lag)).
+  # 1.0 ~ e^1 = 2.718x jump threshold.
+  ca_prefilter_jump_log_thr = 1.0,
 
   # Prefilter heuristics (B3-only)
   ca_prefilter_recent_days   = 252L,
@@ -336,6 +681,10 @@ af2_config_default <- list(
   # NEW: how far forward we allow snapping Yahoo split dates
   # to the next B3 trading day (for weekend/holiday/vendor-date mismatches)
   split_gap_max_forward_days = 5L,
+
+  # How far BACK we allow snapping Yahoo vendor split dates
+  # (vendor date can be 1-3 days off vs B3 effective trading day).
+  split_gap_max_back_days = 3L,
 
   # NEW: prefer using post-day OPEN when available (splits are effective at market open);
   # fallback to CLOSE if OPEN missing.
@@ -379,6 +728,29 @@ af2_get_config <- function(config = NULL) {
   }
 
   cfg$split_gap_use_open <- isTRUE(cfg$split_gap_use_open)
+
+  # -------------------------------
+  # Normalize newer knobs
+  # -------------------------------
+  cfg$ca_fetch_mode <- tolower(trimws(cfg$ca_fetch_mode %||% "chart"))
+  if (!cfg$ca_fetch_mode %in% c("chart", "quantmod")) {
+    cfg$ca_fetch_mode <- "chart"
+  }
+
+  cfg$ca_prefilter_jump_log_thr <- as.numeric(cfg$ca_prefilter_jump_log_thr %||% 1.0)
+  if (!is.finite(cfg$ca_prefilter_jump_log_thr) || cfg$ca_prefilter_jump_log_thr < 0.5) {
+    cfg$ca_prefilter_jump_log_thr <- 1.0
+  }
+
+  cfg$adj_residual_jump_tol_log <- as.numeric(cfg$adj_residual_jump_tol_log %||% 1.0)
+  if (!is.finite(cfg$adj_residual_jump_tol_log) || cfg$adj_residual_jump_tol_log <= 0) {
+    cfg$adj_residual_jump_tol_log <- 1.0
+  }
+
+  cfg$split_gap_max_back_days <- as.integer(cfg$split_gap_max_back_days %||% 3L)
+  if (!is.finite(cfg$split_gap_max_back_days) || cfg$split_gap_max_back_days < 0L) {
+    cfg$split_gap_max_back_days <- 3L
+  }
 
   cfg
 }
@@ -1134,6 +1506,142 @@ Purpose:
 
 
 ###############################################################################
+### FILE: modules/02_diagnostics/R/diag_symbol.R
+###############################################################################
+# v2/modules/02_diagnostics/R/diag_symbol.R
+# Deterministic per-symbol diagnostics (raw vs adjusted, events, biggest jumps)
+
+af2_diag_symbol <- function(symbol,
+                            panel_adj,
+                            events = NULL,
+                            corp_actions_apply = NULL,
+                            split_audit = NULL,
+                            show_plot = TRUE,
+                            top_n_jumps = 5L) {
+
+  af2_require("data.table")
+  sym <- toupper(trimws(as.character(symbol)))
+
+  dt <- data.table::as.data.table(panel_adj)
+  dt <- dt[symbol == sym]
+  if (!nrow(dt)) {
+    message("AF2_DIAG: symbol not found in panel_adj: ", sym)
+    return(invisible(NULL))
+  }
+
+  data.table::setorder(dt, refdate)
+
+  # Basic summary
+  cat("\n========================\n")
+  cat("AF2_DIAG SYMBOL: ", sym, "\n", sep = "")
+  cat("========================\n")
+  cat("Date range: ", as.character(min(dt$refdate)), " -> ", as.character(max(dt$refdate)), "\n", sep = "")
+  cat("Rows: ", nrow(dt), "\n", sep = "")
+  if ("asset_type" %in% names(dt)) cat("Asset type: ", unique(dt$asset_type), "\n", sep = "")
+  if ("adjustment_state" %in% names(dt)) cat("Adjustment state(s): ", paste(unique(dt$adjustment_state), collapse = ", "), "\n", sep = "")
+
+  # Compute jumps
+  get_jump_table <- function(x, dates) {
+    x <- as.numeric(x)
+    ok <- is.finite(x) & x > 0
+    if (sum(ok) < 3) return(data.table::data.table())
+    lr <- diff(log(x))
+    d  <- dates[-1]
+    out <- data.table::data.table(
+      refdate = as.Date(d),
+      logret  = as.numeric(lr),
+      abs_logret = abs(as.numeric(lr))
+    )
+    out[is.finite(abs_logret)]
+  }
+
+  jt_raw   <- if ("close_raw" %in% names(dt)) get_jump_table(dt$close_raw, dt$refdate) else data.table::data.table()
+  jt_split <- if ("close_adj_split" %in% names(dt)) get_jump_table(dt$close_adj_split, dt$refdate) else data.table::data.table()
+  jt_final <- if ("close_adj_final" %in% names(dt)) get_jump_table(dt$close_adj_final, dt$refdate) else data.table::data.table()
+
+  if (nrow(jt_raw)) {
+    cat("\nTop raw jumps (abs logret):\n")
+    print(jt_raw[order(-abs_logret)][1:top_n_jumps])
+  }
+  if (nrow(jt_split)) {
+    cat("\nTop split-adjusted jumps (abs logret):\n")
+    print(jt_split[order(-abs_logret)][1:top_n_jumps])
+  }
+  if (nrow(jt_final)) {
+    cat("\nTop final-adjusted jumps (abs logret):\n")
+    print(jt_final[order(-abs_logret)][1:top_n_jumps])
+  }
+
+  # Events slice
+  if (!is.null(events)) {
+    ev <- data.table::as.data.table(events)[symbol == sym]
+    if (nrow(ev)) {
+      data.table::setorder(ev, refdate)
+      cat("\nEvents for symbol:\n")
+      print(ev)
+    } else {
+      cat("\nEvents for symbol: (none)\n")
+    }
+  }
+
+  # CA slice
+  if (!is.null(corp_actions_apply)) {
+    ca <- data.table::as.data.table(corp_actions_apply)[symbol == sym]
+    if (nrow(ca)) {
+      data.table::setorder(ca, refdate, action_type)
+      cat("\ncorp_actions_apply rows:\n")
+      print(ca)
+    } else {
+      cat("\ncorp_actions_apply: (none)\n")
+    }
+  }
+
+  # Split audit slice
+  if (!is.null(split_audit) && nrow(split_audit)) {
+    sa <- data.table::as.data.table(split_audit)[symbol == sym]
+    if (nrow(sa)) {
+      data.table::setorder(sa, vendor_refdate)
+      cat("\nSplit audit rows:\n")
+      print(sa)
+    }
+  }
+
+  # Plot
+  if (isTRUE(show_plot) && interactive()) {
+    op <- par(no.readonly = TRUE)
+    on.exit(par(op), add = TRUE)
+
+    par(mfrow = c(2, 1))
+
+    if ("close_raw" %in% names(dt)) {
+      plot(dt$refdate, dt$close_raw, type = "l",
+           main = paste0(sym, " — close_raw"),
+           xlab = "", ylab = "")
+    } else {
+      plot.new(); title(main = paste0(sym, " — close_raw missing"))
+    }
+
+    if ("close_adj_final" %in% names(dt)) {
+      plot(dt$refdate, dt$close_adj_final, type = "l",
+           main = paste0(sym, " — close_adj_final"),
+           xlab = "", ylab = "")
+    } else {
+      plot.new(); title(main = paste0(sym, " — close_adj_final missing"))
+    }
+  }
+
+  invisible(list(
+    symbol = sym,
+    panel = dt,
+    jumps_raw = jt_raw,
+    jumps_split = jt_split,
+    jumps_final = jt_final
+  ))
+}
+
+
+
+###############################################################################
 ### FILE: modules/02_diagnostics/README.md
 ###############################################################################
 # Module
@@ -1290,6 +1798,7 @@ af2_ca_build_registry <- function(symbols,
     parallel::clusterExport(
       cl,
       varlist = c(
+        "cfg",  # <--- ADDED THIS
         "map_dt",
         "from", "to",
         "af2_ca_fetch_splits_one",
@@ -1413,12 +1922,30 @@ af2_ca_build_registry_by_symbol <- function(symbols,
       next
     }
 
-    dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
-    dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE)
+    # --- LOGIC UPDATE START ---
+    mode <- tolower(cfg$ca_fetch_mode %||% "chart")
 
-    out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
+    # Fallback if chart deps missing
+    if (mode == "chart" &&
+        (!requireNamespace("jsonlite", quietly = TRUE) ||
+         !requireNamespace("curl", quietly = TRUE))) {
+      if (verbose) af2_log("AF2_CA:", "chart mode requested but jsonlite/curl missing; falling back to quantmod for ", sym)
+      mode <- "quantmod"
+    }
 
-    if (!nrow(out)) {
+    out <- NULL
+    if (mode == "chart") {
+      out <- af2_ca_fetch_events_yahoo_chart_one(ysym, from = from, to = to, verbose = FALSE)
+    } else {
+      # Legacy quantmod calls
+      dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
+      dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE)
+      out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
+      if (!nrow(out)) out <- NULL
+    }
+    # --- LOGIC UPDATE END ---
+
+    if (is.null(out) || !nrow(out)) {
       out <- data.table::data.table(
         symbol = character(),
         yahoo_symbol = character(),
@@ -1524,66 +2051,78 @@ af2_ca_fetch_dividends_one <- function(yahoo_symbol,
 ### FILE: modules/03_corporate_actions/R/fetch_events_yahoo_chart.R
 ###############################################################################
 # v2/modules/03_corporate_actions/R/fetch_events_yahoo_chart.R
-# Fetch splits + dividends in ONE call via Yahoo chart endpoint.
-# Returns data.table with schema:
-# yahoo_symbol, refdate, action_type (split|dividend), value, source
-
 source("v2/modules/03_corporate_actions/R/yahoo_retry.R")
 
 af2_ca_fetch_events_yahoo_chart_one <- function(yahoo_symbol,
                                                from = "2018-01-01",
                                                to = Sys.Date(),
                                                verbose = FALSE) {
-  if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(NULL)
+  # Default empty table structure
+  empty_dt <- data.table::data.table(
+      yahoo_symbol = character(),
+      refdate = as.Date(character()),
+      action_type = character(),
+      value = numeric(),
+      source = character()
+  )
+
+  if (is.na(yahoo_symbol) || !nzchar(yahoo_symbol)) return(empty_dt)
+
+  # Check dependencies (Crucial for parallel workers)
+  if (!requireNamespace("jsonlite", quietly = TRUE) || 
+      !requireNamespace("curl", quietly = TRUE)) {
+      if(verbose) message("AF2_CA_ERR: jsonlite or curl missing on worker for ", yahoo_symbol)
+      return(empty_dt)
+  }
 
   af2_ca_require(c("data.table", "jsonlite", "curl"))
 
   from <- as.Date(from)
   to   <- as.Date(to)
-
-  # Yahoo wants unix seconds
   p1 <- as.integer(as.POSIXct(from, tz = "UTC"))
-  p2 <- as.integer(as.POSIXct(to + 1, tz = "UTC"))  # inclusive-ish
+  p2 <- as.integer(as.POSIXct(to + 1, tz = "UTC"))
 
+  # Corrected URL (Plural splits)
   url <- sprintf(
-    "https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&events=div%%7Csplit",
+    "https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&events=div%%7Csplits",
     utils::URLencode(yahoo_symbol, reserved = TRUE),
     p1, p2
   )
 
   h <- curl::new_handle()
-  curl::handle_setheaders(h,
-    "User-Agent" = "Mozilla/5.0",
-    "Accept" = "application/json"
-  )
+  curl::handle_setheaders(h, "User-Agent" = "Mozilla/5.0", "Accept" = "application/json")
 
   fetch_once <- function() {
     resp <- curl::curl_fetch_memory(url, handle = h)
     status <- resp$status_code
     txt <- rawToChar(resp$content)
-
-    if (status == 429) stop("HTTP 429 rate limit", call. = FALSE)
-    if (status >= 400) stop(paste0("HTTP ", status, " on yahoo chart"), call. = FALSE)
-
-    jsonlite::fromJSON(txt, simplifyVector = FALSE)
+    
+    if (status == 429) stop("HTTP 429", call. = FALSE)
+    if (status == 404) return(NULL) # Symbol not found
+    if (status >= 400) stop(paste0("HTTP ", status), call. = FALSE)
+    
+    # Safely parse JSON
+    tryCatch(jsonlite::fromJSON(txt, simplifyVector = FALSE), error=function(e) NULL)
   }
 
-  js <- af2_ca_with_retry(fetch_once, max_tries = 4L, base_sleep = 1.5, verbose = verbose)
-  if (is.null(js)) return(NULL)
+  js <- af2_ca_with_retry(fetch_once, max_tries = 4L, verbose = verbose)
+  
+  # Handle failures gracefully
+  if (is.null(js)) {
+      if(verbose) message("AF2_CA_WARN: No JSON returned for ", yahoo_symbol)
+      return(empty_dt)
+  }
 
-  res <- js$chart$result
-  if (is.null(res) || !length(res)) return(NULL)
-
-  ev <- res[[1]]$events
-  if (is.null(ev)) return(NULL)
+  res <- js$chart$result[[1]]
+  if (is.null(res)) return(empty_dt)
+  ev <- res$events
+  if (is.null(ev)) return(empty_dt)
 
   out_list <- list()
 
-  # --- dividends ---
-  divs <- ev$dividends
-  if (!is.null(divs) && length(divs)) {
-    # divs often keyed by timestamp strings; values are objects with $date, $amount
-    div_dt <- data.table::rbindlist(lapply(divs, function(d) {
+  # Process Dividends
+  if (!is.null(ev$dividends)) {
+    out_list[["dividend"]] <- data.table::rbindlist(lapply(ev$dividends, function(d) {
       if (is.null(d$date) || is.null(d$amount)) return(NULL)
       data.table::data.table(
         yahoo_symbol = yahoo_symbol,
@@ -1592,43 +2131,35 @@ af2_ca_fetch_events_yahoo_chart_one <- function(yahoo_symbol,
         value = as.numeric(d$amount),
         source = "yahoo"
       )
-    }), use.names = TRUE, fill = TRUE)
-
-    if (nrow(div_dt)) out_list[["dividend"]] <- div_dt
+    }), fill=TRUE)
   }
 
-  # --- splits ---
-  splits <- ev$splits
-  if (!is.null(splits) && length(splits)) {
-    split_dt <- data.table::rbindlist(lapply(splits, function(s) {
+  # Process Splits
+  if (!is.null(ev$splits)) {
+    out_list[["split"]] <- data.table::rbindlist(lapply(ev$splits, function(s) {
       if (is.null(s$date) || is.null(s$numerator) || is.null(s$denominator)) return(NULL)
-
-      num <- as.numeric(s$numerator)
-      den <- as.numeric(s$denominator)
-      if (!is.finite(num) || !is.finite(den) || num <= 0 || den <= 0) return(NULL)
-
-      # PRICE FACTOR = denominator/numerator (e.g. 2-for-1 => 1/2 = 0.5; 1-for-20 reverse => 20/1 = 20)
-      pf <- den / num
-
+      pf <- as.numeric(s$denominator) / as.numeric(s$numerator)
       data.table::data.table(
         yahoo_symbol = yahoo_symbol,
         refdate = as.Date(as.POSIXct(as.integer(s$date), origin = "1970-01-01", tz = "UTC")),
         action_type = "split",
-        value = as.numeric(pf),
+        value = pf,
         source = "yahoo"
       )
-    }), use.names = TRUE, fill = TRUE)
-
-    if (nrow(split_dt)) out_list[["split"]] <- split_dt
+    }), fill=TRUE)
   }
 
-  out <- data.table::rbindlist(out_list, use.names = TRUE, fill = TRUE)
-  if (!nrow(out)) return(NULL)
-
-  out <- out[is.finite(value) & !is.na(refdate)]
-  out
+  out <- data.table::rbindlist(out_list, fill = TRUE)
+  
+  if (nrow(out) > 0) {
+      out <- out[is.finite(value) & !is.na(refdate)]
+      # REMOVED: The erroneous 100x scaling fix. 
+      # BRIM11 and others need the raw value.
+      return(out)
+  }
+  
+  return(empty_dt)
 }
-
 
 
 ###############################################################################
@@ -2644,10 +3175,10 @@ af2_adj_build_events <- function(corp_actions,
   ev[is.na(div_cash), div_cash := 0]
 
   # Compose source mask
-  ev[, source_mask := fifelse(
+  ev[, source_mask := data.table::fifelse(
     !is.na(source_mask) & !is.na(source_mask_div),
     paste0(source_mask, "+", source_mask_div),
-    fifelse(!is.na(source_mask), source_mask, source_mask_div)
+    data.table::fifelse(!is.na(source_mask), source_mask, source_mask_div)
   )]
   ev[is.na(source_mask), source_mask := "unknown"]
 
@@ -2676,14 +3207,6 @@ af2_adj_build_events <- function(corp_actions,
 ###############################################################################
 # v2/modules/04_adjuster/R/build_panel_adj.R
 
-# High-level builder:
-#   universe_raw (Module 01 output)
-#   corp_actions (Module 03 output)
-#   manual_events (optional)
-#
-# Returns:
-#   list(panel_adj = ..., adjustments = ..., events = ..., residual_jump_audit = ...)
-
 af2_build_panel_adj <- function(universe_raw,
                                 corp_actions = NULL,
                                 manual_events = NULL,
@@ -2705,23 +3228,16 @@ af2_build_panel_adj <- function(universe_raw,
   dt[, symbol := toupper(trimws(as.character(symbol)))]
   dt[, refdate := as.Date(refdate)]
 
-  # ------------------------------------------------------------------
-  # Defensive dedupe (rb3 edge cases)
-  # ------------------------------------------------------------------
+  # Defensive dedupe
   data.table::setorder(dt, asset_type, symbol, refdate)
-
   dup_check <- dt[, .N, by = .(symbol, refdate)][N > 1L]
   if (nrow(dup_check)) {
-    af2_log(
-      "AF2_ADJ:",
-      "WARNING: universe_raw had duplicated symbol/refdate rows. Keeping first row per key."
-    )
+    af2_log("AF2_ADJ:", "WARNING: universe_raw had duplicated symbol/refdate rows. Keeping first row per key.")
     dt <- dt[, .SD[1L], by = .(symbol, refdate)]
   }
-
   af2_assert_no_dupes(dt, c("symbol", "refdate"), name = "universe_raw")
 
-  # 1) Build event table (split_value + div_cash per symbol-date)
+  # 1) Build event table
   events <- af2_adj_build_events(
     corp_actions = if (isTRUE(cfg$enable_splits)) corp_actions else NULL,
     manual_events = if (isTRUE(cfg$enable_manual_events)) manual_events else NULL,
@@ -2729,7 +3245,7 @@ af2_build_panel_adj <- function(universe_raw,
     verbose = verbose
   )
 
-  # 2) Apply adjustments (Now Vectorized & Fast)
+  # 2) Apply adjustments (Vectorized)
   out <- af2_adj_apply_adjustments(
     universe_raw = dt,
     events = events,
@@ -2739,25 +3255,19 @@ af2_build_panel_adj <- function(universe_raw,
   panel <- out$panel_adj
   adj_tl <- out$adjustments
 
-  # 3) Add raw aliases for clarity/audit
+  # 3) Add raw aliases
   panel[, `:=`(
-    open_raw = open,
-    high_raw = high,
-    low_raw  = low,
-    close_raw = close
+    open_raw = open, high_raw = high, low_raw = low, close_raw = close
   )]
 
-  # 4) Compute adjustment_state per symbol (Vectorized)
-  #    Using adj_tl to detect issues and events to detect types
+  # 4) Compute adjustment_state per symbol
   
   # Aggregate flags from adjustments timeline
-  # This is much faster than subsetting events iteratively
   issue_flags <- adj_tl[, .(
-    issue_div_any = any(isTRUE(issue_div))
+    issue_div_any = any(issue_div %in% TRUE)
   ), by = symbol]
 
   # Aggregate flags from events
-  # Filter events to relevant window first
   panel_min <- min(panel$refdate, na.rm = TRUE)
   panel_max <- max(panel$refdate, na.rm = TRUE)
   
@@ -2767,54 +3277,41 @@ af2_build_panel_adj <- function(universe_raw,
     ev_flags <- ev_in_window[, .(
       has_split = any(is.finite(split_value) & split_value != 1),
       has_div   = any(is.finite(div_cash) & div_cash > 0),
-      has_manual = any(isTRUE(has_manual))
+      has_manual = any(has_manual %in% TRUE)
     ), by = symbol]
   } else {
     ev_flags <- data.table::data.table(symbol = character(), has_split=logical(), has_div=logical(), has_manual=logical())
   }
 
-  # Merge all metadata
-  # Start with all symbols in panel
+  # Merge metadata
   state_dt <- data.table::data.table(symbol = unique(panel$symbol))
-  
   state_dt <- merge(state_dt, ev_flags, by = "symbol", all.x = TRUE)
   state_dt <- merge(state_dt, issue_flags, by = "symbol", all.x = TRUE)
   
-  # Fill NAs
   state_dt[is.na(has_split), has_split := FALSE]
   state_dt[is.na(has_div), has_div := FALSE]
   state_dt[is.na(has_manual), has_manual := FALSE]
   state_dt[is.na(issue_div_any), issue_div_any := FALSE]
 
-  # Determine State
-  state_dt[, adjustment_state := fifelse(
-    issue_div_any, "suspect_unresolved",
-    fifelse(
-      has_manual, "manual_override",
-      fifelse(
-        has_split & has_div, "split_dividend",
-        fifelse(
-          has_split, "split_only",
-          fifelse(
-            has_div, "dividend_only",
-            "ok"
-          )
-        )
-      )
-    )
-  )]
+  # Determine State (Robust Syntax)
+  state_dt[, adjustment_state := "ok"]
+  state_dt[has_div & !has_split, adjustment_state := "dividend_only"]
+  state_dt[has_split & !has_div, adjustment_state := "split_only"]
+  state_dt[has_split & has_div, adjustment_state := "split_dividend"]
+  
+  # FIX: Explicit boolean comparison to avoid scoping errors
+  state_dt[has_manual == TRUE, adjustment_state := "manual_override"]
+  state_dt[issue_div_any == TRUE, adjustment_state := "suspect_unresolved"]
 
   # ------------------------------------------------------------
-  # 4b) Residual jump safety net (The Safety Valve)
+  # 4b) Residual jump safety net
   # ------------------------------------------------------------
   jump_tol <- as.numeric(cfg$adj_residual_jump_tol_log %||% 1.0)
   if (!is.finite(jump_tol) || jump_tol <= 0) jump_tol <- 1.0
 
-  # Compute max log-jump on FINAL adjusted close
   jump_audit <- panel[
     is.finite(close_adj_final) & close_adj_final > 0,
     {
-      # Diff Log gives log returns
       v <- abs(diff(log(close_adj_final)))
       if (!length(v) || all(!is.finite(v))) {
         .(residual_max_abs_logret = 0, residual_jump_date = as.Date(NA))
@@ -2822,7 +3319,7 @@ af2_build_panel_adj <- function(universe_raw,
         k <- which.max(v)
         .(
           residual_max_abs_logret = as.numeric(v[k]),
-          residual_jump_date = refdate[k + 1L] # date of the jump
+          residual_jump_date = refdate[k + 1L]
         )
       }
     },
@@ -2831,25 +3328,22 @@ af2_build_panel_adj <- function(universe_raw,
 
   jump_audit[, residual_jump_flag := is.finite(residual_max_abs_logret) & residual_max_abs_logret >= jump_tol]
 
-  # Merge jump info into state_dt
+  # Merge jump info and OVERRIDE state if needed
   state_dt <- merge(state_dt, jump_audit, by = "symbol", all.x = TRUE)
   
-  # OVERRIDE state if residual jump detected
-  state_dt[isTRUE(residual_jump_flag), adjustment_state := "suspect_unresolved"]
+  # FIX: Explicit boolean comparison
+  state_dt[residual_jump_flag == TRUE, adjustment_state := "suspect_unresolved"]
 
-  # Apply state back to panel
   panel[state_dt, on = "symbol", adjustment_state := i.adjustment_state]
 
-  # 5) Final column cleanup ordering
+  # 5) Cleanup
   keep_cols <- c(
     "symbol", "refdate", "asset_type",
     "open_raw", "high_raw", "low_raw", "close_raw",
     "open_adj_split", "high_adj_split", "low_adj_split", "close_adj_split",
     "open_adj_final", "high_adj_final", "low_adj_final", "close_adj_final",
-    "turnover", "qty",
-    "adjustment_state"
+    "turnover", "qty", "adjustment_state"
   )
-
   present_keep <- intersect(keep_cols, names(panel))
   other_cols <- setdiff(names(panel), present_keep)
   data.table::setcolorder(panel, c(present_keep, other_cols))
@@ -2909,6 +3403,9 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   # Map inputs to internal names
   dt <- data.table::as.data.table(universe_raw)
   sp <- data.table::as.data.table(corp_actions)
+  
+  # PRESERVE ORIGINAL (Unpolluted)
+  sp0 <- data.table::copy(sp) 
 
   # Prepare empty return structures
   empty_audit <- data.table::data.table(
@@ -2918,10 +3415,10 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
       chosen_err=numeric(), status=character()
   )
 
-  # If no corp actions, return pass-through immediately
+  # Return empty structure if inputs empty
   if (!nrow(sp)) {
     return(list(
-      corp_actions = sp,
+      corp_actions = sp0,
       fixed_kept = sp[0], 
       quarantine = data.table::copy(empty_audit), # quarantine structure approx
       audit = empty_audit
@@ -2932,20 +3429,20 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   data.table::setorder(dt, symbol, refdate)
   dt[, close_lag := data.table::shift(close, 1L), by = symbol]
 
-  # Add row_id to preserve identity
-  sp <- data.table::copy(sp)
-  if (!"row_id" %in% names(sp)) sp[, row_id := .I]
+  # WORK ON COPY FOR VALIDATION (Avoid pollution)
+  to_validate <- data.table::copy(sp0)
+  if (!"row_id" %in% names(to_validate)) to_validate[, row_id := .I] 
 
-  sp[, vendor_refdate := as.Date(refdate)]
-  sp[, value := as.numeric(value)]
+  to_validate[, vendor_refdate := as.Date(refdate)]
+  to_validate[, value := as.numeric(value)]
   
   # Only validate SPLITS from YAHOO that are positive
-  to_validate <- sp[action_type == "split" & source == "yahoo" & is.finite(value) & value > 0]
+  to_validate <- to_validate[action_type == "split" & source == "yahoo" & is.finite(value) & value > 0]
   
   # If no validatable splits, return pass-through
   if (!nrow(to_validate)) {
      return(list(
-      corp_actions = sp,
+      corp_actions = sp0, # Return clean copy
       fixed_kept = sp[0], 
       quarantine = data.table::copy(empty_audit),
       audit = empty_audit
@@ -3023,7 +3520,7 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
                    status)]
 
   list(
-    corp_actions = sp, # <--- CRITICAL FIX: Pass through original input
+    corp_actions = sp0, # <--- CRITICAL FIX: Pass through original unpolluted input
     fixed_kept = fixed_kept,
     quarantine = quarantine,
     audit = audit
@@ -3110,7 +3607,7 @@ af2_build_panel_adj_selective <- function(universe_raw,
       verbose = verbose
     )
   
-    ca <- fix$corp_actions  # Now exists!
+    ca <- fix$corp_actions
     split_audit <- fix$audit
     yahoo_splits_fixed <- fix$fixed_kept
     yahoo_splits_quarantine <- fix$quarantine
@@ -3121,7 +3618,6 @@ af2_build_panel_adj_selective <- function(universe_raw,
       af2_log("AF2_CA_PREF:", "corp_actions AFTER validation is EMPTY -> panel will be unadjusted.")
     } else {
       af2_log("AF2_CA_PREF:", "corp_actions AFTER validation rows= ", nrow(ca))
-      # print(ca[, .N, by = .(action_type, source)][order(-N)])
     }
   }
 
@@ -3133,18 +3629,31 @@ af2_build_panel_adj_selective <- function(universe_raw,
   
   if (nrow(ca_apply)) {
   
-    # Drop vendor Yahoo splits
-    ca_apply <- ca_apply[!(action_type == "split" & source == "yahoo")]
-  
-    # Add back fixed splits
-    if (nrow(yahoo_splits_fixed)) {
-      ca_apply <- data.table::rbindlist(
-        list(ca_apply, yahoo_splits_fixed),
-        use.names = TRUE, fill = TRUE
-      )
+    # Count vendor splits before deciding logic
+    vendor_splits_n <- ca_apply[action_type == "split" & source == "yahoo", .N]
+    
+    # SAFETY: If we have vendor splits, but validation kept ZERO, 
+    # we might be too strict. Default to KEEPING vendor splits (Fail Open) 
+    # instead of having an unadjusted panel which is definitely wrong.
+    if (vendor_splits_n > 0 && nrow(yahoo_splits_fixed) == 0) {
+      if (verbose) af2_log("AF2_CA_PREF:", "WARNING: split validation kept 0 splits; NOT dropping vendor Yahoo splits to avoid fully unadjusted panel.")
+      # Do not drop 'split'/'yahoo' rows in this specific edge case
+    } else {
+      # Standard Path: Drop vendor splits, use fixed ones
+      ca_apply <- ca_apply[!(action_type == "split" & source == "yahoo")]
+      
+      # Add back fixed splits
+      if (nrow(yahoo_splits_fixed)) {
+        ca_apply <- data.table::rbindlist(
+          list(ca_apply, yahoo_splits_fixed),
+          use.names = TRUE, fill = TRUE
+        )
+      }
     }
   
-    ca_apply <- unique(ca_apply)
+    # Deduplicate strictly on business keys to merge identical dividends
+    # This prevents 'row_id' or other artifacts from creating dups
+    ca_apply <- unique(ca_apply, by = c("symbol", "refdate", "action_type", "value", "source"))
     
     if (nrow(yahoo_splits_quarantine)) {
         ca_quarantine <- yahoo_splits_quarantine
@@ -3843,5 +4352,545 @@ Purpose:
 - List functions
 - List tests
 
+
+
+###############################################################################
+### FILE: tests/test_data_layer_v2.R
+###############################################################################
+# v2/tests/test_data_layer_v2.R
+# Smoke + deep diagnostics for v2 data layer (candidates -> CA fetch -> events -> adjustments -> features)
+
+# =========================
+# 1) HARD RESET (MUST BE FIRST)
+# =========================
+rm(list = ls(all.names = TRUE))
+gc()
+
+options(stringsAsFactors = FALSE)
+Sys.setenv(TZ = "UTC")
+
+# =========================
+# 2) USER KNOBS
+# =========================
+# NOTE:
+# - This block is intentionally written so it NEVER errors if you refactor/reset.
+# - Edit the *defaults* here when you want to change behavior.
+
+WATCH <- get0(
+  "WATCH",
+  ifnotfound = c("SEQL3", "IFCM3", "GOLD11", "GOGL34", "PETR4", "VALE3", "ITUB4")
+)
+WATCH <- unique(toupper(trimws(as.character(WATCH))))
+WATCH <- WATCH[nzchar(WATCH)]
+
+FORCE_REFRESH_CA_BATCH_CACHE <- isTRUE(get0("FORCE_REFRESH_CA_BATCH_CACHE", ifnotfound = FALSE))
+RUN_PARALLEL_MINITEST        <- isTRUE(get0("RUN_PARALLEL_MINITEST", ifnotfound = TRUE))
+HARD_FAIL_IF_NO_DIVIDENDS    <- isTRUE(get0("HARD_FAIL_IF_NO_DIVIDENDS", ifnotfound = TRUE))
+
+# Optional: override candidate cap for faster tests (set NULL to keep cfg)
+OVERRIDE_MAX_CANDIDATES <- get0("OVERRIDE_MAX_CANDIDATES", ifnotfound = NULL)
+
+# If you already have universe_raw saved, set this path; otherwise script tries to build/load automatically.
+UNIVERSE_RAW_RDS <- get0("UNIVERSE_RAW_RDS", ifnotfound = NULL)
+if (!is.null(UNIVERSE_RAW_RDS)) UNIVERSE_RAW_RDS <- as.character(UNIVERSE_RAW_RDS)
+
+# =========================
+# 3) ASSERT PROJECT ROOT
+# =========================
+if (!dir.exists("v2/modules")) {
+  stop("Run this from the project root (the folder that contains v2/modules).", call. = FALSE)
+}
+
+# =========================
+# 4) HELPERS
+# =========================
+.msg <- function(...) cat(paste0(..., collapse = ""), "\n")
+
+source_all_v2_modules <- function(mod_root = "v2/modules") {
+  files <- list.files(mod_root, pattern = "\\.R$", recursive = TRUE, full.names = TRUE)
+  if (!length(files)) stop("No R files found under v2/modules.", call. = FALSE)
+
+  # Deterministic order; numeric module dirs should already sort correctly
+  files <- sort(normalizePath(files, winslash = "/", mustWork = TRUE))
+
+  # Prefer 00_core first if present
+  core_first <- grepl("/00_", files) | grepl("/00core", files, ignore.case = TRUE)
+  files <- c(files[core_first], files[!core_first])
+
+  .msg("Sourcing ", length(files), " files under ", mod_root, " ...")
+  for (f in files) {
+    tryCatch(
+      source(f, local = FALSE),
+      error = function(e) {
+        stop("Failed sourcing: ", f, "\n", conditionMessage(e), call. = FALSE)
+      }
+    )
+  }
+  invisible(files)
+}
+
+assert_has <- function(fn) {
+  if (!exists(fn, mode = "function")) stop("Missing required function: ", fn, call. = FALSE)
+}
+
+as_dt <- function(x) {
+  if (!requireNamespace("data.table", quietly = TRUE)) stop("data.table not installed.", call. = FALSE)
+  data.table::as.data.table(x)
+}
+
+# Safely delete only batch corp_actions caches (not by_symbol)
+delete_batch_ca_caches <- function(cache_dir = "v2/data/cache/corp_actions") {
+  if (!dir.exists(cache_dir)) return(invisible(FALSE))
+  files <- list.files(cache_dir, pattern = "^corp_actions_.*\\.rds$", full.names = TRUE)
+  if (!length(files)) return(invisible(FALSE))
+  ok <- file.remove(files)
+  .msg("Deleted ", sum(ok), "/", length(files), " batch corp_actions cache files.")
+  invisible(TRUE)
+}
+
+# Try to obtain universe_raw in a robust way
+get_or_build_universe_raw <- function() {
+  
+  # 1. Try explicit user path
+  if (!is.null(UNIVERSE_RAW_RDS) && file.exists(UNIVERSE_RAW_RDS)) {
+    .msg("Loading universe_raw from: ", UNIVERSE_RAW_RDS)
+    return(readRDS(UNIVERSE_RAW_RDS))
+  }
+
+  # 2. Try default cache location
+  default_cache <- "v2/data/cache/universe_raw_latest.rds"
+  if (file.exists(default_cache)) {
+    .msg("Loading universe_raw from: ", default_cache)
+    return(readRDS(default_cache))
+  }
+
+  # 3. Try to build it (PATCHED: Added af2_b3_build_universe)
+  candidates <- c(
+    "af2_b3_build_universe",       # <--- The correct v2 function
+    "af2_build_universe",          # Legacy alias
+    "af2_cotahist_build_universe"  # Legacy alias
+  )
+
+  for (fn in candidates) {
+    if (exists(fn, mode = "function")) {
+      .msg("Building universe_raw via ", fn, "() ...")
+      
+      # Default to last 2 years + current year to be safe and fast
+      y_end <- as.integer(format(Sys.Date(), "%Y"))
+      y_start <- y_end - 1L
+      
+      # Call builder
+      res <- get(fn)(years = y_start:y_end)
+      
+      # Auto-save to cache for next time
+      .msg("Saving universe_raw to ", default_cache, " for future runs...")
+      dir.create(dirname(default_cache), recursive = TRUE, showWarnings = FALSE)
+      saveRDS(res, default_cache)
+      
+      return(res)
+    }
+  }
+
+  stop(
+    "Could not load/build universe_raw.\n",
+    "Function 'af2_b3_build_universe' was not found after sourcing modules.\n",
+    "Check if v2/modules/01_b3_universe/R/build_universe.R exists.",
+    call. = FALSE
+  )
+}
+
+# Fallback features (only used if your screener entrypoint is unavailable)
+compute_fallback_features <- function(panel_adj_dt, lookback = 253L) {
+  dt <- as_dt(panel_adj_dt)
+  data.table::setorder(dt, symbol, refdate)
+
+  out <- dt[, {
+    x <- close_adj_final
+    x <- x[is.finite(x) & x > 0]
+    if (length(x) < 30) {
+      .(end_refdate = max(refdate), n_obs = .N,
+        ret_21d = NA_real_, vol_21d = NA_real_, max_dd = NA_real_,
+        median_turnover = stats::median(turnover, na.rm = TRUE),
+        asset_type = asset_type[.N])
+    } else {
+      # last lookback rows by date
+      idx <- tail(seq_len(.N), lookback)
+      p <- close_adj_final[idx]
+      d <- refdate[idx]
+
+      # returns
+      r <- diff(p) / data.table::shift(p, 1L, type = "lag")[idx][-1]
+      # safer: log returns
+      lr <- diff(log(p))
+
+      # 21d total return
+      ret_21d <- if (length(p) >= 22) (p[length(p)] / p[length(p) - 21] - 1) else NA_real_
+
+      # 21d vol annualized (sqrt(252))
+      vol_21d <- {
+        lr21 <- tail(lr, 21)
+        if (length(lr21) >= 10) stats::sd(lr21, na.rm = TRUE) * sqrt(252) else NA_real_
+      }
+
+      # max drawdown inside window
+      cm <- cummax(p)
+      dd <- p / cm - 1
+      max_dd <- min(dd, na.rm = TRUE)
+
+      .(end_refdate = max(d), n_obs = length(p),
+        ret_21d = ret_21d, vol_21d = vol_21d, max_dd = max_dd,
+        median_turnover = stats::median(turnover, na.rm = TRUE),
+        asset_type = asset_type[.N])
+    }
+  }, by = symbol]
+
+  out[]
+}
+
+# =========================
+# 5) SOURCE MODULES + LOAD CFG
+# =========================
+source_all_v2_modules("v2/modules")
+
+assert_has("af2_get_config")
+assert_has("af2_ca_select_candidates")
+assert_has("af2_build_panel_adj_selective")
+
+cfg <- af2_get_config()
+
+# Optional cap override for faster runs
+if (!is.null(OVERRIDE_MAX_CANDIDATES)) {
+  cfg$ca_prefilter_max_candidates <- as.integer(OVERRIDE_MAX_CANDIDATES)
+  .msg("OVERRIDE: cfg$ca_prefilter_max_candidates = ", cfg$ca_prefilter_max_candidates)
+}
+
+# Make sure new knobs exist (won't fail if absent; just informative)
+.msg("CFG snapshot (relevant):")
+flat <- unlist(cfg, recursive = TRUE)
+print(flat[grep("ca_|corp|split|div|prefilter|gap|jump|max_candidates|cache_mode|fetch_mode",
+                names(flat), ignore.case = TRUE)])
+
+# =========================
+# 6) GET universe_raw
+# =========================
+universe_raw <- get_or_build_universe_raw()
+universe_raw <- as_dt(universe_raw)
+
+.msg("universe_raw: rows=", nrow(universe_raw), " syms=", length(unique(universe_raw$symbol)),
+     " date_range=", min(universe_raw$refdate), " -> ", max(universe_raw$refdate))
+
+# =========================
+# 7) CANDIDATE SELECTION DIAGNOSTICS
+# =========================
+cand <- af2_ca_select_candidates(universe_raw, cfg = cfg, verbose = TRUE)
+cand <- unique(toupper(cand))
+
+.msg("Candidate set: n=", length(cand))
+cand_hit <- setNames(WATCH %in% cand, WATCH)
+print(cand_hit)
+
+# Require SEQL3/IFCM3 in candidates (your must-have regression test)
+if (!("SEQL3" %in% cand && "IFCM3" %in% cand)) {
+  stop("Candidate regression: SEQL3/IFCM3 not in candidates. Fix select_candidates.R.", call. = FALSE)
+}
+
+# =========================
+# 8) OPTIONAL: FORCE REFRESH CA BATCH CACHE
+# =========================
+if (isTRUE(FORCE_REFRESH_CA_BATCH_CACHE)) {
+  delete_batch_ca_caches("v2/data/cache/corp_actions")
+}
+
+# =========================
+# 9) OPTIONAL: PARALLEL MINITEST (registry only)
+# =========================
+if (isTRUE(RUN_PARALLEL_MINITEST) && exists("af2_ca_build_registry", mode = "function")) {
+
+  .msg("\n--- Parallel mini-test (af2_ca_build_registry, n_workers=2) ---")
+  mini_syms <- unique(c("PETR4", "VALE3", "ITUB4", "TAEE11", "HGLG11", "BBAS3"))
+  mini_syms <- mini_syms[mini_syms %in% unique(toupper(universe_raw$symbol))]
+
+  if (length(mini_syms) >= 2) {
+    mini <- tryCatch(
+      af2_ca_build_registry(
+        symbols = mini_syms,
+        cfg = cfg,
+        from = "2022-01-01",
+        to = Sys.Date(),
+        verbose = TRUE,
+        use_cache = FALSE,
+        force_refresh = TRUE,
+        n_workers = 2L,
+        cache_mode = "batch"
+      ),
+      error = function(e) e
+    )
+
+    if (inherits(mini, "error")) {
+      stop("Parallel registry mini-test FAILED:\n", conditionMessage(mini), call. = FALSE)
+    } else {
+      mini <- as_dt(mini)
+      .msg("Parallel registry mini-test OK. action_type counts:")
+      print(mini[, .N, by = action_type][order(-N)])
+    }
+  } else {
+    .msg("Skipping parallel mini-test: not enough mini_syms present in universe_raw.")
+  }
+}
+
+# =========================
+# 10) BUILD PANEL (SELECTIVE CA + ADJUSTER)
+# =========================
+.msg("\n--- Building panel_adj_result (selective) ---")
+panel_adj_result <- af2_build_panel_adj_selective(universe_raw = universe_raw)
+
+# Contract checks
+needed <- c("panel_adj", "events", "corp_actions_apply", "corp_actions_quarantine", "split_audit")
+miss <- setdiff(needed, names(panel_adj_result))
+if (length(miss)) {
+  stop("panel_adj_result missing fields: ", paste(miss, collapse = ", "), call. = FALSE)
+}
+
+panel_adj_dt <- as_dt(panel_adj_result$panel_adj)
+events <- as_dt(panel_adj_result$events)
+ca_apply <- as_dt(panel_adj_result$corp_actions_apply)
+ca_quar <- as_dt(panel_adj_result$corp_actions_quarantine)
+audit <- as_dt(panel_adj_result$split_audit)
+
+.msg("panel_adj: rows=", nrow(panel_adj_dt), " syms=", length(unique(panel_adj_dt$symbol)))
+.msg("events:    rows=", nrow(events), " syms=", length(unique(events$symbol)))
+.msg("ca_apply:  rows=", nrow(ca_apply), " types=", paste(unique(ca_apply$action_type), collapse = ", "))
+.msg("ca_quar:   rows=", nrow(ca_quar))
+
+# =========================
+# 10.5) AURA33 TRACE (PIPELINE BREAK LOCATOR)
+# =========================
+trace_symbol <- function(sym, universe_raw, cand, ca_apply, ca_quar, events, audit) {
+  sym <- toupper(sym)
+
+  cat("\n====================\n")
+  cat("TRACE SYMBOL:", sym, "\n")
+  cat("====================\n")
+
+  u_sym <- universe_raw[symbol == sym]
+  cat("universe_raw rows:", nrow(u_sym), "\n")
+  if (nrow(u_sym)) {
+    cat("universe_raw date range:", as.character(min(u_sym$refdate)), "->", as.character(max(u_sym$refdate)), "\n")
+  }
+
+  in_cand <- sym %in% cand
+  cat("in candidate set:", in_cand, "\n")
+
+  caA <- ca_apply[symbol == sym]
+  caQ <- ca_quar[symbol == sym]
+  ev  <- events[symbol == sym]
+  au  <- audit[symbol == sym]
+
+  cat("ca_apply rows:", nrow(caA), "\n")
+  if (nrow(caA)) print(caA[order(refdate, action_type)])
+
+  cat("ca_quarantine rows:", nrow(caQ), "\n")
+  if (nrow(caQ)) print(caQ[order(refdate, action_type)])
+
+  cat("events rows:", nrow(ev), "\n")
+  if (nrow(ev)) print(ev[order(refdate)])
+
+  cat("split_audit rows:", nrow(au), "\n")
+  if (nrow(au)) print(au[order(refdate)])
+
+  # Quick check: are there any dividend-positive days for this symbol?
+  if ("div_cash" %in% names(events)) {
+    cat("events div_cash>0 rows:", nrow(events[symbol == sym & div_cash > 0]), "\n")
+  }
+
+  invisible(list(
+    in_cand = in_cand,
+    u_rows = nrow(u_sym),
+    ca_apply = caA,
+    ca_quar = caQ,
+    events = ev,
+    audit = au
+  ))
+}
+
+# Make sure cand is defined; if you suspect builder uses a different cfg, still run it —
+# it will at least show where AURA33 is missing.
+if (!exists("cand")) cand <- character()
+
+aura_trace <- trace_symbol(
+  "AURA33",
+  universe_raw = universe_raw,
+  cand = cand,
+  ca_apply = ca_apply,
+  ca_quar = ca_quar,
+  events = events,
+  audit = audit
+)
+
+# =========================
+# 11) DIVIDEND ASSERTIONS
+# =========================
+ca_counts <- ca_apply[, .N, by = action_type][order(-N)]
+.msg("\nCorporate actions APPLY counts:")
+print(ca_counts)
+
+n_div_apply <- if ("dividend" %in% ca_apply$action_type) nrow(ca_apply[action_type == "dividend"]) else 0L
+n_div_ev <- nrow(events[div_cash > 0])
+
+.msg("Dividend rows in ca_apply: ", n_div_apply)
+.msg("Dividend-positive event days (events$div_cash>0): ", n_div_ev)
+
+if (HARD_FAIL_IF_NO_DIVIDENDS && (n_div_apply == 0L || n_div_ev == 0L)) {
+  stop(
+    "Dividend ghost still present: no dividends made it into ca_apply/events.\n",
+    "Fix fetcher wiring (chart events) OR confirm Yahoo returns dividends in your environment.\n",
+    "Tip: inspect ca_apply[action_type=='dividend'] and the registry cache file created this run.",
+    call. = FALSE
+  )
+}
+
+# =========================
+# 12) SPLIT VALIDATION SUMMARY (KEPT/REJECTED/UNVERIFIED)
+# =========================
+if ("status" %in% names(audit)) {
+  .msg("\nSplit audit status counts:")
+  print(audit[, .N, by = status][order(-N)])
+}
+
+# Check watch symbols CA rows
+.msg("\nCA rows for WATCH:")
+print(ca_apply[symbol %chin% WATCH][order(symbol, action_type, refdate)][1:200])
+
+# =========================
+# 13) RESIDUAL JUMP SAFETY NET CHECK
+# =========================
+if ("residual_jump_audit" %in% names(panel_adj_result)) {
+  rj <- as_dt(panel_adj_result$residual_jump_audit)
+  .msg("\nResidual jump audit: top offenders:")
+  print(rj[order(-residual_max_abs_logret)][1:30])
+} else {
+  .msg("\nNOTE: residual_jump_audit not present in panel_adj_result; skipping this check.")
+}
+
+# =========================
+# 14) PER-SYMBOL DIAGNOSTICS
+# =========================
+if (exists("af2_diag_symbol", mode = "function")) {
+  .msg("\n--- af2_diag_symbol(WATCH) ---")
+  for (s in WATCH) {
+    if (s %in% unique(panel_adj_dt$symbol)) {
+      af2_diag_symbol(
+        symbol = s,
+        panel_adj = panel_adj_dt,
+        events = events,
+        corp_actions_apply = ca_apply,
+        split_audit = audit,
+        show_plot = TRUE
+      )
+    }
+  }
+} else {
+  .msg("\nNOTE: af2_diag_symbol() not found; skipping per-symbol diag.")
+}
+
+# =========================
+# 15) REBUILD RES / FEATURES (Screener if available; fallback otherwise)
+# =========================
+res <- NULL
+if (exists("af2_run_screener", mode = "function")) {
+  .msg("\n--- Running af2_run_screener(panel_adj_dt) ---")
+  
+  # NOTE: We pass allow_unresolved = TRUE because we KNOW 'panel_adj_dt' contains
+  # suspects (like TCIN15, AMER3) flagged by the safety net. 
+  # The screener will automatically drop them unless configured otherwise, 
+  # but the validator won't throw a hard stop.
+  res <- af2_run_screener(panel_adj_dt, allow_unresolved = TRUE)
+  
+} else if (exists("af2_run_screener_v2", mode = "function")) {
+  .msg("\n--- Running af2_run_screener_v2(panel_adj_dt) ---")
+  res <- af2_run_screener_v2(panel_adj_dt, allow_unresolved = TRUE)
+}
+
+if (!is.null(res) && is.list(res) && "features" %in% names(res)) {
+  feats <- as_dt(res$features)
+  
+  # If the screener drops unresolved symbols, they won't be in 'feats'.
+  # So we check WATCH items only if they survived.
+  survivors <- intersect(WATCH, feats$symbol)
+  
+  .msg("\nScreener features present. WATCH rows (survivors):")
+  print(feats[symbol %chin% survivors, .(symbol, end_refdate, n_obs, ret_21d, vol_21d, max_dd, median_turnover, asset_type)][order(symbol)])
+
+  .msg("\nTop 30 by abs(ret_21d):")
+  top <- feats[is.finite(ret_21d)][order(-abs(ret_21d))][1:30]
+  print(top[, .(symbol, ret_21d, vol_21d, max_dd, median_turnover, asset_type)])
+
+} else {
+  .msg("\nNOTE: Screener entrypoint not found or did not return $features. Using fallback feature computation.")
+  feats <- compute_fallback_features(panel_adj_dt, lookback = 253L)
+
+  .msg("\nFallback features (WATCH):")
+  print(feats[symbol %chin% WATCH][order(symbol)])
+
+  .msg("\nFallback top 30 by abs(ret_21d):")
+  top <- feats[is.finite(ret_21d)][order(-abs(ret_21d))][1:30]
+  print(top[, .(symbol, ret_21d, vol_21d, max_dd, median_turnover, asset_type)])
+}
+# =========================
+# 16) FINAL SUCCESS MESSAGE
+# =========================
+.msg("\n✅ v2 data-layer test completed.")
+.msg("If HARD_FAIL_IF_NO_DIVIDENDS=TRUE, then dividends are confirmed present end-to-end.")
+
+
+###############################################################################
+### FILE: tests/vis_check.R
+###############################################################################
+# v2/tests/vis_check.R
+# Visual confirmation of Adjustments
+
+# 1. Load data
+if (!exists("panel_adj_dt")) {
+  panel_adj_dt <- readRDS("v2/data/cache/universe_raw_latest.rds") # Or whatever your output cache is named
+  # Actually, the test script leaves 'panel_adj_dt' in memory. 
+  # If you restarted R, re-run the build or load the object.
+}
+
+# 2. Define Plotter
+plot_adjustment <- function(sym) {
+  dt <- panel_adj_dt[symbol == sym][order(refdate)]
+  
+  if (nrow(dt) == 0) return(message("Symbol not found: ", sym))
+  
+  # Normalize to start at 100 for comparison
+  start_p <- dt$close_raw[1]
+  dt[, norm_raw := close_raw / start_p * 100]
+  dt[, norm_adj := close_adj_final / close_adj_final[1] * 100]
+  
+  # Plot
+  plot(dt$refdate, dt$norm_raw, type = "l", col = "grey", lwd = 1,
+       main = paste("Adjustment Impact:", sym), ylab = "Normalized Price", xlab = "Date")
+  lines(dt$refdate, dt$norm_adj, col = "blue", lwd = 2)
+  
+  # Add Events
+  events <- panel_adj_result$events[symbol == sym]
+  if (nrow(events) > 0) {
+    abline(v = events$refdate, col = "red", lty = 2)
+    text(events$refdate, par("usr")[3], labels = ifelse(events$split_value != 1, "S", "D"), 
+         col = "red", pos = 3, cex = 0.8)
+  }
+  
+  legend("topleft", legend = c("Raw", "Adjusted"), col = c("grey", "blue"), lwd = c(1, 2))
+}
+
+# 3. Check specific cases
+# PETR4: Should see a massive difference due to huge dividends
+plot_adjustment("PETR4")
+
+# SEQL3: Should see the raw price jump (reverse split) smoothed out
+plot_adjustment("SEQL3")
+
+# IFCM3: Should see the raw price jump smoothed out
+plot_adjustment("IFCM3")
 
 

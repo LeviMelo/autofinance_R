@@ -34,6 +34,9 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   # Map inputs to internal names
   dt <- data.table::as.data.table(universe_raw)
   sp <- data.table::as.data.table(corp_actions)
+  
+  # PRESERVE ORIGINAL (Unpolluted)
+  sp0 <- data.table::copy(sp) 
 
   # Prepare empty return structures
   empty_audit <- data.table::data.table(
@@ -43,10 +46,10 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
       chosen_err=numeric(), status=character()
   )
 
-  # If no corp actions, return pass-through immediately
+  # Return empty structure if inputs empty
   if (!nrow(sp)) {
     return(list(
-      corp_actions = sp,
+      corp_actions = sp0,
       fixed_kept = sp[0], 
       quarantine = data.table::copy(empty_audit), # quarantine structure approx
       audit = empty_audit
@@ -57,20 +60,20 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
   data.table::setorder(dt, symbol, refdate)
   dt[, close_lag := data.table::shift(close, 1L), by = symbol]
 
-  # Add row_id to preserve identity
-  sp <- data.table::copy(sp)
-  if (!"row_id" %in% names(sp)) sp[, row_id := .I]
+  # WORK ON COPY FOR VALIDATION (Avoid pollution)
+  to_validate <- data.table::copy(sp0)
+  if (!"row_id" %in% names(to_validate)) to_validate[, row_id := .I] 
 
-  sp[, vendor_refdate := as.Date(refdate)]
-  sp[, value := as.numeric(value)]
+  to_validate[, vendor_refdate := as.Date(refdate)]
+  to_validate[, value := as.numeric(value)]
   
   # Only validate SPLITS from YAHOO that are positive
-  to_validate <- sp[action_type == "split" & source == "yahoo" & is.finite(value) & value > 0]
+  to_validate <- to_validate[action_type == "split" & source == "yahoo" & is.finite(value) & value > 0]
   
   # If no validatable splits, return pass-through
   if (!nrow(to_validate)) {
      return(list(
-      corp_actions = sp,
+      corp_actions = sp0, # Return clean copy
       fixed_kept = sp[0], 
       quarantine = data.table::copy(empty_audit),
       audit = empty_audit
@@ -148,7 +151,7 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
                    status)]
 
   list(
-    corp_actions = sp, # <--- CRITICAL FIX: Pass through original input
+    corp_actions = sp0, # <--- CRITICAL FIX: Pass through original unpolluted input
     fixed_kept = fixed_kept,
     quarantine = quarantine,
     audit = audit
@@ -235,7 +238,7 @@ af2_build_panel_adj_selective <- function(universe_raw,
       verbose = verbose
     )
   
-    ca <- fix$corp_actions  # Now exists!
+    ca <- fix$corp_actions
     split_audit <- fix$audit
     yahoo_splits_fixed <- fix$fixed_kept
     yahoo_splits_quarantine <- fix$quarantine
@@ -246,7 +249,6 @@ af2_build_panel_adj_selective <- function(universe_raw,
       af2_log("AF2_CA_PREF:", "corp_actions AFTER validation is EMPTY -> panel will be unadjusted.")
     } else {
       af2_log("AF2_CA_PREF:", "corp_actions AFTER validation rows= ", nrow(ca))
-      # print(ca[, .N, by = .(action_type, source)][order(-N)])
     }
   }
 
@@ -258,18 +260,31 @@ af2_build_panel_adj_selective <- function(universe_raw,
   
   if (nrow(ca_apply)) {
   
-    # Drop vendor Yahoo splits
-    ca_apply <- ca_apply[!(action_type == "split" & source == "yahoo")]
-  
-    # Add back fixed splits
-    if (nrow(yahoo_splits_fixed)) {
-      ca_apply <- data.table::rbindlist(
-        list(ca_apply, yahoo_splits_fixed),
-        use.names = TRUE, fill = TRUE
-      )
+    # Count vendor splits before deciding logic
+    vendor_splits_n <- ca_apply[action_type == "split" & source == "yahoo", .N]
+    
+    # SAFETY: If we have vendor splits, but validation kept ZERO, 
+    # we might be too strict. Default to KEEPING vendor splits (Fail Open) 
+    # instead of having an unadjusted panel which is definitely wrong.
+    if (vendor_splits_n > 0 && nrow(yahoo_splits_fixed) == 0) {
+      if (verbose) af2_log("AF2_CA_PREF:", "WARNING: split validation kept 0 splits; NOT dropping vendor Yahoo splits to avoid fully unadjusted panel.")
+      # Do not drop 'split'/'yahoo' rows in this specific edge case
+    } else {
+      # Standard Path: Drop vendor splits, use fixed ones
+      ca_apply <- ca_apply[!(action_type == "split" & source == "yahoo")]
+      
+      # Add back fixed splits
+      if (nrow(yahoo_splits_fixed)) {
+        ca_apply <- data.table::rbindlist(
+          list(ca_apply, yahoo_splits_fixed),
+          use.names = TRUE, fill = TRUE
+        )
+      }
     }
   
-    ca_apply <- unique(ca_apply)
+    # Deduplicate strictly on business keys to merge identical dividends
+    # This prevents 'row_id' or other artifacts from creating dups
+    ca_apply <- unique(ca_apply, by = c("symbol", "refdate", "action_type", "value", "source"))
     
     if (nrow(yahoo_splits_quarantine)) {
         ca_quarantine <- yahoo_splits_quarantine

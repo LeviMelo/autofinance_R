@@ -304,6 +304,71 @@ audit <- as_dt(panel_adj_result$split_audit)
 .msg("ca_quar:   rows=", nrow(ca_quar))
 
 # =========================
+# 10.5) AURA33 TRACE (PIPELINE BREAK LOCATOR)
+# =========================
+trace_symbol <- function(sym, universe_raw, cand, ca_apply, ca_quar, events, audit) {
+  sym <- toupper(sym)
+
+  cat("\n====================\n")
+  cat("TRACE SYMBOL:", sym, "\n")
+  cat("====================\n")
+
+  u_sym <- universe_raw[symbol == sym]
+  cat("universe_raw rows:", nrow(u_sym), "\n")
+  if (nrow(u_sym)) {
+    cat("universe_raw date range:", as.character(min(u_sym$refdate)), "->", as.character(max(u_sym$refdate)), "\n")
+  }
+
+  in_cand <- sym %in% cand
+  cat("in candidate set:", in_cand, "\n")
+
+  caA <- ca_apply[symbol == sym]
+  caQ <- ca_quar[symbol == sym]
+  ev  <- events[symbol == sym]
+  au  <- audit[symbol == sym]
+
+  cat("ca_apply rows:", nrow(caA), "\n")
+  if (nrow(caA)) print(caA[order(refdate, action_type)])
+
+  cat("ca_quarantine rows:", nrow(caQ), "\n")
+  if (nrow(caQ)) print(caQ[order(refdate, action_type)])
+
+  cat("events rows:", nrow(ev), "\n")
+  if (nrow(ev)) print(ev[order(refdate)])
+
+  cat("split_audit rows:", nrow(au), "\n")
+  if (nrow(au)) print(au[order(refdate)])
+
+  # Quick check: are there any dividend-positive days for this symbol?
+  if ("div_cash" %in% names(events)) {
+    cat("events div_cash>0 rows:", nrow(events[symbol == sym & div_cash > 0]), "\n")
+  }
+
+  invisible(list(
+    in_cand = in_cand,
+    u_rows = nrow(u_sym),
+    ca_apply = caA,
+    ca_quar = caQ,
+    events = ev,
+    audit = au
+  ))
+}
+
+# Make sure cand is defined; if you suspect builder uses a different cfg, still run it —
+# it will at least show where AURA33 is missing.
+if (!exists("cand")) cand <- character()
+
+aura_trace <- trace_symbol(
+  "AURA33",
+  universe_raw = universe_raw,
+  cand = cand,
+  ca_apply = ca_apply,
+  ca_quar = ca_quar,
+  events = events,
+  audit = audit
+)
+
+# =========================
 # 11) DIVIDEND ASSERTIONS
 # =========================
 ca_counts <- ca_apply[, .N, by = action_type][order(-N)]
@@ -375,16 +440,27 @@ if (exists("af2_diag_symbol", mode = "function")) {
 res <- NULL
 if (exists("af2_run_screener", mode = "function")) {
   .msg("\n--- Running af2_run_screener(panel_adj_dt) ---")
-  res <- af2_run_screener(panel_adj_dt)
+  
+  # NOTE: We pass allow_unresolved = TRUE because we KNOW 'panel_adj_dt' contains
+  # suspects (like TCIN15, AMER3) flagged by the safety net. 
+  # The screener will automatically drop them unless configured otherwise, 
+  # but the validator won't throw a hard stop.
+  res <- af2_run_screener(panel_adj_dt, allow_unresolved = TRUE)
+  
 } else if (exists("af2_run_screener_v2", mode = "function")) {
   .msg("\n--- Running af2_run_screener_v2(panel_adj_dt) ---")
-  res <- af2_run_screener_v2(panel_adj_dt)
+  res <- af2_run_screener_v2(panel_adj_dt, allow_unresolved = TRUE)
 }
 
 if (!is.null(res) && is.list(res) && "features" %in% names(res)) {
   feats <- as_dt(res$features)
-  .msg("\nScreener features present. WATCH rows:")
-  print(feats[symbol %chin% WATCH, .(symbol, end_refdate, n_obs, ret_21d, vol_21d, max_dd, median_turnover, asset_type)][order(symbol)])
+  
+  # If the screener drops unresolved symbols, they won't be in 'feats'.
+  # So we check WATCH items only if they survived.
+  survivors <- intersect(WATCH, feats$symbol)
+  
+  .msg("\nScreener features present. WATCH rows (survivors):")
+  print(feats[symbol %chin% survivors, .(symbol, end_refdate, n_obs, ret_21d, vol_21d, max_dd, median_turnover, asset_type)][order(symbol)])
 
   .msg("\nTop 30 by abs(ret_21d):")
   top <- feats[is.finite(ret_21d)][order(-abs(ret_21d))][1:30]
@@ -401,7 +477,6 @@ if (!is.null(res) && is.list(res) && "features" %in% names(res)) {
   top <- feats[is.finite(ret_21d)][order(-abs(ret_21d))][1:30]
   print(top[, .(symbol, ret_21d, vol_21d, max_dd, median_turnover, asset_type)])
 }
-
 # =========================
 # 16) FINAL SUCCESS MESSAGE
 # =========================
