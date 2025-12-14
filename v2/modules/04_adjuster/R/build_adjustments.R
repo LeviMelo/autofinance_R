@@ -117,6 +117,12 @@ af2_adj_build_events <- function(corp_actions,
     ))
   }
 
+  # ------------------------------------------------------------
+  # CRITICAL: remove exact duplicates before split multiplication.
+  # Otherwise vendor artifacts can multiply factors (v^2, v^3, ...)
+  # ------------------------------------------------------------
+  dt_all <- unique(dt_all, by = c("symbol", "refdate", "action_type", "value", "source"))
+
   # Aggregate same-day events:
   # - splits: multiply price factors
   # - dividends: sum cash amounts

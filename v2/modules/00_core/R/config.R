@@ -1,4 +1,8 @@
 # v2/modules/00_core/R/config.R
+# ---- bootstrap safety: config.R must not depend on load order ----
+if (!exists("%||%", mode = "function")) {
+  `%||%` <- function(x, y) if (!is.null(x)) x else y
+}
 
 af2_config_default <- list(
   # Universe scope (used later)
@@ -114,9 +118,9 @@ af2_get_config <- function(config = NULL) {
   # Validation of sensitive knobs
   # -------------------------------
   if (!is.null(cfg$ca_cache_mode) &&
-      !cfg$ca_cache_mode %in% c("batch", "by_symbol")) {
+      !cfg$ca_cache_mode %in% c("batch", "by_symbol", "none")) {
     stop("Invalid ca_cache_mode: ", cfg$ca_cache_mode,
-         ". Allowed: batch, by_symbol", call. = FALSE)
+         ". Allowed: batch, by_symbol, none", call. = FALSE)
   }
 
   cfg$ca_prefilter_recent_days <- as.integer(cfg$ca_prefilter_recent_days %||% 252L)

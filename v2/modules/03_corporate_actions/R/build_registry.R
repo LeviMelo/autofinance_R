@@ -28,7 +28,8 @@ af2_ca_build_registry <- function(symbols,
                                   use_cache = TRUE,
                                   force_refresh = FALSE,
                                   n_workers = 1L,
-                                  cache_mode = c("batch", "by_symbol")) {
+                                  # UPDATED: Added "none" to allowed args
+                                  cache_mode = c("batch", "by_symbol", "none")) {
 
   cfg <- cfg %||% af2_get_config()
   symbols <- as.character(symbols)
@@ -36,7 +37,14 @@ af2_ca_build_registry <- function(symbols,
   symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
   symbols <- sort(unique(symbols))
 
+  # UPDATED: Handle argument matching
   cache_mode <- match.arg(cache_mode)
+
+  # Implement "none": bypass read/write caching entirely
+  if (cache_mode == "none") {
+    use_cache <- FALSE
+    force_refresh <- TRUE
+  }
 
   if (cache_mode == "by_symbol") {
     if (!exists("af2_ca_build_registry_by_symbol")) {
@@ -106,13 +114,22 @@ af2_ca_build_registry <- function(symbols,
 
     mode <- tolower(cfg$ca_fetch_mode %||% "chart")
 
+    # IMPORTANT: match by_symbol behavior
+    # If chart deps are not available, fall back to quantmod instead of returning empty.
+    if (mode == "chart" &&
+        (!requireNamespace("jsonlite", quietly = TRUE) ||
+         !requireNamespace("curl", quietly = TRUE))) {
+      mode <- "quantmod"
+    }
+
     out <- NULL
     if (mode == "chart") {
       out <- af2_ca_fetch_events_yahoo_chart_one(ysym, from = from, to = to, verbose = FALSE)
     } else {
       # fallback legacy (2 calls)
       dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
-      dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE, split.adjust = FALSE)
+      # UPDATED: split.adjust = TRUE
+      dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE, split.adjust = TRUE)
       out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
       if (!nrow(out)) out <- NULL
     }
@@ -280,7 +297,8 @@ af2_ca_build_registry_by_symbol <- function(symbols,
     } else {
       # Legacy quantmod calls
       dt_s <- af2_ca_fetch_splits_one(ysym, from = from, to = to, verbose = FALSE)
-      dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE)
+      # UPDATED: split.adjust = TRUE
+      dt_d <- af2_ca_fetch_dividends_one(ysym, from = from, to = to, verbose = FALSE, split.adjust = TRUE)
       out <- data.table::rbindlist(list(dt_s, dt_d), use.names = TRUE, fill = TRUE)
       if (!nrow(out)) out <- NULL
     }

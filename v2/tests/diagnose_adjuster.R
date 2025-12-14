@@ -56,11 +56,19 @@ if (!dir.exists(file.path(root, "v2"))) {
 }
 
 source_dir <- function(path) {
-    if (!dir.exists(path)) return(invisible(FALSE))
-    files <- list.files(path, pattern = "\\.R$", full.names = TRUE, recursive = FALSE)
-    files <- sort(files)
-    for (f in files) source(f, local = FALSE)
-    invisible(TRUE)
+  if (!dir.exists(path)) return(invisible(FALSE))
+
+  files <- list.files(path, pattern = "\\.R$", full.names = TRUE, recursive = FALSE)
+  files <- sort(files)
+
+  # Always source zzz_depends.R first (if present)
+  zzz <- files[grepl("zzz_depends\\.R$", files)]
+  rest <- files[!grepl("zzz_depends\\.R$", files)]
+
+  files2 <- c(zzz, rest)
+
+  for (f in files2) source(f, local = FALSE)
+  invisible(TRUE)
 }
 
 source_v2_modules <- function() {

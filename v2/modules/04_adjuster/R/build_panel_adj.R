@@ -87,12 +87,17 @@ af2_build_panel_adj <- function(universe_raw,
   state_dt[is.na(issue_div_any), issue_div_any := FALSE]
 
   # Determine State (Robust Syntax)
-  state_dt[, adjustment_state := "ok"]
+  # UPDATED: Default is no longer "ok", but "no_actions"
+  state_dt[, adjustment_state := "no_actions"]
+  
+  # Logic hierarchy
   state_dt[has_div & !has_split, adjustment_state := "dividend_only"]
   state_dt[has_split & !has_div, adjustment_state := "split_only"]
   state_dt[has_split & has_div, adjustment_state := "split_dividend"]
   
-  # FIX: Explicit boolean comparison to avoid scoping errors
+  # "ok" is now a computed concept? Or do we stick to specific states?
+  # Let's keep specific states. If user wants "ok", they check adjustment_state != "suspect".
+  
   state_dt[has_manual == TRUE, adjustment_state := "manual_override"]
   state_dt[issue_div_any == TRUE, adjustment_state := "suspect_unresolved"]
 

@@ -31,14 +31,28 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
 
   use_open <- isTRUE(use_open %||% cfg$split_gap_use_open %||% TRUE)
 
-  # Map inputs to internal names
+  # 1) Normalize Inputs
   dt <- data.table::as.data.table(universe_raw)
   sp <- data.table::as.data.table(corp_actions)
-  
-  # PRESERVE ORIGINAL (Unpolluted)
-  sp0 <- data.table::copy(sp) 
 
-  # Prepare empty return structures
+  dt[, symbol := toupper(trimws(as.character(symbol)))]
+  dt[, refdate := as.Date(refdate)]
+  dt[, `:=`(open = as.numeric(open), close = as.numeric(close))]
+
+  sp[, symbol := toupper(trimws(as.character(symbol)))]
+  sp[, refdate := as.Date(refdate)]
+  sp[, action_type := tolower(trimws(as.character(action_type)))]
+  sp[, source := tolower(trimws(as.character(source)))]
+  sp[, value := as.numeric(value)]
+  if (!"yahoo_symbol" %in% names(sp)) sp[, yahoo_symbol := NA_character_]
+
+  # 2) Filter target splits
+  sp0 <- data.table::copy(sp) 
+  if (!"row_id" %in% names(sp0)) sp0[, row_id := .I] 
+
+  to_validate <- sp0[action_type == "split" & source == "yahoo" & is.finite(value) & value > 0]
+
+  # Empty return structure
   empty_audit <- data.table::data.table(
       row_id=integer(), symbol=character(), yahoo_symbol=character(),
       vendor_refdate=as.Date(character()), eff_refdate=as.Date(character()), 
@@ -46,53 +60,54 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
       chosen_err=numeric(), status=character()
   )
 
-  # Return empty structure if inputs empty
-  if (!nrow(sp)) {
+  if (!nrow(to_validate)) {
     return(list(
       corp_actions = sp0,
-      fixed_kept = sp[0], 
-      quarantine = data.table::copy(empty_audit), # quarantine structure approx
-      audit = empty_audit
-    ))
-  }
-
-  # Expect dt has symbol, refdate, close, and optionally open
-  data.table::setorder(dt, symbol, refdate)
-  dt[, close_lag := data.table::shift(close, 1L), by = symbol]
-
-  # WORK ON COPY FOR VALIDATION (Avoid pollution)
-  to_validate <- data.table::copy(sp0)
-  if (!"row_id" %in% names(to_validate)) to_validate[, row_id := .I] 
-
-  to_validate[, vendor_refdate := as.Date(refdate)]
-  to_validate[, value := as.numeric(value)]
-  
-  # Only validate SPLITS from YAHOO that are positive
-  to_validate <- to_validate[action_type == "split" & source == "yahoo" & is.finite(value) & value > 0]
-  
-  # If no validatable splits, return pass-through
-  if (!nrow(to_validate)) {
-     return(list(
-      corp_actions = sp0, # Return clean copy
       fixed_kept = sp[0], 
       quarantine = data.table::copy(empty_audit),
       audit = empty_audit
     ))
   }
 
-  # Candidate offsets: back..forward
+  # 3) Prepare Universe for Keyed Lookup
+  # Enforce unique keys for validation logic
+  data.table::setorder(dt, symbol, refdate)
+  dt <- dt[, .SD[1L], by = .(symbol, refdate)]
+  
+  # Set Key for fast lookups
+  data.table::setkey(dt, symbol, refdate)
+  
+  # Compute lag (requires stable ordering, which we just did)
+  dt[, close_lag := data.table::shift(close, 1L), by = symbol]
+
+  # 4) Validation Logic
   offs <- seq.int(-max_back_days, max_fwd_days)
 
-  # For each split row, evaluate candidate effective dates + both orientations
   eval_one <- function(sym, vdate, vval) {
     best <- list(err = Inf, eff = as.Date(NA), chosen = NA_real_)
     for (o in offs) {
       d <- vdate + o
-      row <- dt[symbol == sym & refdate == d]
-      if (!nrow(row)) next
+      
+      row <- dt[.(sym, d), nomatch = 0L]
+      if (nrow(row) != 1L) next
+      
+      cl <- row$close[[1]]
+      op <- row$open[[1]]
+      lag <- row$close_lag[[1]]
+      
+      # Need lag and either open or close
+      if (!is.finite(lag) || lag <= 0) next
+      
+      if (use_open && is.finite(op) && op > 0) {
+        obs <- op / lag
+      } else if (is.finite(cl) && cl > 0) {
+        obs <- cl / lag
+      } else {
+        next
+      }
 
-      # observed ratio at effective day
-      if (use_open && "open" %in% names(row) && is.finite(row$open) && is.finite(row$close_lag) && row$open > 0 && row$close_lag > 0) {
+      # observed ratio
+      if (use_open && is.finite(row$open) && is.finite(row$close_lag) && row$open > 0 && row$close_lag > 0) {
         obs <- row$open / row$close_lag
       } else if (is.finite(row$close) && is.finite(row$close_lag) && row$close > 0 && row$close_lag > 0) {
         obs <- row$close / row$close_lag
@@ -100,7 +115,6 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
         next
       }
 
-      # test value and inverse(value)
       cand_vals <- c(vval, 1 / vval)
       for (cv in cand_vals) {
         if (!is.finite(cv) || cv <= 0) next
@@ -126,22 +140,22 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
       lag_days = as.integer(ifelse(is.na(lag_days), NA_integer_, lag_days)),
       status = status
     )
-  }, by = .(row_id, symbol, yahoo_symbol, vendor_refdate, refdate, action_type, value, source)]
+  }, by = .(row_id, symbol, yahoo_symbol, vendor_refdate = as.Date(refdate), action_type, value, source)]
 
   # Dedup: if multiple rows collapse to same (symbol, eff_refdate, chosen_value), keep best err
   data.table::setorder(out, symbol, eff_refdate, chosen_value, chosen_err)
   out[, dup_rank := seq_len(.N), by = .(symbol, eff_refdate, chosen_value)]
-  dup <- out[dup_rank > 1L & status == "kept"]
-  if (nrow(dup)) {
+  
+  if (nrow(out[dup_rank > 1L & status == "kept"])) {
     out[dup_rank > 1L & status == "kept", status := "dup"]
   }
   out[, dup_rank := NULL]
 
   fixed_kept <- out[status == "kept",
-                    .(yahoo_symbol, refdate = eff_refdate, action_type, value = chosen_value, source, symbol)]
+                    .(yahoo_symbol, refdate = eff_refdate, action_type = "split", value = chosen_value, source, symbol)]
 
   quarantine <- out[status != "kept",
-                    .(row_id, symbol, yahoo_symbol, refdate = vendor_refdate, action_type, value, source,
+                    .(row_id, symbol, yahoo_symbol, refdate = vendor_refdate, action_type = "split", value, source,
                       status, eff_refdate, chosen_value, chosen_err, lag_days, vendor_refdate)]
 
   audit <- out[, .(row_id, symbol, yahoo_symbol,
@@ -151,7 +165,7 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
                    status)]
 
   list(
-    corp_actions = sp0, # <--- CRITICAL FIX: Pass through original unpolluted input
+    corp_actions = sp0,
     fixed_kept = fixed_kept,
     quarantine = quarantine,
     audit = audit
@@ -161,33 +175,68 @@ af2_ca_fix_yahoo_splits_by_raw_gap <- function(corp_actions,
 af2_build_panel_adj_selective <- function(universe_raw,
                                           manual_events = NULL,
                                           cfg = NULL,
-                                          from_ca = "2018-01-01",
-                                          to_ca = Sys.Date(),
+                                          from_ca = NULL,
+                                          to_ca = NULL,
                                           verbose = TRUE,
                                           use_cache = TRUE,
                                           force_refresh = FALSE,
                                           n_workers = 1L,
-                                          force_symbols = NULL
-                                          ) {
+                                          force_symbols = NULL) {
 
   cfg <- cfg %||% af2_get_config()
 
   dt <- data.table::as.data.table(universe_raw)
+  
+  # 1) Assert columns FIRST
   af2_assert_cols(
     dt,
     c("symbol", "refdate", "open", "high", "low", "close", "turnover", "qty", "asset_type"),
     name = "universe_raw"
   )
 
-  # 1) Decide candidate symbols for Yahoo actions
+  # 2) Normalize keys & Dedupe (CRITICAL FIX)
+  dt[, symbol := toupper(trimws(as.character(symbol)))]
+  dt[, asset_type := tolower(trimws(as.character(asset_type)))]
+  dt[, refdate := as.Date(refdate)]
+  dt[, `:=`(
+      open = as.numeric(open),
+      high = as.numeric(high),
+      low  = as.numeric(low),
+      close = as.numeric(close),
+      turnover = as.numeric(turnover),
+      qty = as.numeric(qty)
+  )]
+
+  # Defensive dedupe
+  data.table::setorder(dt, asset_type, symbol, refdate)
+  dup_check <- dt[, .N, by = .(symbol, refdate)][N > 1L]
+  if (nrow(dup_check)) {
+    if (verbose) af2_log("AF2_ADJ:", "WARNING: universe_raw had duplicates. Keeping first row per key.")
+    dt <- dt[, .SD[1L], by = .(symbol, refdate)]
+  }
+  af2_assert_no_dupes(dt, c("symbol", "refdate"), name = "universe_raw(selective)")
+
+  # 3) Dynamic Date Defaults
+  if (is.null(from_ca) || is.na(from_ca)) {
+    from_ca <- min(dt$refdate, na.rm = TRUE) - 10
+  }
+  if (is.null(to_ca) || is.na(to_ca)) {
+    to_ca <- max(dt$refdate, na.rm = TRUE) + 10
+  }
+  from_ca <- as.Date(from_ca)
+  to_ca <- as.Date(to_ca)
+
+  # 4) Decide candidate symbols
   if (isTRUE(cfg$enable_selective_actions)) {
-    cand <- af2_ca_select_candidates(
-      universe_raw = dt,
-      cfg = cfg,
-      verbose = verbose
-    )
+    cand <- af2_ca_select_candidates(universe_raw = dt, cfg = cfg, verbose = verbose)
   } else {
     cand <- sort(unique(toupper(dt$symbol)))
+  }
+
+  if (!is.null(force_symbols)) {
+    force_symbols <- toupper(trimws(as.character(force_symbols)))
+    force_symbols <- force_symbols[!is.na(force_symbols) & nzchar(force_symbols)]
+    cand <- sort(unique(c(cand, force_symbols)))
   }
 
   if (verbose) {
@@ -195,14 +244,7 @@ af2_build_panel_adj_selective <- function(universe_raw,
     af2_log("AF2_CA_PREF:", "Yahoo candidate symbols=", length(cand))
   }
 
-  # PATCH: allow explicit forced symbols
-  if (!is.null(force_symbols)) {
-    force_symbols <- toupper(trimws(as.character(force_symbols)))
-    force_symbols <- force_symbols[!is.na(force_symbols) & nzchar(force_symbols)]
-    cand <- sort(unique(c(cand, force_symbols)))
-  }
-
-  # 2) Fetch registry ONLY for candidates
+  # 5) Fetch registry
   ca <- NULL
   if (length(cand)) {
     ca <- af2_ca_build_registry(
@@ -219,87 +261,76 @@ af2_build_panel_adj_selective <- function(universe_raw,
     )
   }
 
-  # -------------------------------
-  # PATCH D2: reconcile Yahoo split conventions
-  # -------------------------------
-  
-  # Initialize as empty data.tables to prevent "missing fields" crash
+  # 6) Reconcile/Fix Splits
   split_audit <- data.table::data.table()
   yahoo_splits_fixed <- data.table::data.table()
   yahoo_splits_quarantine <- data.table::data.table()
-  
-  if (!is.null(ca) && nrow(ca) &&
-      isTRUE(cfg$enable_split_gap_validation)) {
-  
+
+  if (!is.null(ca) && nrow(ca) && isTRUE(cfg$enable_split_gap_validation)) {
     fix <- af2_ca_fix_yahoo_splits_by_raw_gap(
       corp_actions = ca,
       universe_raw = dt,
       cfg = cfg,
       verbose = verbose
     )
-  
     ca <- fix$corp_actions
     split_audit <- fix$audit
     yahoo_splits_fixed <- fix$fixed_kept
     yahoo_splits_quarantine <- fix$quarantine
   }
-  
-  if (verbose) {
-    if (is.null(ca) || !nrow(ca)) {
-      af2_log("AF2_CA_PREF:", "corp_actions AFTER validation is EMPTY -> panel will be unadjusted.")
-    } else {
-      af2_log("AF2_CA_PREF:", "corp_actions AFTER validation rows= ", nrow(ca))
-    }
-  }
 
-  # ------------------------------------------------------------
-  # APPLY POLICY
-  # ------------------------------------------------------------
-  ca_apply <- if (!is.null(ca)) data.table::copy(ca) else data.table::data.table()
+  # 7) Apply Policy (Fail-Soft)
+  ca_apply <- if (!is.null(ca) && nrow(ca)) data.table::copy(ca) else data.table::data.table()
   ca_quarantine <- data.table::data.table()
-  
+
   if (nrow(ca_apply)) {
-  
-    # Count vendor splits before deciding logic
-    vendor_splits_n <- ca_apply[action_type == "split" & source == "yahoo", .N]
+    # Normalize CA fields
+    ca_apply[, symbol := toupper(trimws(as.character(symbol)))]
+    ca_apply[, refdate := as.Date(refdate)]
+    ca_apply[, action_type := tolower(trimws(as.character(action_type)))]
+    ca_apply[, source := tolower(trimws(as.character(source)))]
+    ca_apply[, value := as.numeric(value)]
+
+    # Separate non-yahoo-splits
+    base_no_vendor <- ca_apply[!(action_type == "split" & source == "yahoo")]
+
+    # Build Fail-Soft Splits from Audit
+    splits_apply <- data.table::data.table()
     
-    # SAFETY: If we have vendor splits, but validation kept ZERO, 
-    # we might be too strict. Default to KEEPING vendor splits (Fail Open) 
-    # instead of having an unadjusted panel which is definitely wrong.
-    if (vendor_splits_n > 0 && nrow(yahoo_splits_fixed) == 0) {
-      if (verbose) af2_log("AF2_CA_PREF:", "WARNING: split validation kept 0 splits; NOT dropping vendor Yahoo splits to avoid fully unadjusted panel.")
-      # Do not drop 'split'/'yahoo' rows in this specific edge case
+    if (nrow(split_audit)) {
+        # Use KEPT or UNVERIFIED (Fail Soft)
+        sa <- data.table::as.data.table(split_audit)
+        sa_apply <- sa[status %in% c("kept", "unverified")]
+        
+        if (nrow(sa_apply)) {
+            sa_apply[, refdate_apply := data.table::fifelse(!is.na(eff_refdate), eff_refdate, vendor_refdate)]
+            sa_apply[, value_apply := data.table::fifelse(status == "kept" & is.finite(chosen_value), chosen_value, yahoo_value)]
+            
+            splits_apply <- sa_apply[
+                !is.na(refdate_apply) & is.finite(value_apply) & value_apply > 0,
+                .(symbol, yahoo_symbol, refdate = as.Date(refdate_apply), action_type = "split", value = as.numeric(value_apply), source = "yahoo")
+            ]
+            splits_apply <- unique(splits_apply, by = c("symbol", "refdate", "action_type", "value", "source"))
+        }
     } else {
-      # Standard Path: Drop vendor splits, use fixed ones
-      ca_apply <- ca_apply[!(action_type == "split" & source == "yahoo")]
-      
-      # Add back fixed splits
-      if (nrow(yahoo_splits_fixed)) {
-        ca_apply <- data.table::rbindlist(
-          list(ca_apply, yahoo_splits_fixed),
-          use.names = TRUE, fill = TRUE
-        )
-      }
+        # No audit? Keep original vendor splits as last resort
+        splits_apply <- ca_apply[action_type == "split" & source == "yahoo"]
     }
-  
-    # Deduplicate strictly on business keys to merge identical dividends
-    # This prevents 'row_id' or other artifacts from creating dups
+
+    # Recombine
+    ca_apply <- data.table::rbindlist(list(base_no_vendor, splits_apply), use.names = TRUE, fill = TRUE)
     ca_apply <- unique(ca_apply, by = c("symbol", "refdate", "action_type", "value", "source"))
+    if ("row_id" %in% names(ca_apply)) ca_apply[, row_id := NULL]
+    if (!is.null(ca) && "row_id" %in% names(ca)) ca[, row_id := NULL]
+
+    if (nrow(yahoo_splits_quarantine)) ca_quarantine <- yahoo_splits_quarantine
     
-    if (nrow(yahoo_splits_quarantine)) {
-        ca_quarantine <- yahoo_splits_quarantine
-    }
-  
     if (verbose) {
-      af2_log(
-        "AF2_CA_PREF:",
-        "Yahoo split apply policy: fixed_kept=", nrow(yahoo_splits_fixed),
-        " quarantine=", nrow(ca_quarantine)
-      )
+      af2_log("AF2_CA_PREF:", "Applied splits count=", nrow(splits_apply), " Quarantine=", nrow(ca_quarantine))
     }
   }
 
-  # 3) Run the normal adjuster builder
+  # 8) Run Adjuster
   out <- af2_build_panel_adj(
     universe_raw = dt,
     corp_actions = ca_apply,
@@ -308,7 +339,6 @@ af2_build_panel_adj_selective <- function(universe_raw,
     verbose = verbose
   )
 
-  # Attach audit + quarantine
   out$split_audit <- split_audit
   out$corp_actions_apply <- ca_apply
   out$corp_actions_quarantine <- ca_quarantine
