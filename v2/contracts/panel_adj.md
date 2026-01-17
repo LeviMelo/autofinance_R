@@ -1,14 +1,14 @@
-# panel_adj.md
+# panel_adj.md (Module 04 output)
 
 ## Purpose
 `panel_adj` is the adjusted daily panel produced by Module 04 (Adjuster).
-It contains raw OHLC, split-adjusted OHLC, and final adjusted OHLC (Split + Dividend).
+It contains raw OHLC aliases, split-adjusted OHLC, and final adjusted OHLC (Split + Dividend).
 It is the only input accepted by the Screener (Module 05).
 
 ## Table contract (schema)
 
-### Keys
-- **Primary key:** `(symbol, refdate)` must be **unique**.
+### Primary key
+- `(symbol, refdate)` must be unique.
 
 ### Required columns (minimum)
 | column           | type      | required | semantics |
@@ -17,13 +17,13 @@ It is the only input accepted by the Screener (Module 05).
 | refdate          | Date      | yes      | trading date |
 | asset_type       | character | yes      | `equity` / `fii` / `etf` / `bdr` |
 | close_adj_final  | numeric   | yes      | final adjusted close (splits + dividends) |
-| adjustment_state | character | yes      | see below |
-| turnover         | numeric   | yes* | liquidity volume in BRL (or `vol_fin`) |
+| adjustment_state | character | yes      | see states below |
+| turnover         | numeric   | yes*     | liquidity volume in BRL |
 | qty              | numeric   | yes      | liquidity quantity proxy |
 
-\* Either `turnover` OR `vol_fin` must exist. Downstream modules normalize to `turnover`.
+\* Either `turnover` or `vol_fin` may exist in upstream objects, but v2 normalizes to `turnover` in practice.
 
-### Standard Columns (V2 Production)
+### Standard columns (v2 production)
 Raw aliases:
 - `open_raw, high_raw, low_raw, close_raw`
 
@@ -33,20 +33,52 @@ Split-adjusted (intermediate):
 Final adjusted (split + dividend):
 - `open_adj_final, high_adj_final, low_adj_final, close_adj_final`
 
-### adjustment_state semantics
-- `ok` : no split/dividend events in-range
-- `dividend_only` : dividend events applied, no splits
-- `split_only` : split events applied, no dividends
-- `split_dividend` : both applied
-- `manual_override` : at least one manual event present for the symbol
-- `suspect_unresolved` : 
-    1. Dividend adjustment had computation issue (`issue_div == TRUE`)
-    2. **Residual Jump Safety Net:** `close_adj_final` still contains a 1-day log-return > threshold (defaults to 1.0)
+### Optional / non-contract columns
+Depending on internal steps, `panel_adj` may also contain:
+- original `open/high/low/close` (raw duplicates),
+- additional intermediate columns added during debug.
+Consumers must not rely on them.
 
-### Invariants / Guarantees
-- `(symbol, refdate)` uniqueness guaranteed.
-- If `adjustment_state == suspect_unresolved`, downstream consumers (Screener) **MUST** exclude the symbol by default.
+## adjustment_state (authoritative set; must not drift)
+
+v2 emits exactly one of:
+
+- `no_actions`
+  - no split and no dividend events detected in the panel window, and no manual events
+- `dividend_only`
+  - at least one dividend event applied; no splits in-window
+- `split_only`
+  - at least one split event applied; no dividends in-window
+- `split_dividend`
+  - both splits and dividends in-window
+- `manual_override`
+  - at least one manual event exists for the symbol (takes precedence over the above state labels)
+- `suspect_unresolved`
+  - safety valve triggered by either:
+    1) any dividend day had `issue_div == TRUE` in `adjustments`, OR
+    2) residual jump safety net flagged (abs 1-day log-return in `close_adj_final` >= tolerance)
+
+### Precedence rules (exact)
+1) Start as `no_actions`.
+2) Assign `dividend_only` / `split_only` / `split_dividend` by event presence.
+3) If any manual event for symbol ⇒ `manual_override`.
+4) If any dividend issue OR residual jump flagged ⇒ `suspect_unresolved` (overrides everything).
+
+## Invariants / Guarantees
+- `(symbol, refdate)` uniqueness is enforced (dedupe + assert).
+- If `adjustment_state == "suspect_unresolved"`, the Screener must exclude symbol by default.
 
 ## Relationship to other outputs
-Module 04 also returns:
-- `residual_jump_audit`: Table flagging symbols that failed the safety net check.
+Module 04 returns also:
+- `adjustments` (factor timeline)
+- `events` (normalized daily event table)
+- `residual_jump_audit` (safety net per symbol)
+
+Selective build additionally returns:
+- `split_audit`
+- `corp_actions_apply`
+- `corp_actions_quarantine`
+
+## Consumer rule (hard)
+The Screener must not attempt to “fix” prices; it must treat:
+- `suspect_unresolved` as poison unless explicitly overridden by config.
